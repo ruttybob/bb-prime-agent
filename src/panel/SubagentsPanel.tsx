@@ -1,11 +1,20 @@
+import { useState } from "react";
 import type { PrimeChild } from "../subagents/children.js";
-import { useSubagentsRoster, type RosterStatus } from "./use-subagents-roster.js";
+import { MAX_STEER_MESSAGE_CHARS } from "../subagents/control.js";
+import {
+  useSubagentsRoster,
+  type RosterStatus,
+  type SubagentsPanel,
+} from "./use-subagents-roster.js";
 
 /**
  * The Subagents panel (bbpa-ggf.9): the prime subagents of this thread, with
- * status, model and token count, live from the daemon's roster. Read-only on
- * purpose — steering and stopping a subagent is bbpa-ggf.10 — so the only
- * interaction here is reading.
+ * status, model and token count, live from the daemon's roster — and, since
+ * bbpa-ggf.10, the two controls on a running one: a steer message and a stop.
+ *
+ * The controls are pending states only. What the panel never does is invent a
+ * result: a stopped row says "cancelled" when the daemon's roster says so, and
+ * a refused action says so instead of going quiet.
  *
  * Presentation is deliberately self-contained Tailwind (the plugin build
  * scopes utilities to this plugin), with mid-tone colors that hold on both
@@ -13,18 +22,19 @@ import { useSubagentsRoster, type RosterStatus } from "./use-subagents-roster.js
  */
 
 export function SubagentsPanel({ threadId }: { threadId: string }) {
-  const status = useSubagentsRoster(threadId);
+  const panel = useSubagentsRoster(threadId);
   return (
     <div
       className="flex min-w-0 flex-col gap-3 text-sm"
       data-testid="subagents-panel"
     >
-      <PanelBody status={status} />
+      <PanelBody panel={panel} />
     </div>
   );
 }
 
-function PanelBody({ status }: { status: RosterStatus }) {
+function PanelBody({ panel }: { panel: SubagentsPanel }) {
+  const { status } = panel;
   if (status.kind === "loading") {
     return (
       <p className="text-[13px] text-zinc-500" role="status">
@@ -51,10 +61,16 @@ function PanelBody({ status }: { status: RosterStatus }) {
       </p>
     );
   }
-  return <RosterList roster={status.children} />;
+  return <RosterList roster={status.children} panel={panel} />;
 }
 
-function RosterList({ roster }: { roster: readonly PrimeChild[] }) {
+function RosterList({
+  roster,
+  panel,
+}: {
+  roster: readonly PrimeChild[];
+  panel: SubagentsPanel;
+}) {
   const ordered = [...roster].sort(
     (left, right) => Number(isLive(right)) - Number(isLive(left)),
   );
@@ -70,18 +86,32 @@ function RosterList({ roster }: { roster: readonly PrimeChild[] }) {
       </div>
       <ul className="flex min-w-0 flex-col gap-2">
         {ordered.map((child) => (
-          <ChildRow key={child.id} child={child} />
+          <ChildRow key={child.id} child={child} panel={panel} />
         ))}
       </ul>
     </div>
   );
 }
 
-function ChildRow({ child }: { child: PrimeChild }) {
+function ChildRow({
+  child,
+  panel,
+}: {
+  child: PrimeChild;
+  panel: SubagentsPanel;
+}) {
   const detail = childDetail(child);
   const live = isLive(child);
+  const pending = panel.pending.get(child.id);
+  const failure =
+    panel.failure?.childId === child.id ? panel.failure : undefined;
+  const delivery =
+    panel.delivery?.childId === child.id ? panel.delivery.delivery : undefined;
   return (
-    <li className="min-w-0 rounded-md border border-zinc-500/20 px-3 py-2">
+    <li
+      className="min-w-0 rounded-md border border-zinc-500/20 px-3 py-2"
+      aria-busy={pending !== undefined}
+    >
       <div className="flex min-w-0 items-center gap-2">
         <span
           aria-hidden
@@ -127,7 +157,84 @@ function ChildRow({ child }: { child: PrimeChild }) {
           {detail}
         </p>
       ) : null}
+      {live ? (
+        <SteerForm child={child} panel={panel} pending={pending} />
+      ) : null}
+      {live ? (
+        <div className="mt-1 flex items-center justify-end">
+          <button
+            type="button"
+            onClick={() => void panel.stop(child.id)}
+            disabled={pending !== undefined}
+            className="shrink-0 rounded border border-rose-500/40 px-2 py-1 text-[11px] text-rose-600 hover:bg-rose-500/10 disabled:cursor-not-allowed disabled:opacity-50 dark:text-rose-400"
+          >
+            {pending === "stop" ? "Stopping…" : "Stop"}
+          </button>
+        </div>
+      ) : null}
+      {delivery !== undefined ? (
+        <p className="mt-1 text-[12px] text-emerald-600 dark:text-emerald-400" role="status">
+          Steer {delivery === "unknown" ? "sent" : delivery}.
+        </p>
+      ) : null}
+      {failure !== undefined ? (
+        <p
+          className="mt-1 text-[12px] text-rose-600 dark:text-rose-400"
+          role="alert"
+        >
+          {failure.action === "steer" ? "Steer refused: " : "Stop refused: "}
+          {failure.message}
+        </p>
+      ) : null}
     </li>
+  );
+}
+
+/** The steer input for one running child; clearing it is prime's verdict. */
+function SteerForm({
+  child,
+  panel,
+  pending,
+}: {
+  child: PrimeChild;
+  panel: SubagentsPanel;
+  pending: "steer" | "stop" | undefined;
+}) {
+  const [draft, setDraft] = useState("");
+  const message = draft.trim();
+  const busy = pending !== undefined;
+  return (
+    <form
+      className="mt-2 flex min-w-0 items-center gap-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (busy || message.length === 0) {
+          return;
+        }
+        void panel.steer(child.id, message).then((accepted) => {
+          if (accepted) {
+            setDraft("");
+          }
+        });
+      }}
+    >
+      <input
+        value={draft}
+        onChange={(event) => setDraft(event.target.value)}
+        maxLength={MAX_STEER_MESSAGE_CHARS}
+        placeholder={`Steer ${child.label}…`}
+        aria-label={`Steer ${child.label}`}
+        disabled={busy}
+        className="min-w-0 flex-1 rounded border border-zinc-500/30 bg-transparent px-2 py-1 text-[12px] outline-none placeholder:text-zinc-500 focus:border-sky-500/60 disabled:opacity-50"
+      />
+      <button
+        type="submit"
+        disabled={busy || message.length === 0}
+        className="shrink-0 rounded border border-sky-500/40 px-2 py-1 text-[11px] text-sky-600 hover:bg-sky-500/10 disabled:cursor-not-allowed disabled:opacity-50 dark:text-sky-400"
+      >
+        {pending === "steer" ? "Sending…" : "Send"}
+      </button>
+    </form>
   );
 }
 

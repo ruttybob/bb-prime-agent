@@ -48,7 +48,11 @@ export default function plugin(bb: BbPluginApi): void {
 
 /**
  * The Subagents panel's server half: thread id → prime session → roster, plus
- * the host-signal → realtime hop that makes transitions live.
+ * the host-signal → realtime hop that makes transitions live. The control
+ * actions (bbpa-ggf.10) take the same road — the panel's steer and stop are
+ * relayed to the connected hosts, and one daemon (the one holding the session)
+ * acts — with one difference: a control action that no host can perform is an
+ * rpc error, never a quiet success.
  */
 function registerSubagents(bb: BbPluginApi): () => void {
   const hostClient = bb.hosts.experimental_client({
@@ -93,10 +97,17 @@ function registerSubagents(bb: BbPluginApi): () => void {
     return activeSessionId;
   }
 
-  /** Ask every connected host; the one holding the session answers first. */
-  async function askHosts(
+  /**
+   * Ask every connected host in turn; the first one whose daemon holds the
+   * session answers. A host without the session refuses (there is nothing to
+   * attach to, nothing to steer), which is why only a universal refusal is an
+   * answer — and why a control action lands on exactly one daemon.
+   */
+  async function firstHostAnswer<Answer>(
     activeSessionId: string,
-  ): Promise<SubagentsRosterResult["children"] | undefined> {
+    what: string,
+    ask: (hostId: string) => Promise<Answer>,
+  ): Promise<Answer | undefined> {
     let hosts: Awaited<ReturnType<typeof bb.sdk.hosts.list>>;
     try {
       hosts = await bb.sdk.hosts.list();
@@ -111,21 +122,34 @@ function registerSubagents(bb: BbPluginApi): () => void {
         continue;
       }
       try {
-        const answer = await hostClient.call(
-          "subagents.roster",
-          { activeSessionId },
-          { hostId: host.id },
-        );
-        return answer.children;
+        return await ask(host.id);
       } catch (error) {
-        // A host without this session's daemon refuses the attach; the next
-        // connected host is asked, and only a universal refusal is an answer.
         bb.log.debug(
-          `Subagents panel: host ${host.id} has no roster for ${activeSessionId} (${errorMessage(error)})`,
+          `Subagents panel: host ${host.id} could not ${what} ${activeSessionId} (${errorMessage(error)})`,
         );
       }
     }
     return undefined;
+  }
+
+  /** The thread's session, or a refusal the panel can show as-is. */
+  async function requireActiveSessionId(
+    threadId: string,
+    activeSessionId: string | undefined,
+  ): Promise<string> {
+    const resolved = activeSessionId ?? (await resolveActiveSessionId(threadId));
+    if (resolved === undefined) {
+      throw new Error(
+        "This thread has no prime-agent session yet. Start it on prime-agent and its subagents become steerable.",
+      );
+    }
+    return resolved;
+  }
+
+  function noHostHolds(activeSessionId: string): Error {
+    return new Error(
+      `No connected machine has prime-agent session ${activeSessionId}. Is prime-agent running on the machine this thread runs on?`,
+    );
   }
 
   bb.rpc.register(primeSubagentsRpcContract, {
@@ -135,11 +159,66 @@ function registerSubagents(bb: BbPluginApi): () => void {
       if (activeSessionId === undefined) {
         return { state: "unknown_thread", activeSessionId: null, children: [] };
       }
-      const children = await askHosts(activeSessionId);
+      const children = await firstHostAnswer(
+        activeSessionId,
+        "read a roster for",
+        (hostId) =>
+          hostClient.call(
+            "subagents.roster",
+            { activeSessionId },
+            { hostId },
+          ).then((answer) => answer.children),
+      );
       if (children === undefined) {
         return { state: "unavailable", activeSessionId, children: [] };
       }
       return { state: "ready", activeSessionId, children };
+    },
+
+    async steer(input) {
+      const activeSessionId = await requireActiveSessionId(
+        input.threadId,
+        input.activeSessionId,
+      );
+      const answer = await firstHostAnswer(
+        activeSessionId,
+        "steer a subagent in",
+        (hostId) =>
+          hostClient.call(
+            "subagents.steer",
+            {
+              activeSessionId,
+              childId: input.childId,
+              message: input.message,
+            },
+            { hostId },
+          ),
+      );
+      if (answer === undefined) {
+        throw noHostHolds(activeSessionId);
+      }
+      return { activeSessionId, delivery: answer.delivery };
+    },
+
+    async stop(input) {
+      const activeSessionId = await requireActiveSessionId(
+        input.threadId,
+        input.activeSessionId,
+      );
+      const answer = await firstHostAnswer(
+        activeSessionId,
+        "stop a subagent in",
+        (hostId) =>
+          hostClient.call(
+            "subagents.stop",
+            { activeSessionId, childId: input.childId },
+            { hostId },
+          ),
+      );
+      if (answer === undefined) {
+        throw noHostHolds(activeSessionId);
+      }
+      return { activeSessionId, cancelled: answer.cancelled };
     },
   });
 
