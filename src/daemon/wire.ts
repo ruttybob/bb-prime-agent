@@ -235,13 +235,46 @@ export const authStaleEventSchema = z
   })
   .passthrough();
 
+/**
+ * `get_queue`'s answer — the same lane previews the push carries, read at
+ * attach so a session adopted with work already waiting shows it at once
+ * (`followUp` is prime's singular spelling there; the push spells it
+ * `followUps`).
+ */
+export const daemonQueueResultSchema = z
+  .object({
+    steering: z.array(z.unknown()).default([]),
+    followUp: z.array(z.unknown()).default([]),
+  })
+  .passthrough();
+export type DaemonQueueResult = z.infer<typeof daemonQueueResultSchema>;
+
+/**
+ * `session_action_update` — prime's queue announcement (`bbpa-ggf.5`). The
+ * previews are what prime's own TUI shows for the waiting steering and
+ * follow-up lanes; read defensively (strings only) so a prime that reshapes
+ * the projection degrades to fewer previews instead of failing the event.
+ */
+export const sessionActionUpdateEventSchema = z
+  .object({
+    type: z.literal("session_action_update"),
+    actions: z
+      .object({
+        steering: z.array(z.unknown()).default([]),
+        followUps: z.array(z.unknown()).default([]),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
 /** Event types the bridge understands but deliberately renders nothing for. */
 export const IGNORED_SESSION_EVENT_TYPES = new Set([
-  // UI/telemetry state that has no bb timeline meaning.
+  // UI/telemetry state that has no bb timeline meaning. `session_action_update`
+  // is deliberately NOT here: the queued-message lanes it announces are
+  // surfaced as queue state (bbpa-ggf.5).
   "session_info_changed",
   "thinking_level_changed",
   "service_tier_changed",
-  "session_action_update",
   "recap_update",
   "goal_update",
   "connection_status",

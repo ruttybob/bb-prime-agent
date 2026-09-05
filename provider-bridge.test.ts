@@ -781,10 +781,12 @@ describe("stop, release and discard", () => {
     });
     const reply = await waitForResponse("t2");
     expect(reply.result).toEqual({ ok: true });
-    // Nothing was running, so there is no turn to abort — only the detach.
+    // Nothing was running, so there is no turn to abort — only the queue read
+    // at attach and the detach.
     expect(daemon.commands.map((command) => command.type)).toEqual([
       "create",
       "attach",
+      "get_queue",
       "detach",
     ]);
     expect(deltas("thr_1").map((delta) => delta.kind)).not.toContain("turn.boundary");
