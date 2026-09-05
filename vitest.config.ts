@@ -4,7 +4,7 @@ export default defineConfig({
   test: {
     name: "bb-plugin-prime-agent",
     include: ["**/*.test.ts"],
-    exclude: ["node_modules/**", "dist/**"],
+    exclude: ["**/node_modules/**", "**/dist/**", ".claude/**"],
     silent: "passed-only",
     setupFiles: ["./vitest.setup.ts"],
   },
