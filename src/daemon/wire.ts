@@ -61,10 +61,46 @@ export const daemonSessionSummarySchema = z
   .passthrough();
 export type DaemonSessionSummary = z.infer<typeof daemonSessionSummarySchema>;
 
+/** A model as prime puts it on the wire (pi-ai's `Model`, read loosely). */
+export const primeModelSchema = z
+  .object({
+    id: z.string().min(1),
+    provider: z.string().min(1),
+    name: z.string().optional(),
+    reasoning: z.boolean().optional(),
+    input: z.array(z.string()).optional(),
+    /** pi thinking level → provider value; `null` marks a level unsupported. */
+    thinkingLevelMap: z
+      .record(z.string(), z.union([z.string(), z.null()]))
+      .optional(),
+    contextWindow: z.number().optional(),
+  })
+  .passthrough();
+export type PrimeModel = z.infer<typeof primeModelSchema>;
+
+/**
+ * The session facts prime reports about itself (`AgentConnectionState`, read
+ * loosely): the current model and thinking ladder, and the compaction flags.
+ * These ride every attach snapshot's `state`, so the lane learns them for free
+ * — including which levels a model does *not* support, which is what lets the
+ * bridge refuse an unsupported level instead of letting prime clamp it.
+ */
+export const primeConnectionStateSchema = z
+  .object({
+    model: primeModelSchema.optional(),
+    thinkingLevel: z.string().optional(),
+    availableThinkingLevels: z.array(z.string()).optional(),
+    isCompacting: z.boolean().optional(),
+    autoCompactionEnabled: z.boolean().optional(),
+  })
+  .passthrough();
+export type PrimeConnectionState = z.infer<typeof primeConnectionStateSchema>;
+
 export const daemonSessionSnapshotSchema = z
   .object({
     activeSessionId: z.string(),
     summary: daemonSessionSummarySchema.optional(),
+    state: primeConnectionStateSchema.optional(),
     messages: z.array(z.unknown()).default([]),
     lastEventSequence: z.number().optional(),
     lastEventCursor: daemonEventCursorSchema.optional(),
@@ -192,6 +228,19 @@ export const compactionEndEventSchema = z
     willRetry: z.boolean().optional(),
     errorMessage: z.string().optional(),
     errorSeverity: z.string().optional(),
+  })
+  .passthrough();
+
+/**
+ * `{type:"thinking_level_changed", level}` — pushed when the session's thinking
+ * level moves, whether the bridge asked (set_thinking_level) or prime did
+ * (a model switch re-clamps). The timeline has no bb delta for it; the lane
+ * tracks it so the next turn's level change is judged against reality.
+ */
+export const thinkingLevelChangedEventSchema = z
+  .object({
+    type: z.literal("thinking_level_changed"),
+    level: z.string().optional(),
   })
   .passthrough();
 

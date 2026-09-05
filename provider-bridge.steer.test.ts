@@ -360,7 +360,8 @@ describe("queue state surfacing", () => {
     daemon.enqueueAttach({
       messages: [{ role: "user", content: "queued elsewhere" }],
     });
-    daemon.enqueueData("get_queue", {
+    daemon.enqueue({
+      commandType: "get_queue",
       // prime's get_queue spells the lane `followUp`; the push spells it
       // `followUps` — both map onto the same queue state.
       data: { steering: ["queued in prime's TUI"], followUp: ["and a follow-up"] },
