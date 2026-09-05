@@ -48,7 +48,11 @@ import {
 } from "./daemon/connection.js";
 import { primeAvailableModels } from "./model-catalog.js";
 import { resolveDaemonSocketPath } from "./daemon/socket.js";
+import { asWireCommand } from "./daemon/transport.js";
+import { daemonSessionSummarySchema } from "./daemon/wire.js";
+import { primeSessionName } from "./session-params.js";
 import { PrimeSession } from "./prime-session.js";
+import { forkPrimeSession } from "./fork-session.js";
 import { enabledExtensionsFromProviderOptions } from "./user-extensions.js";
 import {
   SessionTable,
@@ -71,6 +75,11 @@ import { sessionSkillRoots } from "./session-params.js";
  * id) attaches to it and rebuilds the timeline from the attach snapshot
  * (bbpa-ggf.4). Discard is the one destructive path: soft stop, then `kill` +
  * `delete_saved_session` for exactly the session the thread's record names.
+ * Forking (bbpa-ggf.7) branches the source session's transcript at the
+ * requested point into a NEW session for the new thread — the bracketed
+ * replace-in-place dance lives in `src/fork-session.ts`, and the fork anchors
+ * ride the turn boundaries as checkpoint ids (`src/fork-points.ts`). Renames
+ * keep the "[bb] " prefix on prime's catalog name.
  */
 type JsonRpcId = string | number;
 
@@ -253,6 +262,37 @@ function sessionFor(record: SessionRecord): PrimeSession {
   return session;
 }
 
+/**
+ * The transcript file a rename of an inactive session addresses. The record's
+ * own file wins; a thread this process released (record dropped on `release`)
+ * is still renamed honestly through the daemon-derived provider thread id —
+ * the session either answers `get_state` or the rename fails legibly.
+ */
+async function sessionFileForRenaming(
+  record: SessionRecord | undefined,
+  providerThreadId: string,
+  threadId: string,
+): Promise<string> {
+  if (record?.sessionFile !== undefined) {
+    return record.sessionFile;
+  }
+  const activeSessionId = activeSessionIdFrom(providerThreadId);
+  if (activeSessionId !== undefined) {
+    const state = await daemonRequest(
+      asWireCommand({ type: "get_state", activeSessionId }),
+    );
+    if (state.success) {
+      const summary = daemonSessionSummarySchema.safeParse(state.data);
+      if (summary.success && summary.data.sessionFile !== undefined) {
+        return summary.data.sessionFile;
+      }
+    }
+  }
+  throw new Error(
+    `no prime-agent session is known for thread ${threadId} (${providerThreadId}); there is nothing to rename`,
+  );
+}
+
 function laneFor(record: SessionRecord): PrimeSession {
   const session = new PrimeSession({
     record,
@@ -290,6 +330,8 @@ function laneFor(record: SessionRecord): PrimeSession {
 async function startSession(args: {
   record: SessionRecord;
   title?: string | undefined;
+  /** An existing transcript to adopt (the fork branch, bbpa-ggf.7), when any. */
+  sessionPath?: string | undefined;
   model?: string | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
   /** The extension picker's selection, read from this command's options. */
@@ -309,6 +351,7 @@ async function startSession(args: {
       threadId: record.threadId,
       cwd: record.cwd,
       title: args.title,
+      sessionPath: args.sessionPath,
       model: args.model,
       reasoningLevel: args.reasoningLevel,
       enabledExtensions: args.enabledExtensions,
@@ -422,9 +465,16 @@ const handlers: Record<string, RequestHandler> = {
         // (recovery across a daemon restart is bbpa-ggf.11).
         sessionRestore: true,
         threadArchive: false,
-        threadRename: false,
+        // Renames apply to prime's catalog name with the "[bb] " prefix kept
+        // (bbpa-ggf.7): the resident session is renamed in place, and a
+        // released thread's saved transcript is renamed by file.
+        threadRename: true,
         threadGoalClear: false,
-        fork: "none",
+        // Checkpoint forks (bbpa-ggf.7): every settled prompt-carrying turn
+        // mints a fork anchor on its boundary, and `thread/fork` branches the
+        // source session's transcript at that anchor into a NEW session for
+        // the new thread.
+        fork: "checkpoint",
         // prime-agent has no approval gate; bb runs the policy it declares.
         approvalEnforcedBy: "runtime",
         // Steers are queued, not injected: `turn/steer` rides prime's steering
@@ -624,9 +674,75 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.threadFork, parsed.error.issues);
       return;
     }
-    throw new Error(
-      "prime-agent fork is not wired yet: the handshake declares fork \"none\" until the persistence work lands it (bbpa-ggf.4)",
-    );
+    return (async () => {
+      const sourceActiveSessionId = activeSessionIdFrom(
+        parsed.data.sourceProviderThreadId,
+      );
+      if (sourceActiveSessionId === undefined) {
+        io.sendError(
+          id,
+          BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
+          `cannot fork ${parsed.data.sourceProviderThreadId}: it is not a prime-agent session id this bridge created`,
+        );
+        return;
+      }
+      // The fork's NEW thread gets the full construction funnel: its own bb
+      // thread id names its own "[bb] " session, and the channel listens
+      // before `create` exactly as in thread/start (bbpa-ggf.13).
+      const record = registerSession({
+        threadId: parsed.data.threadId,
+        cwd: parsed.data.cwd,
+        dynamicTools: parsed.data.dynamicTools ?? [],
+      });
+      try {
+        // The channel listens before `create` so the companion extension finds
+        // it while the prime worker boots (bbpa-ggf.13) — mirror thread/start.
+        await ensureDynamicToolsChannel(record);
+        // Branch the source session's transcript at the requested fork point
+        // and hand the source session back its own transcript — see
+        // `forkPrimeSession` for why prime's fork is a replace-in-place that
+        // has to be bracketed. bb has already copied the inherited timeline
+        // into the new thread itself, so the snapshot below arms the boundary
+        // without being replayed as content.
+        const branched = await forkPrimeSession({
+          request: (command, requestArgs) => daemonRequest(command, requestArgs),
+          sourceActiveSessionId,
+          checkpointId: parsed.data.sourceProviderCheckpointId,
+        });
+        await startSession({
+          record,
+          model: parsed.data.options.model,
+          reasoningLevel: parsed.data.options.reasoningLevel,
+          enabledExtensions: enabledExtensionsFromProviderOptions(
+            parsed.data.options.providerOptions,
+          ),
+          // The branch file: the new resident session opens the forked
+          // transcript instead of a fresh one.
+          sessionPath: branched.sessionFile,
+          input: undefined,
+          beforeFirstTurn: () => publishDynamicTools(record),
+        });
+        if (
+          branched.sessionFile !== undefined &&
+          record.activeSessionId === sourceActiveSessionId
+        ) {
+          throw new Error(
+            "prime-agent answered the fork's create with the source session itself; the new thread must not adopt it",
+          );
+        }
+      } catch (error) {
+        // A half-built fork leaves nothing behind: no channel, no record.
+        await stopDynamicTools(record);
+        if (sessions.byThread(record.threadId) === record) {
+          sessions.drop(record.threadId);
+        }
+        throw error;
+      }
+      io.sendResult(id, {
+        providerThreadId: record.providerThreadId,
+        sessionRestorable: true,
+      });
+    })();
   },
 
   [BRIDGE_REQUEST_METHODS.threadStop]: (id, params) => {
@@ -693,9 +809,57 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.threadNameSet, parsed.error.issues);
       return;
     }
-    throw new Error(
-      "prime-agent thread rename is not wired yet: the handshake declares no threadRename until the persistence work lands it (bbpa-ggf.4)",
-    );
+    return (async () => {
+      const { threadId, providerThreadId, title } = parsed.data;
+      // Same naming funnel as create: the "[bb] " prefix stays on (prime's
+      // catalog must keep telling bb's sessions apart from its own), and the
+      // bb thread id keeps agent names unique inside prime's family scope.
+      const name = primeSessionName({ threadId, title });
+      const record = sessions.byThread(threadId);
+      if (record?.session !== undefined && record.activeSessionId !== undefined) {
+        // Active: prime renames the resident session in place.
+        const renamed = await daemonRequest(
+          asWireCommand({
+            type: "rename",
+            activeSessionId: record.activeSessionId,
+            name,
+          }),
+        );
+        if (!renamed.success) {
+          throw new Error(
+            `prime-agent refused "rename": ${renamed.error ?? "unknown daemon error"}`,
+          );
+        }
+        const summary = daemonSessionSummarySchema.safeParse(renamed.data);
+        if (summary.success && summary.data.sessionFile !== undefined) {
+          record.sessionFile = summary.data.sessionFile;
+        }
+        record.sessionName = summary.success
+          ? (summary.data.sessionName ?? name)
+          : name;
+      } else {
+        // Inactive (released, or resident without a lane in this process):
+        // prime renames the transcript file, and finds an active session by
+        // that file itself — both cases answered by one command.
+        const sessionFile = await sessionFileForRenaming(
+          record,
+          providerThreadId,
+          threadId,
+        );
+        const renamed = await daemonRequest(
+          asWireCommand({ type: "rename_saved_session", sessionPath: sessionFile, name }),
+        );
+        if (!renamed.success) {
+          throw new Error(
+            `prime-agent refused "rename_saved_session": ${renamed.error ?? "unknown daemon error"}`,
+          );
+        }
+        if (record !== undefined) {
+          record.sessionName = name;
+        }
+      }
+      io.sendResult(id, { ok: true });
+    })();
   },
 
   [BRIDGE_REQUEST_METHODS.threadArchive]: (id, params) => {

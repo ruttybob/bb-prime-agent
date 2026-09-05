@@ -13,6 +13,7 @@ import {
   type TranslationContext,
 } from "./delta-translation.js";
 import {
+  agentEndEventSchema,
   daemonAttachResultSchema,
   daemonCreateResultSchema,
   daemonQueueResultSchema,
@@ -38,6 +39,7 @@ import {
   type PrimeThinkingLevel,
 } from "./session-params.js";
 import { primePromptText } from "./skill-mentions.js";
+import { forkCheckpointFor } from "./fork-points.js";
 import { asWireCommand } from "./daemon/transport.js";
 import type { SessionRecord } from "./session-table.js";
 
@@ -67,6 +69,8 @@ export interface StartSessionArgs {
   threadId: string;
   cwd: string;
   title?: string | undefined;
+  /** An existing transcript to adopt (the fork branch, bbpa-ggf.7), when any. */
+  sessionPath?: string | undefined;
   model?: string | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
   /** Extension-picker paths to load explicitly (bbpa-ggf.12), when any. */
@@ -204,6 +208,15 @@ export class PrimeSession {
    * itself (`compactManually`).
    */
   private compactionStarted = false;
+  /**
+   * Fork anchors for the prompt-carrying runs sent but not yet settled
+   * (bbpa-ggf.7), FIFO in the order prime will run them (steering and
+   * follow-up lanes are both FIFO). Each `agent_end` consumes the head and
+   * stamps its checkpoint onto the boundary delta; a fork resolves it later
+   * against prime's own fork-point discovery.
+   */
+  private readonly pendingCheckpoints: string[] = [];
+  private inputOrdinal = 0;
 
   constructor(options: PrimeSessionOptions) {
     this.record = options.record;
@@ -241,6 +254,7 @@ export class PrimeSession {
       threadId: args.threadId,
       title: args.title,
       cwd: args.cwd,
+      sessionPath: args.sessionPath,
       model: args.model,
       reasoningLevel: args.reasoningLevel,
       enabledExtensions: args.enabledExtensions,
@@ -759,12 +773,19 @@ export class PrimeSession {
     if (typeof sequence === "number") {
       this.lastSequence = sequence;
     }
+    // Every agent_end belongs to the oldest unsettled input, settled or not:
+    // consuming here (boundary suppressed or not) keeps the FIFO aligned with
+    // prime's runs.
+    const checkpointId = agentEndEventSchema.safeParse(push.event).success
+      ? this.pendingCheckpoints.shift()
+      : undefined;
     const context: TranslationContext = {
       threadId: this.record.threadId,
       cwd: this.record.cwd,
       // An interrupt settled the turn locally; prime's own `agent_end` still
       // carries the item closes but must not close the turn twice.
       suppressTurnBoundary: this.openTurn?.settledLocally === true,
+      ...(checkpointId === undefined ? {} : { providerCheckpointId: checkpointId }),
       onTurnSettled: () => {
         if (this.openTurn !== undefined) {
           this.openTurn.settledLocally = true;
@@ -772,6 +793,12 @@ export class PrimeSession {
       },
     };
     this.pushDeltas(this.translator.translate(push.event, context));
+  }
+
+  /** Mint the fork anchor for a prompt-carrying run about to be sent. */
+  private queueCheckpoint(promptText: string): void {
+    this.inputOrdinal += 1;
+    this.pendingCheckpoints.push(forkCheckpointFor(this.inputOrdinal, promptText));
   }
 
   private pushDeltas(deltas: readonly ThreadDelta[]): void {
@@ -847,20 +874,30 @@ export class PrimeSession {
       clientRequestId: args.clientRequestId,
       settledLocally: false,
     };
-    await this.request(
-      asWireCommand({
-        type: "prompt",
-        activeSessionId: this.record.activeSessionId,
-        message: PrimeSession.promptText(args.input),
-        // Prime refuses a bare prompt while it is streaming ("Specify
-        // streamingBehavior …"), and a prompt that lands on a busy session
-        // must not take the session away from the running turn: the follow-up
-        // lane holds it and prime delivers it only after the agent finishes.
-        // On an idle session this is exactly prime's ordinary prompt — the
-        // daemon applies resumeIfIdle either way (bbpa-ggf.5).
-        streamingBehavior: "followUp",
-      }),
-    );
+    // The anchor is queued with the send: prime settles every admitted input
+    // with an agent_end, which consumes it. If the prompt is refused, the
+    // anchor is taken back so the FIFO stays aligned with prime's runs.
+    this.queueCheckpoint(PrimeSession.promptText(args.input));
+    try {
+      await this.request(
+        asWireCommand({
+          type: "prompt",
+          activeSessionId: this.record.activeSessionId,
+          message: PrimeSession.promptText(args.input),
+          // Prime refuses a bare prompt while it is streaming ("Specify
+          // streamingBehavior …"), and a prompt that lands on a busy session
+          // must not take the session away from the running turn: the
+          // follow-up lane holds it and prime delivers it only after the
+          // agent finishes. On an idle session this is exactly prime's
+          // ordinary prompt — the daemon applies resumeIfIdle either way
+          // (bbpa-ggf.5).
+          streamingBehavior: "followUp",
+        }),
+      );
+    } catch (error) {
+      this.pendingCheckpoints.pop();
+      throw error;
+    }
   }
 
   /**
@@ -879,17 +916,23 @@ export class PrimeSession {
     }
     await this.awaitLive();
     this.openTurn = { settledLocally: false };
-    await readCommandData(
-      await this.request(
-        asWireCommand({
-          type: "steer",
-          activeSessionId: this.record.activeSessionId,
-          message: PrimeSession.promptText(args.input),
-        }),
-      ),
-      "steer",
-      (data) => ({ success: true as const, data }),
-    );
+    this.queueCheckpoint(PrimeSession.promptText(args.input));
+    try {
+      await readCommandData(
+        await this.request(
+          asWireCommand({
+            type: "steer",
+            activeSessionId: this.record.activeSessionId,
+            message: PrimeSession.promptText(args.input),
+          }),
+        ),
+        "steer",
+        (data) => ({ success: true as const, data }),
+      );
+    } catch (error) {
+      this.pendingCheckpoints.pop();
+      throw error;
+    }
   }
 
   /**

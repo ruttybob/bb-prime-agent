@@ -219,6 +219,13 @@ export interface TranslationContext {
    * carries item closes, but its boundary must not close the turn twice.
    */
   suppressTurnBoundary?: boolean;
+  /**
+   * The fork anchor minted for the run this `agent_end` settles (bbpa-ggf.7).
+   * It rides the turn boundary onto bb's turn/completed event, which a later
+   * fork from an earlier message resolves against. Only the agent_end boundary
+   * carries one — a prompt-carrying run is what a fork anchors at.
+   */
+  providerCheckpointId?: string;
   /** Called when an `agent_end` settles the turn prime is running. */
   onTurnSettled?: (observation: TurnObservation) => void;
 }
@@ -635,6 +642,9 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
           deltas.push({
             kind: "turn.boundary",
             status,
+            ...(context.providerCheckpointId === undefined
+              ? {}
+              : { providerCheckpointId: context.providerCheckpointId }),
             ...(error === undefined ? {} : { error: { message: error } }),
             claimIfIdle: true,
           });

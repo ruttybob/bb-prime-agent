@@ -225,6 +225,12 @@ export interface PrimeCreateCommandArgs {
   title?: string | undefined;
   /** The bb thread environment's cwd; the session executes here. */
   cwd: string;
+  /**
+   * An existing transcript for the new session to adopt (bbpa-ggf.7): the fork
+   * choreography's branch, which the daemon opens instead of creating a fresh
+   * file. Absent for every ordinary new session.
+   */
+  sessionPath?: string | undefined;
   /** bb-selected model, passed through when the thread picked one. */
   model?: string | undefined;
   /** bb-selected reasoning level, mapped onto prime's thinking ladder. */
@@ -267,6 +273,8 @@ export interface PrimeDynamicToolsConfig {
 export interface PrimeCreateCommand {
   type: "create";
   name: string;
+  /** An existing transcript to adopt (the fork branch), when any. */
+  sessionPath?: string;
   lifecycle: "resident";
   config: {
     cwd: string;
@@ -342,6 +350,7 @@ export function buildPrimeCreateCommand(
   return {
     type: "create",
     name: primeSessionName({ threadId: args.threadId, title: args.title }),
+    ...(args.sessionPath === undefined ? {} : { sessionPath: args.sessionPath }),
     lifecycle: "resident",
     config: {
       cwd: args.cwd,

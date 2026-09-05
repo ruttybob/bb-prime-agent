@@ -123,6 +123,56 @@ export const daemonAttachResultSchema = z
   .passthrough();
 export type DaemonAttachResult = z.infer<typeof daemonAttachResultSchema>;
 
+/* ----------------------------- fork/rename reads ----------------------------- */
+/* bbpa-ggf.7: the fork choreography reads prime's session tree and fork-point
+ * discovery, branches with `fork`, and hands the source session its own
+ * transcript back with `switch_session`. All loose, read-only views. */
+
+export const daemonSessionTreeEntrySchema = z
+  .object({
+    id: z.string(),
+    parentId: z.string().nullable().optional(),
+    type: z.string().optional(),
+    message: z.object({ role: z.string().optional() }).passthrough().optional(),
+  })
+  .passthrough();
+
+/** `get_session_tree` → `{flatNodes, leafId}` (the entry id space `fork` speaks). */
+export const daemonSessionTreeSchema = z
+  .object({
+    flatNodes: z
+      .array(z.object({ entry: daemonSessionTreeEntrySchema }).passthrough())
+      .default([]),
+    leafId: z.string().nullable().optional(),
+  })
+  .passthrough();
+export type DaemonSessionTree = z.infer<typeof daemonSessionTreeSchema>;
+
+/** `get_user_messages_for_forking` → the fork selector prime's own TUI uses. */
+export const daemonUserMessagesForForkingSchema = z
+  .object({
+    messages: z
+      .array(z.object({ entryId: z.string(), text: z.string() }).passthrough())
+      .default([]),
+  })
+  .passthrough();
+export type DaemonUserMessagesForForking = z.infer<
+  typeof daemonUserMessagesForForkingSchema
+>;
+
+/** `fork` → `{cancelled, selectedText?}`: the source session was replaced in place. */
+export const daemonForkResultSchema = z
+  .object({
+    cancelled: z.boolean().optional(),
+    selectedText: z.string().optional(),
+  })
+  .passthrough();
+
+/** `switch_session` → `{cancelled}`: the state now runs the given file. */
+export const daemonSwitchSessionResultSchema = z
+  .object({ cancelled: z.boolean().optional() })
+  .passthrough();
+
 /** `{type:"session_closed", reason}` — the daemon closed a session we held. */
 export const sessionClosedSchema = z
   .object({

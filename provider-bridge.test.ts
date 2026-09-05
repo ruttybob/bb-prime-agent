@@ -1027,17 +1027,8 @@ describe("methods that need work the later tickets own", () => {
       // (provider-bridge.models.test.ts).
       ["provider/installation/status", { providerId: "prime-agent" }],
       ["provider/installation/run", { providerId: "prime-agent", action: "install" }],
-      [
-        "thread/fork",
-        {
-          threadId: "t",
-          sourceProviderThreadId: "p",
-          cwd,
-          instructionMode: "append",
-          options: FULL_OPTIONS,
-        },
-      ],
-      ["thread/name/set", { threadId: "t", providerThreadId: "p", title: "x" }],
+      // thread/fork and thread/name/set are wired as of bbpa-ggf.7 (see
+      // provider-bridge.fork.test.ts / provider-bridge.rename.test.ts).
       ["thread/archive", { threadId: "t", providerThreadId: "p" }],
       ["thread/unarchive", { threadId: "t", providerThreadId: "p" }],
       ["thread/goal/clear", { threadId: "t", providerThreadId: "p" }],

@@ -227,7 +227,16 @@ describe("turn/steer onto prime's steering lane", () => {
     const threadDeltasAfter = deltas("thr_1");
     expect(
       threadDeltasAfter.filter((delta) => delta.kind === "turn.boundary"),
-    ).toEqual([{ kind: "turn.boundary", status: "completed", claimIfIdle: true }]);
+    ).toEqual([
+      {
+        kind: "turn.boundary",
+        status: "completed",
+        // The steer's own fork anchor rides the boundary that settles its run
+        // (bbpa-ggf.7).
+        providerCheckpointId: expect.any(String),
+        claimIfIdle: true,
+      },
+    ]);
     const acceptedAt = threadDeltasAfter.findIndex(
       (delta) => delta.kind === "input.accepted" && delta.clientRequestId === "creq_steerabcxy",
     );

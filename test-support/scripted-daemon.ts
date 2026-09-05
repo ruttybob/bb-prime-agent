@@ -212,10 +212,15 @@ export function createScriptedDaemon(
     isDropped() {
       return dropped;
     },
-    enqueueCreate() {
+    enqueueCreate(args?: Partial<ScriptedSession>) {
       blocks.push({
         commandType: "create",
-        answer: ok("create", { ...session, lifecycle: "resident", isSessionActive: false }),
+        answer: ok("create", {
+          ...session,
+          ...args,
+          lifecycle: "resident",
+          isSessionActive: false,
+        }),
         pushes: [],
       });
     },

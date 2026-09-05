@@ -52,6 +52,65 @@ beforeEach(() => {
   });
   daemon.enqueueOk("abort");
   daemon.enqueueOk("detach");
+  // The fork rule (bbpa-ggf.7) forks the lifecycle session at its tip and
+  // expects the new thread's identity: the fork bracket reads the source's
+  // transcript file and tree, forks, reads the branch's file, hands the source
+  // its own transcript back, and the new session opens the branch.
+  daemon.enqueue(
+    { commandType: "get_state",
+
+      data: {
+      activeSessionId: "sess_conformance",
+      sessionFile: "/tmp/prime/sessions/sess_conformance.jsonl",
+      sessionName: "[bb] say hello (thr_conformance_1)",
+      cwd: workspaceDir,
+    },
+  });
+  daemon.enqueue(
+    { commandType: "get_session_tree",
+
+      data: {
+      flatNodes: [
+        {
+          entry: {
+            id: "entry_leaf",
+            parentId: null,
+            type: "message",
+            message: { role: "assistant" },
+          },
+        },
+      ],
+      leafId: "entry_leaf",
+    },
+  });
+  daemon.enqueue(
+    { commandType: "fork",
+   data: { cancelled: false } });
+  daemon.enqueue(
+    { commandType: "get_state",
+
+      data: {
+      activeSessionId: "sess_scripted",
+      sessionFile: "/tmp/prime/sessions/sess_forked.jsonl",
+    },
+  });
+  daemon.enqueue(
+    { commandType: "switch_session",
+   data: { cancelled: false } });
+  daemon.enqueue(
+    { commandType: "get_state",
+
+      data: {
+      activeSessionId: "sess_conformance",
+      sessionFile: "/tmp/prime/sessions/sess_conformance.jsonl",
+    },
+  });
+  daemon.enqueueCreate({
+    activeSessionId: "sess_forked",
+    sessionFile: "/tmp/prime/sessions/sess_forked.jsonl",
+    sessionName: "[bb] thr_conformance_fork",
+  });
+  daemon.enqueueAttach();
   setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
 });
 
@@ -94,6 +153,7 @@ it("passes the canonical protocol suite", async () => {
     "events/schema-valid": "pass",
     "item/opens-before-delta": "pass",
     "stop/release-not-interrupted": "pass",
+    "session/fork-identity": "pass",
     "session/resume-identity": "pass",
     "session/resume-id-uniqueness": "pass",
     "skills/configure-declared": "pass",
