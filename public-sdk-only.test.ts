@@ -23,7 +23,13 @@ describe("the prime-agent plugin imports only the public SDK", () => {
   });
 
   it("has no @bb/* import and stays inside the allowlist", () => {
-    expect(scan.violations).toEqual([]);
+    // Agent worktrees under .claude/ are session infrastructure of the
+    // development workflow, not plugin source; the scanner itself has no
+    // directory filter (it excludes only node_modules and dist).
+    const violations = scan.violations.filter(
+      (violation) => !violation.file.startsWith(".claude/"),
+    );
+    expect(violations).toEqual([]);
   });
 
   it("declares no @bb/* dependency in package.json", () => {

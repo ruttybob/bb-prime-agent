@@ -821,6 +821,7 @@ describe("stop, release and discard", () => {
     expect(daemon.commands.map((command) => command.type)).toEqual([
       "create",
       "attach",
+      "get_queue",
       "prompt",
       "abort",
       "detach",
@@ -847,6 +848,7 @@ describe("stop, release and discard", () => {
     expect(daemon.commands.map((command) => command.type)).toEqual([
       "create",
       "attach",
+      "get_queue",
       "detach",
       "kill",
       "delete_saved_session",
@@ -908,6 +910,7 @@ describe("stop, release and discard", () => {
     expect(daemon.commands.map((command) => command.type)).toEqual([
       "create",
       "attach",
+      "get_queue",
       "detach",
       "delete_saved_session",
     ]);
@@ -1090,6 +1093,7 @@ describe("process teardown (closing bb)", () => {
     expect(daemon.commands.map((command) => command.type)).toEqual([
       "create",
       "attach",
+      "get_queue",
       "detach",
     ]);
     expect(daemon.commands).not.toContainEqual(expect.objectContaining({ type: "kill" }));
@@ -1120,6 +1124,7 @@ describe("process teardown (closing bb)", () => {
     expect(daemon.commands.map((command) => command.type)).toEqual([
       "create",
       "attach",
+      "get_queue",
       "prompt",
       "abort",
       "detach",
