@@ -1,4 +1,5 @@
 import type { PluginProviderDeclaration } from "@get-bb/plugin-sdk";
+import { PRIME_NATIVE_ROOTS_DECLARATION } from "./native-roots.js";
 import {
   enabledExtensionsProviderOptions,
   enabledUserExtensionPaths,
@@ -56,6 +57,11 @@ export function primeProviderDeclaration(
     },
     experimental_visibility: "installed",
     maintenance: { health: true, usage: false, installation: false },
+    // prime's own skill directories (bbpa-ggf.8): bb indexes them into the
+    // composer "/" menu beside its own skills, and resolves the host-only rest
+    // (settings-configured roots, loose skill files) through this plugin's
+    // `bb.host` entry (`src/native-roots.ts` has the contract and the paths).
+    ...PRIME_NATIVE_ROOTS_DECLARATION,
     env: { passthrough: [PRIME_DAEMON_SOCKET_ENV] },
     capabilities: {
       supportsServiceTier: false,

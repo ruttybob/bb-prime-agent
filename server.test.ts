@@ -89,14 +89,37 @@ describe("the prime-agent provider declaration", () => {
     });
   });
 
+  it("declares prime's native skill roots and host-side resolution for the / menu", () => {
+    const declaration = registeredDeclaration();
+    // prime's fixed skill directories (docs/skills.md "Locations"); bb scans
+    // them beside its own skills for the composer "/" menu. The host
+    // normalizes the declaration, so every option arrives explicit.
+    expect(declaration.experimental_nativeSkillRoots).toEqual({
+      user: [
+        { path: ".prime/agent/skills", recursive: false, ancestors: false, namePrefix: "" },
+        { path: ".agents/skills", recursive: false, ancestors: false, namePrefix: "" },
+      ],
+      project: [
+        { path: ".prime/agent/skills", recursive: false, ancestors: false, namePrefix: "" },
+        // prime walks `.agents/skills` up to the repository root.
+        { path: ".agents/skills", recursive: false, ancestors: true, namePrefix: "" },
+      ],
+    });
+    // The host-only rest (settings-configured roots, loose skill files) comes
+    // from this plugin's `resolveNativeRoots`.
+    expect(declaration.experimental_resolvesNativeRoots).toBe(true);
+    // prime has no separate prompt-file command surface on this ticket.
+    expect(declaration.experimental_nativeCommandRoots).toBeUndefined();
+  });
+
   it("registers our declaration with only the host's defaulting on top", () => {
     const declaration = registeredDeclaration();
     const ours = primeProviderDeclaration();
     expect(declaration.strings).toEqual(ours.strings);
     expect(declaration.capabilities).toEqual(ours.capabilities);
     expect(declaration.reasoningLevels).toEqual(ours.reasoningLevels);
-    // The host fills these two defaults; neither opts us into extra surfaces.
-    expect(declaration.experimental_resolvesNativeRoots).toBe(false);
+    // The host fills this default; the declaration itself is unchanged. The
+    // native-roots resolution we opt into is covered by its own tests.
     expect(declaration.models).toEqual({ scope: "workspace" });
   });
 });

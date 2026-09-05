@@ -54,6 +54,7 @@ import {
   type ConfiguredSkillRoot,
   type SessionRecord,
 } from "./session-table.js";
+import { sessionSkillRoots } from "./session-params.js";
 
 /**
  * The prime-agent provider bridge.
@@ -109,8 +110,23 @@ const toolCalls = createPendingToolCallTracker({
   sendToolCall: (request) => io.send(request),
 });
 
-/** Skill roots from `skills/configure`, consumed when sessions are created. */
+/**
+ * Skill roots from `skills/configure`, consumed when sessions are created.
+ *
+ * bb sends the catalog of *its own* skills once per process, after the
+ * handshake and before the first thread command, to a bridge that declared
+ * `skills: {configure: true}`. prime discovers its own skills worker-side
+ * (`noSkills: false`), so the catalog informs nothing on prime's behalf — it
+ * is what lets a *bb* skill resolve inside a prime session: the roots join
+ * `create.config.skills` (prime's additive `--skill` form) for every session
+ * created after the configure arrived.
+ */
 let configuredSkillRoots: readonly ConfiguredSkillRoot[] = [];
+
+/** The configured root paths a new session loads (`create.config.skills`). */
+function configuredSkillRootPaths(): string[] {
+  return sessionSkillRoots(configuredSkillRoots.map((root) => root.path)) ?? [];
+}
 
 let bridgeContext: ProviderBridgeContext | undefined;
 
@@ -274,6 +290,8 @@ async function startSession(args: {
   /** The extension picker's selection, read from this command's options. */
   enabledExtensions?: readonly string[] | undefined;
   input: readonly PromptInput[] | undefined;
+  /** bb's configured skill roots for the new session (bbpa-ggf.8), when any. */
+  skillRoots?: readonly string[] | undefined;
   /** Runs after the session exists but before the first prompt — the window
    * where the dynamic-tools set must be published, so the model's first turn
    * already sees the bb tools. */
@@ -290,6 +308,7 @@ async function startSession(args: {
       reasoningLevel: args.reasoningLevel,
       enabledExtensions: args.enabledExtensions,
       dynamicTools: dynamicTools.sessionConfig(record.threadId),
+      skillRoots: args.skillRoots,
     });
     sessions.adoptProviderThreadId(record, identity.providerThreadId);
   } catch (error) {
@@ -515,6 +534,11 @@ const handlers: Record<string, RequestHandler> = {
           enabledExtensions: enabledExtensionsFromProviderOptions(
             parsed.data.options.providerOptions,
           ),
+          // The skills/configure catalog (bb's own skills), read at create
+          // time like the picker's selection: a session created before the
+          // configure arrived cannot have it, and a resume attaches to the
+          // resident worker without re-sending anything.
+          skillRoots: configuredSkillRootPaths(),
           input: parsed.data.input,
           beforeFirstTurn: () => publishDynamicTools(record),
         }),
@@ -829,6 +853,11 @@ export function handleLine(line: string): void {
 /** The skills/configure catalog, for tests and for session creation. */
 export function currentConfiguredSkillRoots(): readonly ConfiguredSkillRoot[] {
   return configuredSkillRoots;
+}
+
+/** Test seam: forget the configured skill catalog (bb sends it once per process). */
+export function resetConfiguredSkillRootsForTests(): void {
+  configuredSkillRoots = [];
 }
 
 /** Test seam: the process-local session table. */
