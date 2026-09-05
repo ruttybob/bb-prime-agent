@@ -1,20 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { describe, expect, it } from "vitest";
 import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
-import {
-  handleLine,
-  resetDaemonForTests,
-  sessionTableForTests,
-} from "./src/provider-bridge.js";
+import { sessionTableForTests } from "./src/provider-bridge.js";
 import { PRIME_QUEUE_EXTENSION_KIND } from "./src/queue-state.js";
-import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
+import { type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
 import {
-  createScriptedDaemon,
-  type ScriptedDaemonHandle,
-} from "./test-support/scripted-daemon.js";
+  CLIENT_REQUEST_ID,
+  FULL_OPTIONS,
+  startBridgeHarness,
+  type BridgeResponse,
+} from "./test-support/bridge-harness.js";
 
 /**
  * The steering surface (bbpa-ggf.5): `turn/steer` onto prime's steering lane,
@@ -22,94 +16,22 @@ import {
  * queue surfaced as the thread's queue state.
  */
 
-let output: CapturedBridgeJsonRpcOutput;
-let collected: unknown[] = [];
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
-let cwd: string;
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected = [];
-  cwd = "/tmp/prime-workspace";
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_1",
-      sessionFile: "/tmp/prime/sessions/sess_1.jsonl",
-      sessionName: "[bb] scripted thread",
-      cwd,
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_1",
+    sessionFile: "/tmp/prime/sessions/sess_1.jsonl",
+    sessionName: "[bb] scripted thread",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
 });
 
-afterEach(() => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-});
-
-function messages(): unknown[] {
-  collected.push(...output.takeMessages());
-  return collected;
-}
-
-function sendRequest(id: string, method: string, params: unknown = {}): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-interface Response {
-  id: string;
-  result?: Record<string, unknown>;
-  error?: { code: number; message: string; data?: unknown };
-}
-
-function responses(): Response[] {
-  return messages().filter(
-    (message): message is Response =>
-      typeof message === "object" &&
-      message !== null &&
-      !("method" in (message as Record<string, unknown>)),
-  );
-}
-
-async function waitForResponse(id: string, timeoutMs = 2_000): Promise<Response> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const found = responses().find((message) => message.id === id);
-    if (found !== undefined) {
-      return found;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no response with id ${id} within ${timeoutMs}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-function deltas(threadId: string): Array<Record<string, unknown>> {
-  return notifications("thread/delta")
-    .filter((message) => message.params.threadId === threadId)
-    .flatMap((message) => message.params.deltas as Array<Record<string, unknown>>);
-}
-
-function notifications(method: string): Array<{ params: Record<string, unknown> }> {
-  return messages().filter(
-    (message): message is { method: string; params: Record<string, unknown> } =>
-      typeof message === "object" &&
-      message !== null &&
-      (message as Record<string, unknown>).method === method,
-  );
-}
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
-
-const CLIENT_REQUEST_ID = "creq_abcdefghij";
+const { cwd, sendRequest, waitForResponse, deltas, forgetMessages } = h;
 
 interface StartThreadArgs {
   id: string;
@@ -138,7 +60,7 @@ async function runTurn(args: {
   events?: readonly unknown[];
   text?: string;
   clientRequestId?: string;
-}): Promise<Response> {
+}): Promise<BridgeResponse> {
   daemon.enqueuePrompt({ events: args.events ?? [] });
   sendRequest(args.id, "turn/start", {
     threadId: args.threadId,
@@ -156,7 +78,7 @@ async function steer(args: {
   providerThreadId?: string;
   text?: string;
   clientRequestId?: string;
-}): Promise<Response> {
+}): Promise<BridgeResponse> {
   sendRequest(args.id, "turn/steer", {
     threadId: args.threadId,
     providerThreadId: args.providerThreadId ?? "prime_sess_1",
@@ -187,7 +109,7 @@ describe("turn/steer onto prime's steering lane", () => {
       providerThreadId,
       events: [{ type: "agent_start" }],
     });
-    collected = [];
+    forgetMessages();
 
     daemon.enqueueOk("prompt");
     const reply = await steer({ id: "t3", threadId: "thr_1", providerThreadId });
@@ -256,7 +178,7 @@ describe("turn/steer onto prime's steering lane", () => {
   it("steers an idle lane through prime's resumeIfIdle instead of refusing", async () => {
     const providerThreadId = await startThread({ id: "t1", threadId: "thr_1" });
     expect(sessionTableForTests().byThread("thr_1")?.session).toBeDefined();
-    collected = [];
+    forgetMessages();
 
     daemon.enqueueOk("steer");
     const reply = await steer({ id: "t2", threadId: "thr_1", providerThreadId });
@@ -313,7 +235,7 @@ describe("busy lanes and follow-up", () => {
 
     // A second turn while prime is still running the first: queued on the
     // follow-up lane (delivered only after the agent finishes), never aborting.
-    collected = [];
+    forgetMessages();
     const reply = await runTurn({
       id: "t3",
       threadId: "thr_1",
@@ -337,7 +259,7 @@ describe("busy lanes and follow-up", () => {
 describe("queue state surfacing", () => {
   it("surfaces prime's waiting lanes as queue state while messages wait", async () => {
     await startThread({ id: "t1", threadId: "thr_1" });
-    collected = [];
+    forgetMessages();
 
     pushEvent(
       {
@@ -368,7 +290,7 @@ describe("queue state surfacing", () => {
     });
 
     // …and an unchanged queue re-emits nothing.
-    collected = [];
+    forgetMessages();
     pushEvent({ type: "session_action_update", actions: { queuedCount: 0, steering: [], followUps: [] } }, 12);
     expect(deltas("thr_1")).toEqual([]);
   });

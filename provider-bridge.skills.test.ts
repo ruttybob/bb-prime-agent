@@ -1,21 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { describe, expect, it } from "vitest";
 import {
   currentConfiguredSkillRoots,
-  handleLine,
   resetConfiguredSkillRootsForTests,
-  resetDaemonForTests,
-  sessionTableForTests,
 } from "./src/provider-bridge.js";
-import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
-import {
-  createScriptedDaemon,
-  textTurnEvents,
-  type ScriptedDaemonHandle,
-} from "./test-support/scripted-daemon.js";
+import { textTurnEvents, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
+import { FULL_OPTIONS, startBridgeHarness } from "./test-support/bridge-harness.js";
 
 /**
  * The skills surface on the bridge (bbpa-ggf.8).
@@ -43,65 +32,25 @@ const SKILL_ROOTS = [
   },
 ];
 
-let output: CapturedBridgeJsonRpcOutput;
-let collected: unknown[] = [];
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected = [];
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_skills",
-      sessionFile: "/tmp/prime/sessions/sess_skills.jsonl",
-      sessionName: "[bb] skills thread",
-      cwd: "/tmp/prime-workspace",
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_skills",
+    sessionFile: "/tmp/prime/sessions/sess_skills.jsonl",
+    sessionName: "[bb] skills thread",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
+  afterEachExtra: () => {
+    resetConfiguredSkillRootsForTests();
+  },
 });
 
-afterEach(() => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  resetConfiguredSkillRootsForTests();
-  sessionTableForTests().clear();
-});
-
-function sendRequest(id: string, method: string, params: unknown): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-interface Response {
-  id: string;
-  result?: Record<string, unknown>;
-  error?: { code: number; message: string; data?: unknown };
-}
-
-function responses(): Response[] {
-  collected.push(...output.takeMessages());
-  return collected.filter(
-    (message): message is Response =>
-      typeof message === "object" &&
-      message !== null &&
-      !("method" in (message as Record<string, unknown>)),
-  );
-}
-
-async function waitForResponse(id: string, timeoutMs = 2_000): Promise<Response> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const found = responses().find((message) => message.id === id);
-    if (found !== undefined) {
-      return found;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no response with id ${id} within ${timeoutMs}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
+const { sendRequest, waitForResponse, responses } = h;
 
 function commands(type: string): Array<Record<string, unknown>> {
   return daemon.commands.filter(
@@ -116,13 +65,6 @@ function createConfig(create: Record<string, unknown>): Record<string, unknown> 
 function promptMessages(): Array<Record<string, unknown>> {
   return commands("prompt");
 }
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
 
 /** A skill pick as bb's composer sends it: `/name` text plus the mention. */
 function skillMention(name: string, start = 0): unknown {

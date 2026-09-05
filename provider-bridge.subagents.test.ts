@@ -1,17 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_assembleCapturedThreadEvents as assembleCapturedThreadEvents,
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
-import type { ThreadDelta } from "@get-bb/plugin-sdk/provider-bridge";
-import { handleLine, resetDaemonForTests, sessionTableForTests } from "./src/provider-bridge.js";
-import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
-import {
-  createScriptedDaemon,
-  textTurnEvents,
-  type ScriptedDaemonHandle,
-} from "./test-support/scripted-daemon.js";
+import { describe, expect, it } from "vitest";
+import { experimental_assembleCapturedThreadEvents as assembleCapturedThreadEvents } from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { textTurnEvents, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
+import { FULL_OPTIONS, startBridgeHarness } from "./test-support/bridge-harness.js";
 
 /**
  * Subagents on the timeline (bbpa-ggf.9).
@@ -25,58 +15,22 @@ import {
  * pinned too.
  */
 
-let output: CapturedBridgeJsonRpcOutput;
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
-const collected: unknown[] = [];
-const cwd = "/tmp/prime-workspace";
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected.length = 0;
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_children",
-      sessionFile: "/tmp/prime/sessions/sess_children.jsonl",
-      sessionName: "[bb] children",
-      cwd,
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_children",
+    sessionFile: "/tmp/prime/sessions/sess_children.jsonl",
+    sessionName: "[bb] children",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
 });
 
-afterEach(() => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-});
-
-function sendRequest(id: string, method: string, params: unknown): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-function drain(): unknown[] {
-  collected.push(...output.takeMessages());
-  return collected;
-}
-
-function deltas(threadId: string): ThreadDelta[] {
-  return drain().flatMap(
-    (message): ThreadDelta[] => {
-      if (
-        typeof message !== "object" ||
-        message === null ||
-        (message as { method?: unknown }).method !== "thread/delta" ||
-        (message as { params?: { threadId?: unknown } }).params?.threadId !==
-          threadId
-      ) {
-        return [];
-      }
-      return ((message as { params: { deltas?: ThreadDelta[] } }).params
-        .deltas ?? []) as ThreadDelta[];
-    },
-  );
-}
+const { cwd, sendRequest, messages, deltas, waitFor } = h;
 
 function delegationRows(
   events: readonly unknown[],
@@ -92,7 +46,7 @@ function delegationRows(
 
 function assembled(threadId: string): ReturnType<typeof assembleCapturedThreadEvents> {
   return assembleCapturedThreadEvents(
-    drain().filter(
+    messages().filter(
       (message): message is { method: string; params: Record<string, unknown> } =>
         typeof message === "object" &&
         message !== null &&
@@ -102,27 +56,6 @@ function assembled(threadId: string): ReturnType<typeof assembleCapturedThreadEv
     "prime-agent",
   );
 }
-
-async function waitFor(
-  label: string,
-  predicate: () => boolean,
-  timeoutMs = 2_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) {
-      throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
 
 function scoutChild(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {

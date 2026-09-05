@@ -13,6 +13,9 @@ const scan = scanPublicSdkOnly(dirname(fileURLToPath(import.meta.url)), {
   // jsdom are test-only.
   allow: [
     /^vitest\/config$/u,
+    // The shared test harness under test-support/ registers vitest's per-test
+    // wiring — test tooling, never shipped in the plugin artifact.
+    /^vitest$/u,
     /^@get-bb\/plugin-sdk\/provider-bridge\/testing$/u,
     /^@get-bb\/plugin-sdk\/testing(\/|$)/u,
     /^react(\/|$)/u,

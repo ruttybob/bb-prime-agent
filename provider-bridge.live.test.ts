@@ -20,7 +20,6 @@ import {
   resetDaemonForTests,
   sessionTableForTests,
 } from "./src/provider-bridge.js";
-import { BB_TOOLS_CHANNEL_FLAG } from "./src/dynamic-tools/protocol.js";
 import { FakeExtension } from "./test-support/fake-extension.js";
 import { PrimeDaemonClient } from "./src/daemon/client.js";
 import { resolveDaemonSocketPath } from "./src/daemon/socket.js";
@@ -28,6 +27,7 @@ import {
   BB_SESSION_NAME_PREFIX,
   primeSessionName,
 } from "./src/session-params.js";
+import { FULL_OPTIONS } from "./test-support/bridge-harness.js";
 
 /**
  * The live lane: a real turn against the real installed prime-agent daemon.
@@ -266,13 +266,6 @@ async function waitForAsync(
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
 }
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
 
 it.skipIf(!LIVE)(
   "exchanges a full streamed turn with the installed prime-agent",

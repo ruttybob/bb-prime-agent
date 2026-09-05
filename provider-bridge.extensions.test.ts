@@ -1,23 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
-import {
-  dynamicToolsRegistryForTests,
-  handleLine,
-  resetDaemonForTests,
-  sessionTableForTests,
-} from "./src/provider-bridge.js";
-import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
+import { describe, expect, it } from "vitest";
+import { dynamicToolsRegistryForTests } from "./src/provider-bridge.js";
 import { companionExtensionPath } from "./src/dynamic-tools/registry.js";
 import { BB_TOOLS_CHANNEL_FLAG } from "./src/dynamic-tools/protocol.js";
-import {
-  createScriptedDaemon,
-  textTurnEvents,
-  type ScriptedDaemonHandle,
-} from "./test-support/scripted-daemon.js";
+import { textTurnEvents, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
 import { FakeExtension } from "./test-support/fake-extension.js";
+import { FULL_OPTIONS, startBridgeHarness } from "./test-support/bridge-harness.js";
 
 /**
  * The extension picker on the session path (bbpa-ggf.12): the selection the
@@ -33,76 +20,25 @@ const ENABLED = [
   "/tmp/prime-extensions/beta/index.ts",
 ];
 
-let output: CapturedBridgeJsonRpcOutput;
-let collected: unknown[] = [];
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected = [];
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_ext",
-      sessionFile: "/tmp/prime/sessions/sess_ext.jsonl",
-      sessionName: "[bb] extension picker thread",
-      cwd: "/tmp/prime-workspace",
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_ext",
+    sessionFile: "/tmp/prime/sessions/sess_ext.jsonl",
+    sessionName: "[bb] extension picker thread",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
+  afterEachExtra: async () => {
+    await dynamicToolsRegistryForTests().clear();
+  },
 });
 
-afterEach(async () => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-  await dynamicToolsRegistryForTests().clear();
-});
-
-interface Response {
-  id: string;
-  result?: Record<string, unknown>;
-  error?: { code: number; message: string; data?: unknown };
-}
-
-function responses(): Response[] {
-  collected.push(...output.takeMessages());
-  return collected.filter(
-    (message): message is Response =>
-      typeof message === "object" &&
-      message !== null &&
-      !("method" in (message as Record<string, unknown>)),
-  );
-}
-
-/** Poll for an answer that lands on a later tick (async handlers). */
-async function waitForResponse(id: string, timeoutMs = 2_000): Promise<Response> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const found = responses().find((message) => message.id === id);
-    if (found !== undefined) {
-      return found;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no response with id ${id} within ${timeoutMs}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-async function waitFor(
-  label: string,
-  predicate: () => boolean,
-  timeoutMs = 2_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) {
-      throw new Error(`timed out waiting for ${label}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
+const { sendRequest, waitForResponse, waitFor } = h;
 
 function commands(type: string): Array<Record<string, unknown>> {
   return daemon.commands.filter(
@@ -113,13 +49,6 @@ function commands(type: string): Array<Record<string, unknown>> {
 function createConfig(create: Record<string, unknown>): Record<string, unknown> {
   return create.config as Record<string, unknown>;
 }
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
 
 /** Options carrying the picker's derived selection. */
 function pickerOptions(enabled: unknown): Record<string, unknown> {
@@ -138,21 +67,14 @@ function sendStart(
   daemon.enqueuePrompt({ events: textTurnEvents({ text: "ok" }) });
   daemon.enqueueOk("abort");
   daemon.enqueueOk("detach");
-  handleLine(
-    JSON.stringify({
-      jsonrpc: "2.0",
-      id,
-      method: "thread/start",
-      params: {
-        threadId,
-        cwd: "/tmp/prime-workspace",
-        instructionMode: "append",
-        input: [{ type: "text", text: "hi", mentions: [] }],
-        options,
-        ...(dynamicTools === undefined ? {} : { dynamicTools }),
-      },
-    }),
-  );
+  sendRequest(id, "thread/start", {
+    threadId,
+    cwd: "/tmp/prime-workspace",
+    instructionMode: "append",
+    input: [{ type: "text", text: "hi", mentions: [] }],
+    options,
+    ...(dynamicTools === undefined ? {} : { dynamicTools }),
+  });
 }
 
 const DYNAMIC_TOOLS = [
@@ -267,20 +189,13 @@ describe("the extension picker on the session path", () => {
     // The user flipped the picker between turns: the resume carries a new
     // selection, but the resident session was already created with the old one.
     daemon.enqueueAttach();
-    handleLine(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: "t2",
-        method: "thread/resume",
-        params: {
-          threadId: "thr_live",
-          providerThreadId: "prime_sess_ext",
-          cwd: "/tmp/prime-workspace",
-          instructionMode: "append",
-          options: pickerOptions(["/tmp/prime-extensions/changed.ts"]),
-        },
-      }),
-    );
+    sendRequest("t2", "thread/resume", {
+      threadId: "thr_live",
+      providerThreadId: "prime_sess_ext",
+      cwd: "/tmp/prime-workspace",
+      instructionMode: "append",
+      options: pickerOptions(["/tmp/prime-extensions/changed.ts"]),
+    });
     const reply = await waitForResponse("t2");
     expect(reply.error).toBeUndefined();
 

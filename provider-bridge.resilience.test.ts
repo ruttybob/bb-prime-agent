@@ -1,23 +1,24 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { describe, expect, it } from "vitest";
 import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
-import {
-  dynamicToolsRegistryForTests,
-  handleLine,
-  resetDaemonForTests,
-  sessionTableForTests,
-} from "./src/provider-bridge.js";
+import { dynamicToolsRegistryForTests } from "./src/provider-bridge.js";
 import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
 import { DaemonCapabilityUnavailableError } from "./src/daemon/client.js";
 import { checkDaemonCommandSupport } from "./src/daemon/protocol.js";
 import type { DaemonHello } from "./src/daemon/protocol.js";
-import { createScriptedDaemon, textTurnEvents, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
+import {
+  createScriptedDaemon,
+  textTurnEvents,
+  type ScriptedDaemonHandle,
+} from "./test-support/scripted-daemon.js";
 import { calibratedHello } from "./test-support/fake-daemon.js";
 import { FakeExtension } from "./test-support/fake-extension.js";
 import { BB_TOOLS_CHANNEL_FLAG } from "./src/dynamic-tools/protocol.js";
+import {
+  CLIENT_REQUEST_ID,
+  FULL_OPTIONS,
+  startBridgeHarness,
+  type BridgeResponse,
+} from "./test-support/bridge-harness.js";
 
 /**
  * Daemon-restart resilience (bbpa-ggf.11): a socket that dies mid-turn, the
@@ -25,104 +26,27 @@ import { BB_TOOLS_CHANNEL_FLAG } from "./src/dynamic-tools/protocol.js";
  * and no takeover of a daemon this bridge did not start.
  */
 
-let output: CapturedBridgeJsonRpcOutput;
-let collected: unknown[] = [];
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
-const cwd = "/tmp/prime-workspace";
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected = [];
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_1",
-      sessionFile: "/tmp/prime/sessions/sess_1.jsonl",
-      sessionName: "[bb] scripted thread",
-      cwd,
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_1",
+    sessionFile: "/tmp/prime/sessions/sess_1.jsonl",
+    sessionName: "[bb] scripted thread",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
 });
 
-afterEach(async () => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-});
+const { cwd, sendRequest, deltas, waitFor } = h;
 
-function messages(): unknown[] {
-  collected.push(...output.takeMessages());
-  return collected;
+/** Same poll as the harness, with this file's longer settle budget. */
+function waitForResponse(id: string, timeoutMs = 4_000): Promise<BridgeResponse> {
+  return h.waitForResponse(id, timeoutMs);
 }
-
-function sendRequest(id: string, method: string, params: unknown = {}): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-interface Response {
-  id: string;
-  result?: Record<string, unknown>;
-  error?: { code: number; message: string; data?: unknown };
-}
-
-async function waitForResponse(id: string, timeoutMs = 4_000): Promise<Response> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const found = messages().find(
-      (message): message is Response =>
-        typeof message === "object" &&
-        message !== null &&
-        (message as { id?: unknown }).id === id &&
-        (message as { method?: unknown }).method === undefined,
-    );
-    if (found !== undefined) {
-      return found;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no response with id ${id} within ${timeoutMs}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-function notifications(method: string): Array<{ params: Record<string, unknown> }> {
-  return messages().filter(
-    (message): message is { method: string; params: Record<string, unknown> } =>
-      typeof message === "object" &&
-      message !== null &&
-      (message as Record<string, unknown>).method === method,
-  );
-}
-
-function deltas(threadId: string): Array<Record<string, unknown>> {
-  return notifications("thread/delta")
-    .filter((message) => message.params.threadId === threadId)
-    .flatMap((message) => message.params.deltas as Array<Record<string, unknown>>);
-}
-
-async function waitFor(
-  label: string,
-  predicate: () => boolean,
-  timeoutMs = 2_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) {
-      throw new Error(`timed out waiting for ${label}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
-
-const CLIENT_REQUEST_ID = "creq_abcdefghij";
 
 const TEXT_INPUT = (text: string) => [{ type: "text" as const, text, mentions: [] as never[] }];
 
@@ -151,7 +75,7 @@ async function runTurn(
   threadId: string,
   providerThreadId: string,
   args: { text?: string; events?: readonly unknown[] } = {},
-): Promise<Response> {
+): Promise<BridgeResponse> {
   daemon.enqueuePrompt({ events: args.events ?? textTurnEvents({ text: "later answer" }) });
   sendRequest(id, "turn/start", {
     threadId,

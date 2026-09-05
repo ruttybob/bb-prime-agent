@@ -1,16 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_assembleCapturedThreadEvents as assembleCapturedThreadEvents,
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
-import { handleLine, resetDaemonForTests, sessionTableForTests } from "./src/provider-bridge.js";
-import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
-import {
-  createScriptedDaemon,
-  textTurnEvents,
-  type ScriptedDaemonHandle,
-} from "./test-support/scripted-daemon.js";
+import { describe, expect, it } from "vitest";
+import { experimental_assembleCapturedThreadEvents as assembleCapturedThreadEvents } from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { textTurnEvents, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
+import { FULL_OPTIONS, startBridgeHarness } from "./test-support/bridge-harness.js";
 
 /**
  * The streamed feed, assembled by the runtime's real assembler.
@@ -21,44 +12,26 @@ import {
  * the interrupt settlement — over a scripted prime event feed, in-process.
  */
 
-let output: CapturedBridgeJsonRpcOutput;
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
-const collected: unknown[] = [];
-const cwd = "/tmp/prime-workspace";
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected.length = 0;
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_stream",
-      sessionFile: "/tmp/prime/sessions/sess_stream.jsonl",
-      sessionName: "[bb] stream",
-      cwd,
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_stream",
+    sessionFile: "/tmp/prime/sessions/sess_stream.jsonl",
+    sessionName: "[bb] stream",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
 });
 
-afterEach(() => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-});
-
-function sendRequest(id: string, method: string, params: unknown): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-function drain(): unknown[] {
-  collected.push(...output.takeMessages());
-  return collected;
-}
+const { cwd, sendRequest, messages, waitFor } = h;
 
 function assembled(threadId: string): ReturnType<typeof assembleCapturedThreadEvents> {
   return assembleCapturedThreadEvents(
-    drain().filter(
+    messages().filter(
       (message): message is { method: string; params: Record<string, unknown> } =>
         typeof message === "object" &&
         message !== null &&
@@ -68,27 +41,6 @@ function assembled(threadId: string): ReturnType<typeof assembleCapturedThreadEv
     "prime-agent",
   );
 }
-
-async function waitFor(
-  label: string,
-  predicate: () => boolean,
-  timeoutMs = 2_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) {
-      throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
 
 describe("a scripted prime feed, assembled", () => {
   it("builds a timeline: streamed answer, reasoning, usage, completed turn", async () => {
@@ -269,7 +221,7 @@ describe("a scripted prime feed, assembled", () => {
       options: FULL_OPTIONS,
     });
     await waitFor("the resume response", () =>
-      drain().some(
+      messages().some(
         (message) =>
           typeof message === "object" &&
           message !== null &&
@@ -305,7 +257,7 @@ describe("a scripted prime feed, assembled", () => {
       options: FULL_OPTIONS,
     });
     await waitFor("the turn/start response", () =>
-      drain().some(
+      messages().some(
         (message) =>
           typeof message === "object" &&
           message !== null &&

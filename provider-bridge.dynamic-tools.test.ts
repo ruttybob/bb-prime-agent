@@ -1,91 +1,27 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
-import {
-  dynamicToolsRegistryForTests,
-  handleLine,
-  resetDaemonForTests,
-  sessionTableForTests,
-} from "./src/provider-bridge.js";
-import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
+import { describe, expect, it } from "vitest";
+import { handleLine, dynamicToolsRegistryForTests } from "./src/provider-bridge.js";
 import { companionExtensionPath } from "./src/dynamic-tools/registry.js";
 import { BB_TOOLS_CHANNEL_FLAG } from "./src/dynamic-tools/protocol.js";
-import { createScriptedDaemon, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
+import { textTurnEvents, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
 import { FakeExtension } from "./test-support/fake-extension.js";
-import { textTurnEvents } from "./test-support/scripted-daemon.js";
+import { FULL_OPTIONS, startBridgeHarness } from "./test-support/bridge-harness.js";
 
-let output: CapturedBridgeJsonRpcOutput;
-let collected: unknown[] = [];
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected = [];
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_dt",
-      sessionFile: "/tmp/prime/sessions/sess_dt.jsonl",
-      sessionName: "[bb] dynamic tools thread",
-      cwd: "/tmp/prime-workspace",
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_dt",
+    sessionFile: "/tmp/prime/sessions/sess_dt.jsonl",
+    sessionName: "[bb] dynamic tools thread",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
 });
 
-afterEach(() => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-  // The registry itself is closed per-test; any leaked socket is a test bug.
-});
-
-function messages(): unknown[] {
-  collected.push(...output.takeMessages());
-  return collected;
-}
-
-function sendRequest(id: string, method: string, params: unknown = {}): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
-
-/** Any answer to a request id — result or error; the caller asserts which. */
-async function waitForAnyResponse(id: string, timeoutMs = 4_000): Promise<Record<string, unknown>> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const found = messages().find(
-      (message) =>
-        (message as { id?: unknown; method?: unknown }).id === id &&
-        (message as { method?: unknown }).method === undefined,
-    );
-    if (found !== undefined) {
-      return found as Record<string, unknown>;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no response with id ${id} within ${timeoutMs}ms; got ${JSON.stringify(messages())}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
-
-async function waitFor(label: string, predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) {
-      throw new Error(`timed out waiting for ${label}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-}
+const { sendRequest, waitForAnyResponse, waitFor, messages } = h;
 
 const DYNAMIC_TOOLS = [
   {

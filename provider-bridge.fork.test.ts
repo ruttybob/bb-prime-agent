@@ -1,27 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
-import {
-  BRIDGE_NOTIFICATION_METHODS,
-  BRIDGE_JSON_RPC_ERRORS,
-} from "@get-bb/plugin-sdk/provider-bridge";
+import { describe, expect, it } from "vitest";
+import { BRIDGE_NOTIFICATION_METHODS, BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
 import {
   dynamicToolsRegistryForTests,
-  handleLine,
-  resetDaemonForTests,
   sessionTableForTests,
 } from "./src/provider-bridge.js";
-import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
 import { BB_TOOLS_CHANNEL_FLAG } from "./src/dynamic-tools/protocol.js";
 import { FakeExtension } from "./test-support/fake-extension.js";
 import { primeAgentDir, primeSessionName } from "./src/session-params.js";
-import {
-  createScriptedDaemon,
-  textTurnEvents,
-  type ScriptedDaemonHandle,
-} from "./test-support/scripted-daemon.js";
+import { textTurnEvents, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
+import { FULL_OPTIONS, startBridgeHarness } from "./test-support/bridge-harness.js";
 
 /**
  * bb's `thread/fork` (bbpa-ggf.7): forking from an earlier message creates a
@@ -33,104 +20,31 @@ import {
  * branch file — fails loudly against a script that no longer matches.
  */
 
-let output: CapturedBridgeJsonRpcOutput;
-let collected: unknown[] = [];
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
-let cwd: string;
 let liveExtension: FakeExtension | undefined;
 
 const SOURCE_FILE = "/tmp/prime/sessions/sess_1.jsonl";
 const BRANCH_FILE = "/tmp/prime/sessions/sess_branch.jsonl";
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected = [];
-  cwd = "/tmp/prime-workspace";
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_1",
-      sessionFile: SOURCE_FILE,
-      sessionName: "[bb] source thread (thr_1)",
-      cwd,
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_1",
+    sessionFile: SOURCE_FILE,
+    sessionName: "[bb] source thread (thr_1)",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
+  afterEachExtra: async () => {
+    await liveExtension?.close();
+    liveExtension = undefined;
+    await dynamicToolsRegistryForTests().clear();
+  },
 });
 
-afterEach(async () => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-  await liveExtension?.close();
-  liveExtension = undefined;
-  await dynamicToolsRegistryForTests().clear();
-});
-
-async function waitFor(label: string, predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() > deadline) {
-      throw new Error(`timed out waiting for ${label}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-}
-
-function messages(): unknown[] {
-  collected.push(...output.takeMessages());
-  return collected;
-}
-
-function sendRequest(id: string, method: string, params: unknown = {}): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-interface Response {
-  id: string;
-  result?: Record<string, unknown>;
-  error?: { code: number; message: string };
-}
-
-async function waitForResponse(id: string, timeoutMs = 2_000): Promise<Response> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const found = messages().find(
-      (message) =>
-        (message as { id?: unknown }).id === id &&
-        (message as { method?: unknown }).method === undefined,
-    );
-    if (found !== undefined) {
-      return found as Response;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no response with id ${id} within ${timeoutMs}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-function notifications(method: string): Array<{ params: Record<string, unknown> }> {
-  return messages().filter(
-    (message): message is { method: string; params: Record<string, unknown> } =>
-      typeof message === "object" &&
-      message !== null &&
-      (message as Record<string, unknown>).method === method,
-  );
-}
-
-function deltas(threadId: string): Array<Record<string, unknown>> {
-  return notifications("thread/delta")
-    .filter((message) => message.params.threadId === threadId)
-    .flatMap((message) => message.params.deltas as Array<Record<string, unknown>>);
-}
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
+const { cwd, sendRequest, waitForResponse, notifications, deltas, waitFor } = h;
 
 /** Start the source thread and settle one completed turn on it. */
 async function startSourceThread(

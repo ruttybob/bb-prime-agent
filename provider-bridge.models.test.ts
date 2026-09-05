@@ -1,28 +1,20 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { describe, expect, it, vi } from "vitest";
 import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
-import {
-  handleLine,
-  resetDaemonForTests,
-  sessionTableForTests,
-} from "./src/provider-bridge.js";
 import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
 import { calibratedHello, FakeDaemon } from "./test-support/fake-daemon.js";
 import { createSocketTransport } from "./src/daemon/transport.js";
-import {
-  createScriptedDaemon,
-  textTurnEvents,
-  type ScriptedDaemonHandle,
-} from "./test-support/scripted-daemon.js";
+import { textTurnEvents, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
 import { resetModelCatalogForTests } from "./src/model-catalog.js";
 import {
   splitPrimeModelId,
   supportedPrimeThinkingLevels,
 } from "./src/session-params.js";
 import { primeProviderDeclaration } from "./src/declaration.js";
+import {
+  CLIENT_REQUEST_ID,
+  FULL_OPTIONS,
+  startBridgeHarness,
+} from "./test-support/bridge-harness.js";
 
 /**
  * The model/thinking/compaction surface (bbpa-ggf.6), over the scripted
@@ -33,97 +25,30 @@ import { primeProviderDeclaration } from "./src/declaration.js";
  * compaction mapped onto prime's `compact` with its events streamed.
  */
 
-let output: CapturedBridgeJsonRpcOutput;
-let collected: unknown[] = [];
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
 let fake: FakeDaemon | undefined;
-let cwd: string;
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected = [];
-  cwd = "/tmp/prime-workspace";
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_1",
-      sessionFile: "/tmp/prime/sessions/sess_1.jsonl",
-      sessionName: "[bb] scripted thread",
-      cwd,
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
-  resetModelCatalogForTests();
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_1",
+    sessionFile: "/tmp/prime/sessions/sess_1.jsonl",
+    sessionName: "[bb] scripted thread",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+    resetModelCatalogForTests();
+  },
+  afterEachExtra: async () => {
+    delete process.env.BB_PRIME_AGENT_DAEMON_SOCKET;
+    resetModelCatalogForTests();
+    await fake?.close();
+    fake = undefined;
+  },
 });
 
-afterEach(async () => {
-  output.restore();
-  delete process.env.BB_PRIME_AGENT_DAEMON_SOCKET;
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-  resetModelCatalogForTests();
-  await fake?.close();
-  fake = undefined;
-});
-
-function messages(): unknown[] {
-  collected.push(...output.takeMessages());
-  return collected;
-}
-
-function sendRequest(id: string, method: string, params: unknown = {}): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-interface Response {
-  id: string;
-  result?: Record<string, unknown>;
-  error?: { code: number; message: string; data?: unknown };
-}
-
-function responses(): Response[] {
-  return messages().filter(
-    (message): message is Response =>
-      typeof message === "object" &&
-      message !== null &&
-      !("method" in (message as Record<string, unknown>)),
-  );
-}
-
-async function waitForResponse(id: string, timeoutMs = 2_000): Promise<Response> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const found = responses().find((message) => message.id === id);
-    if (found !== undefined) {
-      return found;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no response with id ${id} within ${timeoutMs}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-function notifications(method: string): Array<{ params: Record<string, unknown> }> {
-  return messages().filter(
-    (message): message is { method: string; params: Record<string, unknown> } =>
-      typeof message === "object" &&
-      message !== null &&
-      (message as Record<string, unknown>).method === method,
-  );
-}
-
-function deltas(threadId: string): Array<Record<string, unknown>> {
-  return notifications("thread/delta")
-    .filter((message) => message.params.threadId === threadId)
-    .flatMap((message) => message.params.deltas as Array<Record<string, unknown>>);
-}
-
-function rawNotifications(method: string): Array<Record<string, unknown>> {
-  return notifications("provider/raw")
-    .map((message) => message.params as Record<string, unknown>)
-    .filter((params) => params.method === method);
-}
+const { cwd, sendRequest, waitForResponse, deltas, rawNotifications, messages } = h;
 
 /** The `prime.session_state` raw mirror payloads (the inner params object). */
 function sessionStateNotifications(): Array<Record<string, unknown>> {
@@ -131,15 +56,6 @@ function sessionStateNotifications(): Array<Record<string, unknown>> {
     (params) => [params.params as Record<string, unknown>],
   );
 }
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
-
-const CLIENT_REQUEST_ID = "creq_abcdefghij";
 
 /** prime's model facts, as the daemon's catalog and connection state carry them. */
 const GLM = {

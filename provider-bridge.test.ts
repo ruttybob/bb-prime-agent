@@ -1,102 +1,35 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { describe, expect, it } from "vitest";
 import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
 import {
   currentConfiguredSkillRoots,
   experimental_providerBridge,
-  handleLine,
   resetDaemonForTests,
   sessionTableForTests,
 } from "./src/provider-bridge.js";
-import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
 import { primeAgentDir } from "./src/session-params.js";
+import { textTurnEvents, type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
 import {
-  createScriptedDaemon,
-  textTurnEvents,
-  type ScriptedDaemonHandle,
-} from "./test-support/scripted-daemon.js";
+  CLIENT_REQUEST_ID,
+  FULL_OPTIONS,
+  startBridgeHarness,
+  type BridgeResponse,
+} from "./test-support/bridge-harness.js";
 
-let output: CapturedBridgeJsonRpcOutput;
-let collected: unknown[] = [];
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
-let cwd: string;
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected = [];
-  cwd = "/tmp/prime-workspace";
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_1",
-      sessionFile: "/tmp/prime/sessions/sess_1.jsonl",
-      sessionName: "[bb] scripted thread",
-      cwd,
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_1",
+    sessionFile: "/tmp/prime/sessions/sess_1.jsonl",
+    sessionName: "[bb] scripted thread",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
 });
 
-afterEach(() => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-});
-
-/**
- * Every read drains the capture and accumulates: takeMessages is destructive,
- * and several bridge answers arrive asynchronously, so tests either read at the
- * end or poll through this one accumulator.
- */
-function messages(): unknown[] {
-  collected.push(...output.takeMessages());
-  return collected;
-}
-
-function sendRequest(id: string, method: string, params: unknown = {}): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-interface Response {
-  id: string;
-  result?: Record<string, unknown>;
-  error?: { code: number; message: string; data?: unknown };
-}
-
-function responses(): Response[] {
-  return messages().filter(
-    (message): message is Response =>
-      typeof message === "object" &&
-      message !== null &&
-      !("method" in (message as Record<string, unknown>)),
-  );
-}
-
-function response(id: string): Response {
-  const reply = responses().find((message) => message.id === id);
-  if (reply === undefined) {
-    throw new Error(`no response with id ${id}`);
-  }
-  return reply;
-}
-
-/** Poll for an answer that lands on a later tick (async handlers). */
-async function waitForResponse(id: string, timeoutMs = 2_000): Promise<Response> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const found = responses().find((message) => message.id === id);
-    if (found !== undefined) {
-      return found;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no response with id ${id} within ${timeoutMs}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
+const { cwd, sendRequest, waitForResponse, notifications, deltas, forgetMessages } = h;
 
 /**
  * `onClose` releases its sessions fire-and-forget (the runtime is already
@@ -115,36 +48,11 @@ async function flushedTeardown(timeoutMs = 2_000): Promise<void> {
   }
 }
 
-function notifications(method: string): Array<{ params: Record<string, unknown> }> {
-  return messages().filter(
-    (message): message is { method: string; params: Record<string, unknown> } =>
-      typeof message === "object" &&
-      message !== null &&
-      (message as Record<string, unknown>).method === method,
-  );
-}
-
-function deltas(threadId: string): Array<Record<string, unknown>> {
-  return notifications("thread/delta")
-    .filter((message) => message.params.threadId === threadId)
-    .flatMap((message) => message.params.deltas as Array<Record<string, unknown>>);
-}
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
-
-/** The runtime mints client request ids as `creq_` + ten [2-9a-kmnp-z] characters. */
-const CLIENT_REQUEST_ID = "creq_abcdefghij";
-
 /** Start a thread, create its resident session, and settle the response. */
 async function startThread(
   id: string,
   threadId: string,
-  input?: Array<{ type: "text"; text: string; mentions: never[] }>,
+  input?: string,
   promptEvents: readonly unknown[] = textTurnEvents({ text: "ok" }),
 ): Promise<string> {
   daemon.enqueueCreate();
@@ -157,7 +65,9 @@ async function startThread(
     cwd,
     instructionMode: "append",
     options: FULL_OPTIONS,
-    ...(input === undefined ? {} : { input }),
+    ...(input === undefined
+      ? {}
+      : { input: [{ type: "text", text: input, mentions: [] }] }),
   });
   const reply = await waitForResponse(id);
   expect(reply.error).toBeUndefined();
@@ -170,7 +80,7 @@ async function runTurn(
   providerThreadId: string,
   events: readonly unknown[],
   text = "hello",
-): Promise<Response> {
+): Promise<BridgeResponse> {
   daemon.enqueuePrompt({ events });
   sendRequest(id, "turn/start", {
     threadId,
@@ -185,9 +95,7 @@ async function runTurn(
 describe("resident session construction", () => {
   it("creates a daemon-resident session with the [bb] name and the thread cwd", async () => {
     daemon.enqueuePrompt({ events: [] });
-    const providerThreadId = await startThread("t1", "thr_1", [
-      { type: "text", text: "count the stars", mentions: [] },
-    ]);
+    const providerThreadId = await startThread("t1", "thr_1", "count the stars");
 
     // The provider thread id is daemon-derived, so it survives a restart.
     expect(providerThreadId).toBe("prime_sess_1");
@@ -212,9 +120,11 @@ describe("resident session construction", () => {
   });
 
   it("announces thread/identity and session.reset before the answer, and streams the first turn", async () => {
-    const providerThreadId = await startThread("t1", "thr_1", [
-      { type: "text", text: "Reply with the single word: ok", mentions: [] },
-    ]);
+    const providerThreadId = await startThread(
+      "t1",
+      "thr_1",
+      "Reply with the single word: ok",
+    );
 
     const identity = notifications("thread/identity").at(-1);
     expect(identity?.params).toMatchObject({
@@ -432,7 +342,7 @@ describe("turn streaming", () => {
       clientRequestId: CLIENT_REQUEST_ID,
       options: FULL_OPTIONS,
     });
-    expect(response("t9").error?.code).toBe(BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS);
+    expect(h.response("t9").error?.code).toBe(BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS);
   });
 });
 
@@ -450,7 +360,7 @@ describe("the snapshot and live event boundary", () => {
       options: FULL_OPTIONS,
     });
     await waitForResponse("t1");
-    collected = [];
+    forgetMessages();
 
     // History the snapshot already counted: dropped, even out of order.
     daemon.push({
@@ -490,7 +400,7 @@ describe("the snapshot and live event boundary", () => {
       options: FULL_OPTIONS,
     });
     await waitForResponse("t1");
-    collected = [];
+    forgetMessages();
 
     // Another bb thread's session (or a pre-attach push) on the shared socket.
     daemon.push({
@@ -620,7 +530,7 @@ describe("the snapshot and live event boundary", () => {
 
     // The snapshot is the boundary: what the daemon already counted stays
     // history, and what comes next streams into the reopened thread.
-    collected = [];
+    forgetMessages();
     daemon.push({
       type: "session_event",
       activeSessionId: "sess_1",
@@ -709,7 +619,7 @@ describe("stop, release and discard", () => {
       options: FULL_OPTIONS,
     });
     await waitForResponse("t2");
-    collected = [];
+    forgetMessages();
 
     daemon.enqueueOk("abort");
     sendRequest("t3", "thread/stop", {
@@ -1009,7 +919,7 @@ describe("session bookkeeping", () => {
         },
       ],
     });
-    expect(response("k").result).toEqual({ ok: true });
+    expect(h.response("k").result).toEqual({ ok: true });
     expect(currentConfiguredSkillRoots()).toEqual([
       {
         id: "workspace",
@@ -1051,7 +961,7 @@ describe("methods that need work the later tickets own", () => {
 
   it("reports usage as unsupported (the declaration does not offer it)", () => {
     sendRequest("u", "provider/usage", { providerId: "prime-agent" });
-    expect(response("u").result).toEqual({ supported: false });
+    expect(h.response("u").result).toEqual({ supported: false });
   });
 
   it("keeps provider/health talking to the daemon probe", async () => {

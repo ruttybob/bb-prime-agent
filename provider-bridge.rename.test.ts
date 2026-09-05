@@ -1,20 +1,9 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import {
-  experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
-  type CapturedBridgeJsonRpcOutput,
-} from "@get-bb/plugin-sdk/provider-bridge/testing";
+import { describe, expect, it } from "vitest";
 import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
-import {
-  handleLine,
-  resetDaemonForTests,
-  sessionTableForTests,
-} from "./src/provider-bridge.js";
-import { setPrimeDaemonTransportFactoryForTests } from "./src/daemon/connection.js";
+import { sessionTableForTests } from "./src/provider-bridge.js";
 import { primeSessionName } from "./src/session-params.js";
-import {
-  createScriptedDaemon,
-  type ScriptedDaemonHandle,
-} from "./test-support/scripted-daemon.js";
+import { type ScriptedDaemonHandle } from "./test-support/scripted-daemon.js";
+import { FULL_OPTIONS, startBridgeHarness } from "./test-support/bridge-harness.js";
 
 /**
  * bb's `thread/name/set` (bbpa-ggf.7): a rename in bb is reflected in prime's
@@ -24,74 +13,24 @@ import {
  * (`rename_saved_session`, which finds an active session by file itself).
  */
 
-let output: CapturedBridgeJsonRpcOutput;
-let collected: unknown[] = [];
+/** The scripted daemon is created per test; beforeEach re-binds the alias. */
 let daemon: ScriptedDaemonHandle;
-let cwd: string;
 
 const SOURCE_FILE = "/tmp/prime/sessions/sess_1.jsonl";
 
-beforeEach(() => {
-  output = captureBridgeJsonRpcOutput();
-  collected = [];
-  cwd = "/tmp/prime-workspace";
-  daemon = createScriptedDaemon({
-    session: {
-      activeSessionId: "sess_1",
-      sessionFile: SOURCE_FILE,
-      sessionName: "[bb] scripted thread (thr_1)",
-      cwd,
-    },
-  });
-  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
+const h = startBridgeHarness({
+  session: {
+    activeSessionId: "sess_1",
+    sessionFile: SOURCE_FILE,
+    sessionName: "[bb] scripted thread (thr_1)",
+    cwd: "/tmp/prime-workspace",
+  },
+  beforeEachExtra: (harness) => {
+    daemon = harness.daemon;
+  },
 });
 
-afterEach(() => {
-  output.restore();
-  setPrimeDaemonTransportFactoryForTests(undefined);
-  resetDaemonForTests();
-  sessionTableForTests().clear();
-});
-
-function messages(): unknown[] {
-  collected.push(...output.takeMessages());
-  return collected;
-}
-
-function sendRequest(id: string, method: string, params: unknown = {}): void {
-  handleLine(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
-}
-
-interface Response {
-  id: string;
-  result?: Record<string, unknown>;
-  error?: { code: number; message: string };
-}
-
-async function waitForResponse(id: string, timeoutMs = 2_000): Promise<Response> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const found = messages().find(
-      (message) =>
-        (message as { id?: unknown }).id === id &&
-        (message as { method?: unknown }).method === undefined,
-    );
-    if (found !== undefined) {
-      return found as Response;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`no response with id ${id} within ${timeoutMs}ms`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-const FULL_OPTIONS = {
-  permissionMode: "full",
-  permissionScope: "full",
-  approvalReviewer: null,
-  permissionEscalation: null,
-};
+const { cwd, sendRequest, waitForResponse } = h;
 
 /** Start a thread whose resident session is prime_sess_1, and settle it. */
 async function startThread(id: string, threadId: string): Promise<string> {
