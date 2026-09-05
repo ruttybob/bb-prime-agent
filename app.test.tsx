@@ -1,5 +1,12 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 
@@ -158,5 +165,185 @@ describe("the Subagents panel", () => {
     // of icon assets, so nothing here can 404 on a window that never opened
     // the panel.
     expect(registration.icon).toBeTypeOf("string");
+  });
+});
+
+/**
+ * The controls (bbpa-ggf.10): a running child takes a steer message and a
+ * stop; a finished one takes neither. The panel's own state is only ever a
+ * pending state — the change itself always comes back through the roster, and
+ * a refusal is shown rather than swallowed.
+ */
+describe("the Subagents panel's controls", () => {
+  function renderRoster(options: {
+    roster: unknown[];
+    steer?: (input: unknown) => Promise<unknown>;
+    stop?: (input: unknown) => Promise<unknown>;
+  }) {
+    return renderPanel({
+      rpc: {
+        roster: vi.fn().mockResolvedValue({
+          state: "ready",
+          activeSessionId: "sess_panel",
+          children: options.roster,
+        }),
+        ...(options.steer === undefined ? {} : { steer: options.steer }),
+        ...(options.stop === undefined ? {} : { stop: options.stop }),
+      },
+    });
+  }
+
+  it("offers a steer and a stop to a running child and neither to a finished one", async () => {
+    const slot = renderRoster({
+      roster: [
+        scoutChild(),
+        scoutChild({
+          id: "child_2",
+          label: "digger",
+          status: "done",
+          activeSessionId: "sess_child_2",
+          answerPreview: "dug it all",
+        }),
+      ],
+    });
+    await slot.findByText("scout");
+
+    expect(screen.getByLabelText("Steer scout")).toBeDefined();
+    expect(screen.queryByLabelText("Steer digger")).toBeNull();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeDefined();
+
+    // An empty steer cannot be sent.
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(send).toHaveProperty("disabled", true);
+    slot.lifecycle.unmount();
+  });
+
+  it("sends the steer to the plugin server, clears the input when prime takes it", async () => {
+    let accept!: (answer: unknown) => void;
+    const steer = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          accept = resolve;
+        }),
+    );
+    const slot = renderRoster({ roster: [scoutChild()], steer });
+    await slot.findByText("scout");
+
+    fireEvent.change(screen.getByLabelText("Steer scout"), {
+      target: { value: "  Focus on the parser  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    // Pending, not done: the row is busy while prime has the message.
+    await screen.findByText("Sending…");
+    expect(screen.getByLabelText("Steer scout")).toHaveProperty("disabled", true);
+
+    await act(async () => {
+      accept({ activeSessionId: "sess_panel", delivery: "queued" });
+    });
+    await screen.findByText("Steer queued.");
+    expect(steer).toHaveBeenCalledWith({
+      threadId: "thr_panel",
+      childId: "child_1",
+      // Trimmed here, so the daemon never sees padding prime would reject.
+      message: "Focus on the parser",
+      activeSessionId: "sess_panel",
+    });
+    expect((screen.getByLabelText("Steer scout") as HTMLInputElement).value).toBe("");
+    expect(screen.getByLabelText("Steer scout")).toHaveProperty("disabled", false);
+    slot.lifecycle.unmount();
+  });
+
+  it("shows a refused steer and keeps what the user typed", async () => {
+    const slot = renderRoster({
+      roster: [scoutChild()],
+      steer: vi.fn().mockRejectedValue(
+        new Error(
+          'prime-agent has no subagent "child_1" in session sess_panel',
+        ),
+      ),
+    });
+    await slot.findByText("scout");
+
+    fireEvent.change(screen.getByLabelText("Steer scout"), {
+      target: { value: "Focus on the parser" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await screen.findByRole("alert");
+    expect(screen.getByText(/Steer refused: /)).toBeDefined();
+    expect((screen.getByLabelText("Steer scout") as HTMLInputElement).value).toBe(
+      "Focus on the parser",
+    );
+    expect(screen.getByRole("button", { name: "Send" })).toHaveProperty(
+      "disabled",
+      false,
+    );
+    slot.lifecycle.unmount();
+  });
+
+  it("stops the child, stays honest while prime works, and shows the verdict from the roster", async () => {
+    let children = [scoutChild()];
+    let accept!: (answer: unknown) => void;
+    const slot = renderPanel({
+      rpc: {
+        roster: vi.fn().mockImplementation(async () => ({
+          state: "ready",
+          activeSessionId: "sess_panel",
+          children,
+        })),
+        stop: vi.fn(
+          () =>
+            new Promise((resolve) => {
+              accept = resolve;
+            }),
+        ),
+      },
+    });
+    await slot.findByText("scout");
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await screen.findByText("Stopping…");
+    // Pending is all the panel claims: prime has not answered, so the child
+    // is still running as far as this panel is concerned.
+    expect(screen.getByText("running")).toBeDefined();
+    expect(screen.getByLabelText("Steer scout")).toHaveProperty("disabled", true);
+
+    // The authoritative change: prime cancelled, the roster reports it.
+    children = [
+      scoutChild({ status: "cancelled", recap: "stopped from the panel" }),
+    ];
+    await act(async () => {
+      accept({ activeSessionId: "sess_panel", cancelled: true });
+    });
+    await slot.findByText("cancelled");
+    expect(screen.queryByText("running")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    expect(screen.queryByLabelText("Steer scout")).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("shows a stop prime refused, with the child still running", async () => {
+    const slot = renderRoster({
+      roster: [scoutChild()],
+      stop: vi.fn().mockRejectedValue(
+        new Error(
+          'prime-agent answered "cancel_rlm_child" with cancelled:false — the subagent was not running, so nothing was stopped',
+        ),
+      ),
+    });
+    await slot.findByText("scout");
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await screen.findByText(/Stop refused: /);
+    expect(screen.getByText("running")).toBeDefined();
+    // The row is usable again: another attempt is one click away.
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Stop" })).toHaveProperty(
+        "disabled",
+        false,
+      ),
+    );
+    slot.lifecycle.unmount();
   });
 });

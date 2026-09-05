@@ -230,6 +230,12 @@ describe("the subagents panel's server half", () => {
     hosts?: Array<{ id: string; name?: string; status: "connected" | "disconnected" }>;
     rosterAnswer?: unknown;
     rosterError?: string;
+    /** Answers for the control relays, by host method. */
+    steerAnswer?: unknown;
+    stopAnswer?: unknown;
+    controlError?: string;
+    /** Refuse only some hosts (by id), so the fan-out is observable. */
+    controlRefusals?: Record<string, string>;
   }) {
     const host = createFakePluginHost({
       pluginId: PRIME_PROVIDER_ID,
@@ -254,13 +260,26 @@ describe("the subagents panel's server half", () => {
         },
       },
       experimental_callHostRpc: (call) => {
-        if (args.rosterError !== undefined) {
-          throw new Error(args.rosterError);
+        const refusal = args.controlRefusals?.[call.hostId];
+        if (refusal !== undefined) {
+          throw new Error(refusal);
         }
-        if (call.method !== "subagents.roster") {
-          throw new Error(`unexpected host call ${call.method}`);
+        if (args.controlError !== undefined) {
+          throw new Error(args.controlError);
         }
-        return { children: args.rosterAnswer ?? [] };
+        if (call.method === "subagents.roster") {
+          if (args.rosterError !== undefined) {
+            throw new Error(args.rosterError);
+          }
+          return { children: args.rosterAnswer ?? [] };
+        }
+        if (call.method === "subagents.steer") {
+          return args.steerAnswer ?? { delivery: "delivered" };
+        }
+        if (call.method === "subagents.stop") {
+          return args.stopAnswer ?? { cancelled: true };
+        }
+        throw new Error(`unexpected host call ${call.method}`);
       },
     });
     plugin(host.bb);
@@ -372,5 +391,111 @@ describe("the subagents panel's server half", () => {
         },
       },
     ]);
+  });
+
+  /**
+   * The control relays (bbpa-ggf.10): the panel's steer and stop go to the
+   * connected host holding the session, and a control action nobody can
+   * perform is an rpc error — never a quiet success.
+   */
+
+  it("steers the child the panel named, on the host that holds the session", async () => {
+    const host = hostWith({
+      identityRows: [IDENTITY_EVENT],
+      hosts: [{ id: "host_local", status: "connected" }],
+      steerAnswer: { delivery: "queued" },
+    });
+    await expect(
+      host.harness.behavior.callRpc("steer", {
+        threadId: THREAD_ID,
+        childId: "child_1",
+        message: "Focus on the parser",
+      }),
+    ).resolves.toEqual({ activeSessionId: "sess_panel", delivery: "queued" });
+    expect(host.harness.inspection.experimental_hostRpcCalls).toEqual([
+      expect.objectContaining({
+        method: "subagents.steer",
+        hostId: "host_local",
+        input: {
+          activeSessionId: "sess_panel",
+          childId: "child_1",
+          message: "Focus on the parser",
+        },
+      }),
+    ]);
+  });
+
+  it("stops the child and reports prime's verdict", async () => {
+    const host = hostWith({
+      identityRows: [IDENTITY_EVENT],
+      hosts: [{ id: "host_local", status: "connected" }],
+      stopAnswer: { cancelled: true },
+    });
+    await expect(
+      host.harness.behavior.callRpc("stop", {
+        threadId: THREAD_ID,
+        childId: "child_1",
+      }),
+    ).resolves.toEqual({ activeSessionId: "sess_panel", cancelled: true });
+    expect(host.harness.inspection.experimental_hostRpcCalls).toEqual([
+      expect.objectContaining({
+        method: "subagents.stop",
+        hostId: "host_local",
+        input: { activeSessionId: "sess_panel", childId: "child_1" },
+      }),
+    ]);
+  });
+
+  it("keeps asking hosts until one takes the action", async () => {
+    const host = hostWith({
+      identityRows: [IDENTITY_EVENT],
+      hosts: [
+        { id: "host_elsewhere", status: "connected" },
+        { id: "host_local", status: "connected" },
+      ],
+      controlRefusals: {
+        host_elsewhere: "prime-agent refused to attach: no such session",
+      },
+    });
+    await expect(
+      host.harness.behavior.callRpc("stop", {
+        threadId: THREAD_ID,
+        childId: "child_1",
+      }),
+    ).resolves.toEqual({ activeSessionId: "sess_panel", cancelled: true });
+    expect(
+      host.harness.inspection.experimental_hostRpcCalls.map(
+        (call) => `${call.method}@${call.hostId}`,
+      ),
+    ).toEqual(["subagents.stop@host_elsewhere", "subagents.stop@host_local"]);
+  });
+
+  it("refuses to steer a thread that has no prime session", async () => {
+    const host = hostWith({ identityRows: [] });
+    await expect(
+      host.harness.behavior.callRpc("steer", {
+        threadId: THREAD_ID,
+        childId: "child_1",
+        message: "hello",
+      }),
+    ).rejects.toThrow(/no prime-agent session yet/u);
+    expect(host.harness.inspection.experimental_hostRpcCalls).toEqual([]);
+  });
+
+  it("refuses a control action no connected host can perform", async () => {
+    const host = hostWith({
+      identityRows: [IDENTITY_EVENT],
+      hosts: [{ id: "host_local", status: "connected" }],
+      controlError:
+        'prime-agent has no subagent "child_1" in session sess_panel',
+    });
+    await expect(
+      host.harness.behavior.callRpc("stop", {
+        threadId: THREAD_ID,
+        childId: "child_1",
+      }),
+    ).rejects.toThrow(
+      /No connected machine has prime-agent session sess_panel/u,
+    );
   });
 });
