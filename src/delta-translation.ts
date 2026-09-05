@@ -262,6 +262,16 @@ export interface PrimeDeltaTranslator {
    * for the aborted turn is then translated with the boundary suppressed.
    */
   interruptDeltas(threadId: string): ThreadDelta[];
+  /**
+   * Deltas that settle a turn this bridge had to fail itself (bbpa-ggf.11: the
+   * daemon wire dropped mid-turn; a compaction prime refused): open streams
+   * closed, one legible provider error, one failed turn boundary. Prime cannot
+   * settle these — its `agent_end` died with the socket or never came.
+   */
+  failureDeltas(
+    threadId: string,
+    args: { message: string; detail?: string },
+  ): ThreadDelta[];
   resetThread(threadId: string): void;
 }
 
@@ -921,6 +931,22 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
     interruptDeltas(threadId) {
       const deltas = closeOpenStreams({ threadId, cwd: undefined });
       deltas.push({ kind: "turn.boundary", status: "interrupted" });
+      return deltas;
+    },
+    failureDeltas(threadId, args) {
+      const deltas = closeOpenStreams({ threadId, cwd: undefined });
+      deltas.push({
+        kind: "provider.error",
+        message: args.message,
+        ...(args.detail === undefined ? {} : { detail: args.detail }),
+        settlesTurn: true,
+      });
+      deltas.push({
+        kind: "turn.boundary",
+        status: "failed",
+        error: { message: args.detail ?? args.message },
+        claimIfIdle: true,
+      });
       return deltas;
     },
     resetThread(threadId) {

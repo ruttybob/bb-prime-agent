@@ -57,6 +57,16 @@ export interface ScriptedDaemonHandle {
   enqueueFail(commandType: string, error: string): void;
   /** Push a message to the bridge directly (out-of-band daemon chatter). */
   push(message: DaemonPushMessage): void;
+  /**
+   * Drop the socket under the bridge (bbpa-ggf.11): the connection layer sees
+   * a dead wire and starts its bounded recovery. Commands sent while dropped
+   * are refused, like writes to a closed socket.
+   */
+  drop(args?: { cause?: string }): void;
+  /** The daemon answers again; `reconnect` settles with this hello. */
+  restore(args?: { hello?: DaemonHello }): void;
+  /** Whether the wire is currently dropped. */
+  isDropped(): boolean;
 }
 
 /** The session identity every block speaks about (one scripted session per daemon). */
@@ -68,7 +78,16 @@ export interface ScriptedSession {
 }
 
 export function createScriptedDaemon(
-  args: { hello?: DaemonHello; session?: Partial<ScriptedSession> } = {},
+  args: {
+    hello?: DaemonHello;
+    session?: Partial<ScriptedSession>;
+    /**
+     * How long the transport's `reconnect` waits for `restore()` before giving
+     * up. Defaults to a short budget: the scripted daemon is a fixture, and a
+     * test that wants the give-up path sets it explicitly.
+     */
+    reconnectBudgetMs?: number;
+  } = {},
 ): ScriptedDaemonHandle {
   const session = {
     activeSessionId: "sess_scripted",
@@ -80,10 +99,13 @@ export function createScriptedDaemon(
   const blocks: ScriptedBlock[] = [];
   const commands: Array<Record<string, unknown>> = [];
   const listeners = new Set<(message: DaemonPushMessage) => void>();
+  const peerCloseListeners = new Set<(error: Error | undefined) => void>();
   /** The daemon's event clock; only a session replacement changes the generation. */
   const generation = "gen-0";
   let sequence = 0;
-  const hello = (args.hello ?? calibratedHello()) as DaemonHello;
+  let hello = (args.hello ?? calibratedHello()) as DaemonHello;
+  let dropped = false;
+  const reconnectBudgetMs = args.reconnectBudgetMs ?? 5_000;
 
   function nextBlock(commandType: string): ScriptedBlock {
     const index = blocks.findIndex((block) => block.commandType === commandType);
@@ -119,6 +141,11 @@ export function createScriptedDaemon(
         return hello;
       },
       async request(command) {
+        if (dropped) {
+          throw new Error(
+            "the scripted prime-agent daemon dropped the socket mid-command",
+          );
+        }
         const payload = command as Record<string, unknown>;
         const commandType = String(payload.type);
         commands.push(payload);
@@ -139,11 +166,52 @@ export function createScriptedDaemon(
           listeners.delete(listener);
         };
       },
+      onPeerClose(listener) {
+        peerCloseListeners.add(listener);
+        return () => {
+          peerCloseListeners.delete(listener);
+        };
+      },
+      async reconnect(reconnectArgs) {
+        const budgetMs = reconnectArgs?.budgetMs ?? reconnectBudgetMs;
+        const deadline = Date.now() + budgetMs;
+        while (dropped && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 2));
+        }
+        if (dropped) {
+          throw new Error(
+            `gave up reconnecting to the scripted prime-agent daemon after ${budgetMs}ms`,
+          );
+        }
+        // A fresh connection always earns the daemon's *current* greeting.
+        return hello;
+      },
       close() {
+        dropped = false;
         listeners.clear();
+        peerCloseListeners.clear();
       },
     },
     commands,
+    drop({ cause } = {}) {
+      if (dropped) {
+        return;
+      }
+      dropped = true;
+      const error = new Error(cause ?? "the scripted daemon dropped the socket");
+      for (const listener of [...peerCloseListeners]) {
+        listener(error);
+      }
+    },
+    restore(args = {}) {
+      if (args.hello !== undefined) {
+        hello = args.hello;
+      }
+      dropped = false;
+    },
+    isDropped() {
+      return dropped;
+    },
     enqueueCreate() {
       blocks.push({
         commandType: "create",

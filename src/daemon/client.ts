@@ -119,7 +119,7 @@ export class PrimeDaemonClient {
   private readonly pending = new Map<string, PendingRequest>();
   private requestCounter = 0;
   private closedByUs = false;
-  private peerCloseListeners = new Set<(error: Error | undefined) => void>();
+  private readonly peerCloseListeners = new Set<(error: Error | undefined) => void>();
 
   /** Push messages (session events, progress, …) that are not responses. */
   onPush: ((message: DaemonPushMessage) => void) | undefined;
@@ -241,7 +241,13 @@ export class PrimeDaemonClient {
     });
   }
 
-  /** Listen for the transport dying under us; reconnect logic hangs off this. */
+  /**
+   * Listen for the transport dying under us; reconnect logic hangs off this.
+   * Subscriptions are durable: a socket that drops twice tells its listeners
+   * twice, so a recovery watcher set up once watches every drop. `close()` is
+   * the one way to silence them — a transport we closed deliberately is not a
+   * drop anyone should recover from.
+   */
   onPeerClose(listener: (error: Error | undefined) => void): () => void {
     this.peerCloseListeners.add(listener);
     return () => {
@@ -302,6 +308,9 @@ export class PrimeDaemonClient {
   /** Close the socket and fail everything in flight. Idempotent. */
   close(): void {
     this.closedByUs = true;
+    // A transport we closed deliberately is not a drop: nobody should recover
+    // this one, so the watchers are retired before the close is raised.
+    this.peerCloseListeners.clear();
     this.disposeSocket(undefined);
   }
 
@@ -492,8 +501,7 @@ export class PrimeDaemonClient {
         closeError?.message ?? "socket closed",
       ),
     );
-    const listeners = this.peerCloseListeners;
-    this.peerCloseListeners = new Set();
+    const listeners = [...this.peerCloseListeners];
     for (const listener of listeners) {
       listener(closeError);
     }

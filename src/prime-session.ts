@@ -5,6 +5,7 @@ import type {
   ThreadDelta,
 } from "@get-bb/plugin-sdk/provider-bridge";
 import type { DaemonCommandResult } from "./daemon/client.js";
+import type { DaemonConnectionEvent } from "./daemon/connection.js";
 import type { DaemonHello, DaemonPushMessage } from "./daemon/protocol.js";
 import {
   createPrimeDeltaTranslator,
@@ -25,6 +26,7 @@ import {
   type PrimeModel,
   type SessionEventEnvelope,
 } from "./daemon/wire.js";
+import { helloWarnings } from "./daemon/protocol.js";
 import {
   PRIME_THINKING_LADDER,
   buildPrimeCreateCommand,
@@ -104,6 +106,14 @@ export interface PrimeSessionOptions {
   request: (command: { type: string } & Record<string, unknown>, args?: { timeoutMs?: number }) => Promise<DaemonCommandResult>;
   ensureConnected: () => Promise<DaemonHello>;
   /**
+   * Connection events of the shared daemon wire (`src/daemon/connection.ts`):
+   * the lane re-attaches and re-arms its snapshot boundary off `restored`, and
+   * settles a turn that died with the socket off `lost` (bbpa-ggf.11).
+   */
+  subscribeConnection?: (
+    listener: (event: DaemonConnectionEvent) => void,
+  ) => () => void;
+  /**
    * Off-timeline state mirror (`provider/raw {method: "prime.session_state"}`),
    * published whenever the lane learns or changes model/thinking/compaction
    * facts. bb's delta grammar has no row for these; the raw mirror is the
@@ -139,9 +149,11 @@ export class PrimeSession {
   private readonly record: SessionRecord;
   private readonly emit: PrimeSessionOptions["emit"];
   private readonly request: PrimeSessionOptions["request"];
+  private readonly ensureConnected: PrimeSessionOptions["ensureConnected"];
   private readonly onState: PrimeSessionOptions["onState"];
   private readonly translator: PrimeDeltaTranslator;
   private readonly unsubscribe: () => void;
+  private readonly unsubscribeConnection: (() => void) | undefined;
 
   /** Pushes that arrived before the attach snapshot fixed the boundary. */
   private buffered: SessionEventEnvelope[] = [];
@@ -149,6 +161,26 @@ export class PrimeSession {
   private lastSequence = -1;
   private attached = false;
   private closed = false;
+  /**
+   * Open while the shared wire is down (bbpa-ggf.11): a turn that arrives
+   * before the daemon answers again parks on it instead of prompting into the
+   * void, and resolves once the lane re-attached — or as soon as the recovery
+   * gives up, so the turn fails legibly instead of hanging.
+   */
+  private connectionGap: Promise<"recovered" | "unavailable"> | undefined;
+  private resolveConnectionGap:
+    | ((outcome: "recovered" | "unavailable") => void)
+    | undefined;
+  /** What the recovery reported when it gave up, for the turn's error. */
+  private unavailableCause: string | undefined;
+  /**
+   * Set between a lost wire and the lane's own successful re-attach: while it
+   * holds, best-effort commands (`abort`, `detach`) are skipped instead of
+   * parking on the recovery, and turns wait for the lane to be live again.
+   */
+  private wireDown = false;
+  /** The drift verdict this lane already warned about (one row per hello). */
+  private driftSignature: string | undefined;
   /** The daemon told us it closed this session (prime quit it, eviction, …). */
   private daemonClosed = false;
   /** The turn this lane is driving, while prime streams it. */
@@ -177,9 +209,13 @@ export class PrimeSession {
     this.record = options.record;
     this.emit = options.emit;
     this.request = options.request;
+    this.ensureConnected = options.ensureConnected;
     this.onState = options.onState;
     this.translator = createPrimeDeltaTranslator();
     this.unsubscribe = options.subscribePush((message) => this.handlePush(message));
+    this.unsubscribeConnection = options.subscribeConnection?.((event) =>
+      this.handleConnectionEvent(event),
+    );
   }
 
   get threadId(): string {
@@ -299,6 +335,10 @@ export class PrimeSession {
     this.buffered = [];
     this.attached = true;
     this.record.snapshotMessages = snapshotMessages;
+    // Drift is a warning, never a block (ADR-0002): every attach reads the
+    // answered hello against the calibration and says so once per verdict, on
+    // the timeline where the thread's user can see it.
+    this.warnAboutProtocolDrift({ warnings: await this.helloWarningsFromWire() });
     for (const push of stale) {
       if (!this.isStale(push)) {
         this.deliver(push);
@@ -381,6 +421,9 @@ export class PrimeSession {
       // The turn path checks this first; nothing to reconcile against.
       return;
     }
+    // A turn submitted while the daemon restarts waits for the re-attach: it
+    // must be this lane that attaches, or prime streams its events to nobody.
+    await this.awaitLive();
     const target = args.model === undefined ? undefined : splitPrimeModelId(args.model);
     if (target !== undefined && this.state.model !== args.model) {
       const model = await this.setModel(target);
@@ -466,6 +509,7 @@ export class PrimeSession {
     if (this.record.activeSessionId === undefined) {
       throw new Error("cannot compact before the session is created");
     }
+    await this.awaitLive();
     this.compactionStarted = false;
     let refused: string | undefined;
     try {
@@ -480,19 +524,12 @@ export class PrimeSession {
     }
     if (refused !== undefined && !this.compactionStarted) {
       // Prime never streamed a compaction: nothing else will settle this turn.
-      this.pushDeltas([
-        {
-          kind: "provider.error",
+      this.pushDeltas(
+        this.translator.failureDeltas(this.record.threadId, {
           message: "prime-agent could not compact the context",
           detail: refused,
-        },
-        {
-          kind: "turn.boundary",
-          status: "failed",
-          error: { message: refused },
-          claimIfIdle: true,
-        },
-      ]);
+        }),
+      );
     }
   }
 
@@ -550,8 +587,171 @@ export class PrimeSession {
     this.deliver(parsed.data);
   }
 
-  private deliver(push: SessionEventEnvelope): void {
-    this.trackSessionFacts(push.event);
+  /* --------------------- daemon restart resilience (bbpa-ggf.11) --------------------- */
+
+  private handleConnectionEvent(event: DaemonConnectionEvent): void {
+    if (this.closed) {
+      return;
+    }
+    switch (event.kind) {
+      case "lost":
+        this.handleConnectionLost(event.cause);
+        return;
+      case "restored":
+        void this.handleConnectionRestored(event);
+        return;
+      case "unavailable":
+        // The reconnect budget is gone. Every parked turn wakes up now and
+        // fails with this cause instead of waiting on a daemon that left.
+        this.unavailableCause = event.cause;
+        this.resolveConnectionGap?.("unavailable");
+        return;
+    }
+  }
+
+  /**
+   * The shared wire dropped (daemon update, restart, crash). A turn prime was
+   * streaming died with the socket: settle it here, with a legible provider
+   * error, so bb's timeline closes instead of waiting on a daemon that is not
+   * there. Then park until the daemon answers again.
+   */
+  private handleConnectionLost(cause: string): void {
+    if (
+      this.record.activeSessionId === undefined ||
+      this.connectionGap !== undefined
+    ) {
+      return;
+    }
+    if (this.openTurn !== undefined && !this.openTurn.settledLocally) {
+      this.openTurn = { ...this.openTurn, settledLocally: true };
+      this.pushDeltas(
+        this.translator.failureDeltas(this.record.threadId, {
+          message:
+            "the prime-agent daemon connection dropped mid-turn; the turn did not finish",
+          detail: cause,
+        }),
+      );
+    }
+    this.wireDown = true;
+    this.connectionGap = new Promise((resolve) => {
+      this.resolveConnectionGap = resolve;
+    });
+  }
+
+  /**
+   * The daemon is back. Re-attach for a *fresh snapshot*: the boundary moves to
+   * the daemon's own clock, so everything the respawned session replays that
+   * this thread already counted is dropped — the timeline continues without
+   * duplicating or losing a turn. Snapshot *content* is never re-rendered
+   * here: bb persists this thread's timeline, and the session the daemon
+   * restored is the same one (`prime_<activeSessionId>`).
+   */
+  private async handleConnectionRestored(event: {
+    hello: DaemonHello;
+    warnings: string[];
+  }): Promise<void> {
+    if (this.record.activeSessionId === undefined) {
+      return;
+    }
+    try {
+      await this.attach();
+    } catch {
+      // The daemon came back without this session (or is still warming up):
+      // the gap stays open and the next turn retries the attach once, rather
+      // than the lane going silently deaf.
+      return;
+    }
+    this.wireDown = false;
+    if (event.warnings.length > 0) {
+      this.warnAboutProtocolDrift({ warnings: event.warnings });
+    } else {
+      this.pushDeltas([
+        {
+          kind: "provider.warning",
+          category: "general",
+          summary:
+            "the prime-agent daemon restarted; this thread re-attached to its session",
+        },
+      ]);
+    }
+    this.settleConnectionGap("recovered");
+  }
+
+  /**
+   * Hold a turn until the lane is live again. Resolves once the daemon is back
+   * and the lane re-attached; throws one legible error when the daemon never
+   * came back — after one honest re-attach attempt, because a daemon that
+   * returned just after the recovery budget is still worth resuming.
+   */
+  private async awaitLive(): Promise<void> {
+    while (this.connectionGap !== undefined) {
+      const outcome = await this.connectionGap;
+      if (this.connectionGap === undefined) {
+        return;
+      }
+      if (outcome === "recovered") {
+        continue;
+      }
+      try {
+        await this.attach();
+      } catch (error) {
+        throw new Error(
+          `the prime-agent daemon did not come back for thread ${this.record.threadId}: ${
+            this.unavailableCause ?? (error instanceof Error ? error.message : String(error))
+          }`,
+        );
+      }
+      // The daemon was only late: this lane is live again, and the parked turn
+      // (and every other one) may proceed.
+      this.wireDown = false;
+      this.settleConnectionGap("recovered");
+    }
+  }
+
+  private settleConnectionGap(outcome: "recovered" | "unavailable"): void {
+    const resolve = this.resolveConnectionGap;
+    this.connectionGap = undefined;
+    this.resolveConnectionGap = undefined;
+    resolve?.(outcome);
+  }
+
+  /**
+   * Surface a hello that differs from the calibration (generation staleness,
+   * schema revision, app version, capability roster) as a timeline warning.
+   * One row per distinct verdict: a resume on the same daemon says nothing
+   * twice, a restart onto a different build says the new thing once.
+   */
+  private warnAboutProtocolDrift(args: { warnings: readonly string[] }): void {
+    if (args.warnings.length === 0) {
+      return;
+    }
+    const signature = args.warnings.join(" | ");
+    if (signature === this.driftSignature) {
+      return;
+    }
+    this.driftSignature = signature;
+    this.pushDeltas([
+      {
+        kind: "provider.warning",
+        category: "general",
+        summary:
+          "protocol drift between this bridge and prime-agent; the thread keeps working where the daemon's capabilities allow",
+        details: args.warnings.join(" "),
+      },
+    ]);
+  }
+
+  /** The answered hello, when the wire can produce one (warnings are best-effort). */
+  private async helloWarningsFromWire(): Promise<string[]> {
+    try {
+      return helloWarnings(await this.ensureConnected());
+    } catch {
+      // A wire that will not come back says nothing about drift.
+      return [];
+    }
+  }
+
+  private deliver(push: SessionEventEnvelope): void {    this.trackSessionFacts(push.event);
     const sequence = push.meta?.sequence;
     if (typeof sequence === "number" && this.lastSequence >= 0 && sequence <= this.lastSequence) {
       return;
@@ -642,6 +842,7 @@ export class PrimeSession {
     if (this.record.activeSessionId === undefined) {
       throw new Error("cannot prompt before the session is created");
     }
+    await this.awaitLive();
     this.openTurn = {
       clientRequestId: args.clientRequestId,
       settledLocally: false,
@@ -676,6 +877,7 @@ export class PrimeSession {
     if (this.record.activeSessionId === undefined) {
       throw new Error("cannot steer before the session is created");
     }
+    await this.awaitLive();
     this.openTurn = { settledLocally: false };
     await readCommandData(
       await this.request(
@@ -698,7 +900,14 @@ export class PrimeSession {
    */
   async interrupt(): Promise<readonly ThreadDelta[]> {
     const deltas = this.translator.interruptDeltas(this.record.threadId);
-    if (this.record.activeSessionId !== undefined && this.hasOpenTurn) {
+    if (
+      this.record.activeSessionId !== undefined &&
+      this.hasOpenTurn &&
+      // A wire that is down and recovering would park this abort for the whole
+      // recovery budget; the turn is already settled locally, so there is
+      // nothing left for the daemon to abort.
+      !this.wireDown
+    ) {
       this.openTurn = { ...this.openTurn!, settledLocally: true };
       try {
         await this.request(
@@ -717,7 +926,9 @@ export class PrimeSession {
 
   /** Detach this client from the session; the resident session keeps running. */
   async detach(): Promise<void> {
-    if (this.record.activeSessionId === undefined) {
+    if (this.record.activeSessionId === undefined || this.wireDown) {
+      // A daemon that is restarting has already lost this client's seat;
+      // detaching from it can wait (and the next attach supersedes it).
       return;
     }
     try {
@@ -734,10 +945,12 @@ export class PrimeSession {
 
   /** Release: soft-stop anything running, detach, and stop listening. */
   async release(): Promise<void> {
+    this.settleConnectionGap("unavailable");
     await this.interrupt();
     await this.detach();
     this.translator.resetThread(this.record.threadId);
     this.unsubscribe();
+    this.unsubscribeConnection?.();
     this.closed = true;
   }
 
