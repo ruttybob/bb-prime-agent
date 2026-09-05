@@ -1,5 +1,10 @@
 import type { PluginProviderDeclaration } from "@get-bb/plugin-sdk";
 import {
+  enabledExtensionsProviderOptions,
+  enabledUserExtensionPaths,
+  type DiscoveredPrimeExtension,
+} from "./user-extensions.js";
+import {
   PRIME_DAEMON_SOCKET_ENV,
   PRIME_DISPLAY_NAME,
   PRIME_EXPIRED_HINT,
@@ -18,12 +23,21 @@ import {
  * daemon hello probe decides (`src/health.ts`). `maintenance.health: true`
  * must accompany it or the server skips the probe entirely.
  *
+ * `deriveProviderOptions` is the extension picker's (bbpa-ggf.12) way onto the
+ * wire: it turns the settings toggles into the enabled absolute paths, which
+ * arrive at the bridge as `options.providerOptions[enabledExtensions]` on every
+ * command. The bridge reads them on `thread/start` only, so the selection only
+ * ever shapes a session being created.
+ *
  * Permission modes are full-only and deliberately so: prime-agent has no
  * approval gate and no sandbox in 0.7.3 (the daemon's `create` takes no
  * permission config), and the intent rejects bb-side confirmation gates on
  * top — the trust notice below says so wherever bb renders provider copy.
  */
-export function primeProviderDeclaration(): PluginProviderDeclaration {
+export function primeProviderDeclaration(
+  args: { userExtensions?: readonly DiscoveredPrimeExtension[] } = {},
+): PluginProviderDeclaration {
+  const userExtensions = args.userExtensions ?? [];
   return {
     id: PRIME_PROVIDER_ID,
     displayName: PRIME_DISPLAY_NAME,
@@ -65,5 +79,12 @@ export function primeProviderDeclaration(): PluginProviderDeclaration {
       { id: "max", label: "Max" },
     ],
     composerActions: [],
+    deriveProviderOptions(context) {
+      // Fast by construction: the discovery snapshot is closed over, so this
+      // (which sits on the turn-submit path) only filters an in-memory list.
+      return enabledExtensionsProviderOptions(
+        enabledUserExtensionPaths({ extensions: userExtensions, values: context.settings }),
+      );
+    },
   };
 }

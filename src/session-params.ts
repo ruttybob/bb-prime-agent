@@ -12,20 +12,19 @@ import { BB_TOOLS_CHANNEL_FLAG } from "./dynamic-tools/protocol.js";
  *
  * - the "[bb] " session name and the bb environment's cwd are decided once, so
  *   every session bb owns is recognisable in prime's own catalog;
- * - `noExtensions: true` keeps prime's extension discovery off, which is what
- *   makes the *companion extension* channel (ADR-0003) the only way code enters
- *   a bb session;
- * - the later tickets inject their fields HERE and nowhere else:
- *   bbpa-ggf.12 (extension picker) appends to `config.extensions`, and
- *   bbpa-ggf.13 (dynamic tools) appends the companion extension path. The
- *   `extensionConfigFields` seam below is that injection point — it stays a
- *   closed `{}` until those tickets land, so a diff that touches session
- *   params shows up as a one-file change.
+ * - `noExtensions: true` keeps prime's extension discovery off, so code enters
+ *   a bb session only through explicit paths: the extension picker's selection
+ *   (bbpa-ggf.12) and the dynamic-tools companion extension (bbpa-ggf.13,
+ *   ADR-0003) are both appended to `config.extensions` HERE, by
+ *   `extensionConfigFields` — the one injection point for extension config, so
+ *   a diff that touches it shows up as a one-file change.
  *
  * What deliberately does NOT ride `create`: model/thinking *changes* after the
  * session exists (bbpa-ggf.6 owns `set_model`/`set_thinking_level`), and skill
  * roots (bbpa-ggf.8 owns native roots; prime's own skill discovery stays on via
- * `noSkills: false`).
+ * `noSkills: false`). `create` is also sent exactly once per session, which is
+ * what makes the picker's selection a new-sessions-only knob: a resume attaches
+ * to the resident worker without re-sending any of this.
  */
 
 /** Sessions bb owns are namespaced in prime's own catalog with this prefix. */
@@ -103,20 +102,40 @@ function truncate(text: string, max: number): string {
 
 /**
  * Extension/config fields contributed by the tickets that extend a bb session
- * on prime's side. bbpa-ggf.13's contribution: when the thread declares bb
- * dynamic tools, the companion extension is loaded explicitly (`-e`) while
- * discovery stays off (`-ne`, already unconditional above), and the extension
- * learns its channel socket through a per-session flag value — the only
- * per-session value channel prime offers (`create.config.extensionFlagValues`).
+ * on prime's side. Two contributions, merged into one explicit `-e` list under
+ * the unconditional `-ne`:
+ *
+ * - bbpa-ggf.12's picker selection (`enabledExtensions`, absolute paths of the
+ *   user prime-agent extensions the provider settings enabled). The paths
+ *   always stay absolute because prime resolves relative ones against its own
+ *   worker's cwd, not the session's; flag values for user extensions are not
+ *   wired — the picker loads paths, nothing else.
+ * - bbpa-ggf.13's companion extension, when the thread declares bb dynamic
+ *   tools, which learns its channel socket through the per-session flag value —
+ *   the only per-session value channel prime offers
+ *   (`create.config.extensionFlagValues`).
+ *
+ * Nothing here until one of the two contributes: a plain session's `create`
+ * carries no extension fields at all, so the picker's default (everything off)
+ * produces byte-identical payloads to before the picker existed.
  */
 function extensionConfigFields(args: PrimeCreateCommandArgs): Record<string, unknown> {
   const dynamicTools = args.dynamicTools;
-  if (dynamicTools === undefined) {
+  // User extensions first (picker order), companion last: deterministic on both
+  // sides, and deduplicated so a user extension that *is* the companion cannot
+  // be handed to prime twice.
+  const extensions = dedupePreservingOrder([
+    ...(args.enabledExtensions ?? []),
+    ...(dynamicTools?.extensions ?? []),
+  ]);
+  if (extensions.length === 0) {
     return {};
   }
   return {
-    extensions: dynamicTools.extensions,
-    extensionFlagValues: dynamicTools.extensionFlagValues,
+    extensions,
+    ...(dynamicTools?.extensionFlagValues === undefined
+      ? {}
+      : { extensionFlagValues: dynamicTools.extensionFlagValues }),
   };
 }
 
@@ -131,6 +150,12 @@ export interface PrimeCreateCommandArgs {
   model?: string | undefined;
   /** bb-selected reasoning level, mapped onto prime's thinking ladder. */
   reasoningLevel?: ReasoningLevel | undefined;
+  /**
+   * The extension picker's selection for new sessions (bbpa-ggf.12): absolute
+   * paths of the user prime-agent extensions to load explicitly. Present only
+   * when the provider settings enabled any.
+   */
+  enabledExtensions?: readonly string[] | undefined;
   /**
    * The dynamic-tools channel for this session (bbpa-ggf.13): loads the
    * companion extension explicitly and points it at the bridge-side socket.
@@ -162,11 +187,19 @@ export interface PrimeCreateCommand {
     noSkills: false;
     model?: string;
     thinking?: PrimeThinkingLevel;
-    /** Explicit companion-extension load (`-e`), bbpa-ggf.13. */
+    /**
+     * Explicit extension loads (`-e`): the picker's user extensions
+     * (bbpa-ggf.12) then the bb companion extension (bbpa-ggf.13). Loads even
+     * with `noExtensions: true` above — that is the `-e` + `-ne` pair.
+     */
     extensions?: string[];
     /** Per-session values for extension-declared flags (the channel socket). */
     extensionFlagValues?: Record<string, string>;
   };
+}
+
+function dedupePreservingOrder(paths: readonly string[]): string[] {
+  return [...new Set(paths)];
 }
 
 /**

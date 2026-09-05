@@ -46,6 +46,7 @@ import {
 } from "./daemon/connection.js";
 import { resolveDaemonSocketPath } from "./daemon/socket.js";
 import { PrimeSession } from "./prime-session.js";
+import { enabledExtensionsFromProviderOptions } from "./user-extensions.js";
 import {
   SessionTable,
   type ConfiguredSkillRoot,
@@ -248,6 +249,8 @@ async function startSession(args: {
   title?: string | undefined;
   model?: string | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
+  /** The extension picker's selection, read from this command's options. */
+  enabledExtensions?: readonly string[] | undefined;
   input: readonly PromptInput[] | undefined;
   /** Runs after the session exists but before the first prompt — the window
    * where the dynamic-tools set must be published, so the model's first turn
@@ -263,6 +266,7 @@ async function startSession(args: {
       title: args.title,
       model: args.model,
       reasoningLevel: args.reasoningLevel,
+      enabledExtensions: args.enabledExtensions,
       dynamicTools: dynamicTools.sessionConfig(record.threadId),
     });
     sessions.adoptProviderThreadId(record, identity.providerThreadId);
@@ -418,6 +422,13 @@ const handlers: Record<string, RequestHandler> = {
           title: PrimeSession.titleFromInput(parsed.data.input),
           model: parsed.data.options.model,
           reasoningLevel: parsed.data.options.reasoningLevel,
+          // The provider settings' extension picker (bbpa-ggf.12) reaches the
+          // session here and only here: `create` is written once per session,
+          // so the selection is a new-sessions-only knob — the resume below
+          // attaches to the resident worker and never re-reads it.
+          enabledExtensions: enabledExtensionsFromProviderOptions(
+            parsed.data.options.providerOptions,
+          ),
           input: parsed.data.input,
           beforeFirstTurn: () => publishDynamicTools(record),
         }),

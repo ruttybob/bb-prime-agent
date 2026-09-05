@@ -54,6 +54,8 @@ export interface StartSessionArgs {
   title?: string | undefined;
   model?: string | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
+  /** Extension-picker paths to load explicitly (bbpa-ggf.12), when any. */
+  enabledExtensions?: readonly string[] | undefined;
   /** Dynamic-tools channel fragment for the create (bbpa-ggf.13), when any. */
   dynamicTools?: PrimeDynamicToolsConfig | undefined;
 }
@@ -131,6 +133,7 @@ export class PrimeSession {
       cwd: args.cwd,
       model: args.model,
       reasoningLevel: args.reasoningLevel,
+      enabledExtensions: args.enabledExtensions,
       dynamicTools: args.dynamicTools,
     });
     const created = readCommandData(
