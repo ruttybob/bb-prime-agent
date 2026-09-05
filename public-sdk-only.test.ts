@@ -7,8 +7,17 @@ const scan = scanPublicSdkOnly(dirname(fileURLToPath(import.meta.url)), {
   // vitest.config.ts imports the runner's own module — test tooling, not
   // plugin runtime surface. scripts/package-recording.mjs imports the SDK's
   // public provider-bridge TESTING subpath — dev tooling for re-pinning the
-  // recorded parity lane, published as part of the SDK surface.
-  allow: [/^vitest\/config$/u, /^@get-bb\/plugin-sdk\/provider-bridge\/testing$/u],
+  // recorded parity lane, published as part of the SDK surface. React is the
+  // host's own runtime slot (shimmed by `bb plugin build`, never bundled);
+  // the testing library and jsdom are test-only.
+  allow: [
+    /^vitest\/config$/u,
+    /^@get-bb\/plugin-sdk\/provider-bridge\/testing$/u,
+    /^react(\/|$)/u,
+    /^react-dom(\/|$)/u,
+    /^@testing-library\//u,
+    /^jsdom$/u,
+  ],
 });
 
 describe("the prime-agent plugin imports only the public SDK", () => {

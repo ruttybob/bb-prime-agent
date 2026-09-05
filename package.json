@@ -14,7 +14,8 @@
       "icon": "./icons/prime-agent.svg"
     },
     "server": "./server.ts",
-    "host": "./host.ts"
+    "host": "./host.ts",
+    "app": "./app.tsx"
   },
   "keywords": [
     "bb-plugin"
@@ -29,11 +30,17 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@testing-library/react": "^16.3.2",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
     "better-sqlite3": "^12.0.0",
     "cron-parser": "^5.5.0",
     "hono": "^4.11.9",
+    "jsdom": "^29.0.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
     "tsx": "^4.23.13",
     "typescript": "^5.7.0",
     "vitest": "^4.1.1"

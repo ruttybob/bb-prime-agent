@@ -32,6 +32,8 @@ export interface SessionRecord {
   session?: PrimeSession;
   /** Messages from the latest attach snapshot (the adopted-session timeline source). */
   snapshotMessages?: readonly unknown[];
+  /** Children from the latest attach snapshot (the Subagents roster's seed). */
+  snapshotChildren?: readonly unknown[];
 }
 
 /** Skill roots handed over by `skills/configure`, kept for session creation. */

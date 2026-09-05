@@ -6,7 +6,11 @@ import {
   enabledExtensionsFromProviderOptions,
   EXTRA_EXTENSION_PATHS_KEY,
 } from "./src/user-extensions.js";
-import { PRIME_NO_SANDBOX_NOTICE, PRIME_PROVIDER_ID } from "./src/vocabulary.js";
+import {
+  PRIME_NO_SANDBOX_NOTICE,
+  PRIME_PROVIDER_ID,
+  SUBAGENTS_REALTIME_CHANNEL,
+} from "./src/vocabulary.js";
 
 function registeredDeclaration() {
   const declaration = registeredPlugin().provider;
@@ -203,3 +207,170 @@ function optionsContext(settings: Record<string, string | boolean>) {
     settings,
   };
 }
+
+/**
+ * The Subagents panel's server half (bbpa-ggf.9): the panel asks for a roster
+ * by bb thread id, and the server resolves the thread's prime session, asks
+ * the connected hosts, and republishes host roster changes onto one realtime
+ * channel. The fake host stands in for both the thread store and the host
+ * worker (`experimental_callHostRpc` answers what the `bb.host` entry would).
+ */
+describe("the subagents panel's server half", () => {
+  const THREAD_ID = "thr_panel";
+  const IDENTITY_EVENT = {
+    threadId: THREAD_ID,
+    seq: 12,
+    createdAt: 1_000,
+    type: "thread/identity",
+    data: { providerThreadId: "prime_sess_panel" },
+  };
+
+  function hostWith(args: {
+    identityRows?: unknown[];
+    hosts?: Array<{ id: string; name?: string; status: "connected" | "disconnected" }>;
+    rosterAnswer?: unknown;
+    rosterError?: string;
+  }) {
+    const host = createFakePluginHost({
+      pluginId: PRIME_PROVIDER_ID,
+      sdk: {
+        threads: {
+          events: {
+            list: async () => args.identityRows ?? [],
+          },
+        },
+        hosts: {
+          list: async () =>
+            (args.hosts ?? []).map((candidate) => ({
+              name: candidate.name ?? candidate.id,
+              type: "persistent",
+              createdAt: 0,
+              updatedAt: 0,
+              lastSeenAt: null,
+              lastRejectedProtocolVersion: null,
+              maxPermissionMode: "full",
+              ...candidate,
+            })),
+        },
+      },
+      experimental_callHostRpc: (call) => {
+        if (args.rosterError !== undefined) {
+          throw new Error(args.rosterError);
+        }
+        if (call.method !== "subagents.roster") {
+          throw new Error(`unexpected host call ${call.method}`);
+        }
+        return { children: args.rosterAnswer ?? [] };
+      },
+    });
+    plugin(host.bb);
+    return host;
+  }
+
+  it("resolves the thread's prime session and answers with the host's roster", async () => {
+    const host = hostWith({
+      identityRows: [IDENTITY_EVENT],
+      hosts: [{ id: "host_local", status: "connected" }],
+      rosterAnswer: [
+        {
+          id: "child_1",
+          label: "scout",
+          status: "running",
+          model: "zai/glm-5.3-flash",
+          tokenCount: 4321,
+        },
+      ],
+    });
+
+    await expect(
+      host.harness.behavior.callRpc("roster", { threadId: THREAD_ID }),
+    ).resolves.toEqual({
+      state: "ready",
+      activeSessionId: "sess_panel",
+      children: [
+        expect.objectContaining({ id: "child_1", status: "running", tokenCount: 4321 }),
+      ],
+    });
+    // The session id came from the thread identity, the roster from the host.
+    expect(host.harness.inspection.experimental_hostRpcCalls).toEqual([
+      expect.objectContaining({
+        method: "subagents.roster",
+        hostId: "host_local",
+        input: { activeSessionId: "sess_panel" },
+      }),
+    ]);
+  });
+
+  it("skips the identity lookup when the panel already knows the session", async () => {
+    const host = hostWith({
+      hosts: [{ id: "host_local", status: "connected" }],
+    });
+    await expect(
+      host.harness.behavior.callRpc("roster", {
+        threadId: THREAD_ID,
+        activeSessionId: "sess_known",
+      }),
+    ).resolves.toMatchObject({ state: "ready", activeSessionId: "sess_known" });
+    expect(host.harness.sdk.callsTo("threads.events.list")).toEqual([]);
+  });
+
+  it("answers unknown_thread for a thread with no prime identity", async () => {
+    const host = hostWith({ identityRows: [] });
+    await expect(
+      host.harness.behavior.callRpc("roster", { threadId: THREAD_ID }),
+    ).resolves.toEqual({
+      state: "unknown_thread",
+      activeSessionId: null,
+      children: [],
+    });
+    expect(host.harness.inspection.experimental_hostRpcCalls).toEqual([]);
+  });
+
+  it("answers unavailable when no connected host holds the session", async () => {
+    const host = hostWith({
+      identityRows: [IDENTITY_EVENT],
+      hosts: [
+        { id: "host_asleep", status: "disconnected" },
+        { id: "host_local", status: "connected" },
+      ],
+      rosterError: "prime-agent refused to attach: no such session",
+    });
+    await expect(
+      host.harness.behavior.callRpc("roster", { threadId: THREAD_ID }),
+    ).resolves.toEqual({
+      state: "unavailable",
+      activeSessionId: "sess_panel",
+      children: [],
+    });
+  });
+
+  it("republishes host roster changes on the realtime channel", async () => {
+    const host = hostWith({ identityRows: [IDENTITY_EVENT] });
+    await host.harness.behavior.experimental_emitHostSignal(
+      "host_local",
+      "subagents.changed",
+      {
+        activeSessionId: "sess_panel",
+        children: [
+          {
+            id: "child_1",
+            label: "scout",
+            status: "done",
+            answerPreview: "all clear",
+          },
+        ],
+      },
+    );
+    expect(host.harness.inspection.realtimeSignals).toEqual([
+      {
+        channel: SUBAGENTS_REALTIME_CHANNEL,
+        payload: {
+          activeSessionId: "sess_panel",
+          children: [
+            expect.objectContaining({ id: "child_1", status: "done" }),
+          ],
+        },
+      },
+    ]);
+  });
+});

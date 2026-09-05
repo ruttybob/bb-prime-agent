@@ -16,9 +16,11 @@ describe("the host artifact", () => {
 
   it("exports a host RPC entry beside the bridge", () => {
     expect(hostEntry.experimental_apiVersion).toBe(1);
-    // The native-roots contract (bbpa-ggf.8): bb calls `resolveNativeRoots`
-    // when it lists prime's skills for the "/" menu.
-    expect(Object.keys(hostEntry.contract)).toEqual(["resolveNativeRoots"]);
+    // Both halves share the one host entry: the Subagents panel's
+    // per-machine backend (bbpa-ggf.9) and the native-roots resolver
+    // bb calls when it lists prime's skills for the "/" menu (bbpa-ggf.8).
+    expect(Object.keys(hostEntry.contract).sort()).toEqual(["resolveNativeRoots", "subagents.roster"]);
+    expect(hostEntry.experimental_signals).toBeDefined();
   });
 
   it("ignores non-JSON lines and answers unknown methods with METHOD_NOT_FOUND", () => {
