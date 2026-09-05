@@ -60,14 +60,15 @@ export function primeProviderDeclaration(
     capabilities: {
       supportsServiceTier: false,
       supportsNativeUserQuestion: false,
-      // prime can fork a session from a message (`fork` + fork points), but
-      // the wiring is bbpa-ggf.3; the handshake narrows this to "none" today.
-      fork: "none",
+      // prime forks a session from an earlier message (`fork` at the entry a
+      // checkpoint names, bbpa-ggf.7) — bb offers the fork-from-message flow.
+      fork: "checkpoint",
       // prime compacts on its own schedule (`set_auto_compaction`); manual
       // compaction lands with the resident-session work.
       supportsManualCompaction: false,
       supportsThreadArchive: false,
-      supportsThreadRename: false,
+      // Renames apply to prime's catalog name with the "[bb] " prefix kept.
+      supportsThreadRename: true,
       // full-only, with the no-sandbox notice (see the module docs).
       permissionModes: ["full"],
       // prime's thinking ladder (pi-lineage `ThinkingLevel`), read-only onto

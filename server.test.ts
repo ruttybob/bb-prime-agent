@@ -79,7 +79,9 @@ describe("the prime-agent provider declaration", () => {
       "xhigh",
       "max",
     ]);
-    expect(declaration.capabilities.fork).toBe("none");
+    // bbpa-ggf.7: fork from an earlier message and rename in prime's catalog.
+    expect(declaration.capabilities.fork).toBe("checkpoint");
+    expect(declaration.capabilities.supportsThreadRename).toBe(true);
   });
 
   it("forwards the daemon socket override into the bridge process", () => {

@@ -51,9 +51,12 @@ const RECORD_DIR = process.env.BBPA_LIVE_RECORD_DIR;
 let output: CapturedBridgeJsonRpcOutput;
 let collected: unknown[] = [];
 let workspaceDir: string;
-let cleanupSession:
-  | { activeSessionId: string; sessionFile?: string; name: string }
-  | undefined;
+/** Every session this run created; afterEach removes exactly these. */
+const cleanupSessions: Array<{
+  activeSessionId: string;
+  sessionFile?: string;
+  name: string;
+}> = [];
 
 const runtimeLines: string[] = [];
 const bridgeLines: string[] = [];
@@ -83,9 +86,8 @@ afterEach(async () => {
   output.restore();
   resetDaemonForTests();
   sessionTableForTests().clear();
-  // Cleanup is not optional: remove exactly the session this test created.
-  const stale = cleanupSession;
-  if (stale !== undefined) {
+  // Cleanup is not optional: remove exactly the sessions this test created.
+  for (const stale of cleanupSessions) {
     try {
       await withTestClient(async (client) => {
         await client.request({
@@ -102,8 +104,8 @@ afterEach(async () => {
     } catch {
       // A daemon that disappeared already took the resident session with it.
     }
-    cleanupSession = undefined;
   }
+  cleanupSessions.length = 0;
   rmSync(workspaceDir, { recursive: true, force: true });
   await liveExtension?.close();
   liveExtension = undefined;
@@ -263,11 +265,11 @@ it.skipIf(!LIVE)(
     const record = sessionTableForTests().byThread(threadId);
     // prime's active session ids are opaque hashes, not prefixed strings.
     expect(record?.activeSessionId).toMatch(/^[0-9a-f_-]{6,}$/i);
-    cleanupSession = {
+    cleanupSessions.push({
       activeSessionId: record!.activeSessionId!,
       sessionFile: record?.sessionFile,
       name,
-    };
+    });
     // The companion extension actually registered the bb tool in the worker.
     await withTestClient(async (client) => {
       const tool = await client.request({
@@ -554,7 +556,7 @@ it.skipIf(!LIVE)(
     expect(name).toBe(primeSessionName({ threadId, title: prompt }));
     expect(existsSync(sessionFile)).toBe(true);
     // Every path below is covered by this cleanup if the test fails midway.
-    cleanupSession = { activeSessionId, sessionFile, name };
+    cleanupSessions.push({ activeSessionId, sessionFile, name });
 
     // --- release: bb lets go; the daemon session and its file stay. ---
     sendRequest("r", "thread/stop", {
@@ -687,9 +689,169 @@ it.skipIf(!LIVE)(
     });
     // The discard removed the session itself; the afterEach net has nothing
     // left to clean.
-    cleanupSession = undefined;
+    cleanupSessions.length = 0;
   },
   240_000,
+);
+
+/**
+ * The fork-and-rename lane, live (bbpa-ggf.7): a thread with two exchanges is
+ * forked from the FIRST turn's checkpoint into a NEW thread whose own resident
+ * session holds history up to that fork point, and a rename in bb is reflected
+ * in prime's catalog with the "[bb] " prefix kept. Both sessions — the source
+ * and the fork — are cleaned up.
+ *
+ * The forked session's inherited history is asserted at the source of truth
+ * the bridge owns: prime's own transcript (`get_messages` on the forked
+ * session). The new bb thread's persisted timeline is bb's server business —
+ * it copies the inherited events itself, which is why the bridge does not
+ * replay the snapshot as content.
+ */
+it.skipIf(!LIVE)(
+  "forks a thread from an earlier message and renames it in prime's catalog",
+  async () => {
+    const nonce = Math.random().toString(36).slice(2, 8);
+    const threadId = `thr_live_${nonce}`;
+    const forkThreadId = `thr_live_fork_${nonce}`;
+    const firstPrompt = "Remember the word SEVEN. Reply with exactly: ok";
+    const secondPrompt = "Reply with exactly: done";
+
+    // --- Two settled exchanges on the source thread. ---
+    sendRequest("s", "thread/start", {
+      threadId,
+      cwd: workspaceDir,
+      instructionMode: "append",
+      options: FULL_OPTIONS,
+      input: [{ type: "text", text: firstPrompt, mentions: [] }],
+    });
+    await waitFor("the thread/start response", () => responses().some((reply) => reply.id === "s"));
+    const providerThreadId = String(responses().find((reply) => reply.id === "s")!.result?.providerThreadId);
+    await waitFor("the first turn to settle", () =>
+      deltas(threadId).some(
+        (delta) => delta.kind === "turn.boundary" && delta.status === "completed",
+      ),
+    );
+    const firstCheckpoint = deltas(threadId).find(
+      (delta) => delta.kind === "turn.boundary",
+    )?.providerCheckpointId;
+    expect(typeof firstCheckpoint).toBe("string");
+
+    sendRequest("t", "turn/start", {
+      threadId,
+      providerThreadId,
+      input: [{ type: "text", text: secondPrompt, mentions: [] }],
+      clientRequestId: "creq_turn2abcde",
+      options: FULL_OPTIONS,
+    });
+    await waitFor("the second turn to settle", () =>
+      deltas(threadId).filter((delta) => delta.kind === "turn.boundary").length >= 2,
+    );
+
+    const record = sessionTableForTests().byThread(threadId)!;
+    const sourceSessionId = record.activeSessionId!;
+    const sourceFile = record.sessionFile!;
+    const sourceName = record.sessionName!;
+    cleanupSessions.push({ activeSessionId: sourceSessionId, sessionFile: sourceFile, name: sourceName });
+
+    // --- Fork from the first turn's checkpoint. ---
+    sendRequest("f", "thread/fork", {
+      threadId: forkThreadId,
+      cwd: workspaceDir,
+      sourceProviderThreadId: providerThreadId,
+      sourceProviderCheckpointId: firstCheckpoint,
+      instructionMode: "append",
+      options: FULL_OPTIONS,
+    });
+    await waitFor("the fork response", () => responses().some((reply) => reply.id === "f"));
+    const forkReply = responses().find((reply) => reply.id === "f")!;
+    expect(forkReply.error).toBeUndefined();
+    const forkProviderThreadId = String(forkReply.result?.providerThreadId);
+    expect(forkProviderThreadId).toMatch(/^prime_/);
+    expect(forkProviderThreadId).not.toBe(providerThreadId);
+
+    const forkRecord = sessionTableForTests().byThread(forkThreadId)!;
+    const forkSessionId = forkRecord.activeSessionId!;
+    const forkFile = forkRecord.sessionFile!;
+    const forkName = forkRecord.sessionName!;
+    expect(forkName.startsWith(BB_SESSION_NAME_PREFIX)).toBe(true);
+    expect(forkFile).not.toBe(sourceFile);
+    cleanupSessions.push({ activeSessionId: forkSessionId, sessionFile: forkFile, name: forkName });
+
+    // The forked session holds history up to the fork point: the first
+    // exchange is in, the second is not. The source kept both.
+    await withTestClient(async (client) => {
+      const forked = await client.request({ type: "get_messages", activeSessionId: forkSessionId });
+      expect(forked.success, `get_messages failed: ${forked.error}`).toBe(true);
+      const forkedText = JSON.stringify(forked.data);
+      expect(forkedText).toContain("SEVEN");
+      expect(forkedText).not.toContain("done");
+
+      const source = await client.request({ type: "get_messages", activeSessionId: sourceSessionId });
+      expect(source.success, `get_messages failed: ${source.error}`).toBe(true);
+      const sourceText = JSON.stringify(source.data);
+      expect(sourceText).toContain("SEVEN");
+      expect(sourceText).toContain("done");
+    });
+
+    // Both sessions sit in prime's catalog under their [bb] names.
+    await withTestClient(async (client) => {
+      const listing = await client.request({ type: "list" });
+      const sessions =
+        (listing.data as { sessions?: Array<{ sessionName?: string; cwd?: string }> }).sessions ?? [];
+      const mine = sessions.filter(
+        (session) => session.sessionName === sourceName || session.sessionName === forkName,
+      );
+      expect(mine).toHaveLength(2);
+      for (const session of mine) {
+        expect(session.cwd).toBe(workspaceDir);
+      }
+    });
+
+    // The forked thread is a live session of its own: it answers a turn.
+    sendRequest("p", "turn/start", {
+      threadId: forkThreadId,
+      providerThreadId: forkProviderThreadId,
+      input: [{ type: "text", text: "Reply with exactly: forked", mentions: [] }],
+      clientRequestId: "creq_turn3abcde",
+      options: FULL_OPTIONS,
+    });
+    await waitFor("the forked thread's turn to settle", () =>
+      deltas(forkThreadId).some(
+        (delta) => delta.kind === "turn.boundary" && delta.status === "completed",
+      ),
+    );
+    const forkedStream = deltas(forkThreadId)
+      .filter((delta) => delta.kind === "item.textDelta")
+      .map((delta) => String(delta.text))
+      .join("");
+    expect(forkedStream.toLowerCase()).toContain("forked");
+
+    // --- A rename in bb lands in prime's catalog, prefix kept. ---
+    sendRequest("n", "thread/name/set", {
+      threadId: forkThreadId,
+      providerThreadId: forkProviderThreadId,
+      title: `Renamed live ${nonce}`,
+    });
+    await waitFor("the rename response", () => responses().some((reply) => reply.id === "n"));
+    expect(responses().find((reply) => reply.id === "n")?.error).toBeUndefined();
+    const renamedName = primeSessionName({
+      threadId: forkThreadId,
+      title: `Renamed live ${nonce}`,
+    });
+    await waitForAsync("the renamed catalog entry", async () => {
+      await withTestClient(async (client) => {
+        const listing = await client.request({ type: "list" });
+        const sessions =
+          (listing.data as { sessions?: Array<{ sessionName?: string }> }).sessions ?? [];
+        if (!sessions.some((session) => session.sessionName === renamedName)) {
+          throw new StillThere("the renamed session is not in prime's catalog yet");
+        }
+      });
+      return true;
+    });
+    expect(renamedName.startsWith(BB_SESSION_NAME_PREFIX)).toBe(true);
+  },
+  300_000,
 );
 
 /** Marker for the discard poll: the session is (still) there. */
