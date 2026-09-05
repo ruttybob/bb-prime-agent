@@ -23,7 +23,8 @@
   "scripts": {
     "test": "vitest run --config vitest.config.ts",
     "test:watch": "vitest --config vitest.config.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "smoke": "tsx scripts/live-smoke.ts"
   },
   "dependencies": {
     "@get-bb/plugin-sdk": "0.4.34",
