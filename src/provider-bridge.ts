@@ -26,29 +26,37 @@ import {
   turnStartParamsSchema,
   turnSteerParamsSchema,
   type ClientTurnRequestId,
-  type DynamicTool,
+  type PromptInput,
   type ProviderBridgeContext,
+  type ReasoningLevel,
   type ThreadDelta,
 } from "@get-bb/plugin-sdk/provider-bridge";
-import { randomUUID } from "node:crypto";
 import { primeProviderHealthCached } from "./health.js";
+import {
+  daemonRequest,
+  ensureDaemonConnection,
+  onDaemonPush,
+  resetDaemonConnectionForTests,
+} from "./daemon/connection.js";
+import { resolveDaemonSocketPath } from "./daemon/socket.js";
+import { PrimeSession } from "./prime-session.js";
 import {
   SessionTable,
   type ConfiguredSkillRoot,
   type SessionRecord,
 } from "./session-table.js";
-import { PRIME_NO_SANDBOX_NOTICE } from "./vocabulary.js";
 
 /**
  * The prime-agent provider bridge.
  *
- * This ticket owns the protocol surface: the canonical method map, the reply
- * hygiene the conformance kit enforces, and the session/turn grammar that a
- * runtime depends on. Turns are **skeleton turns**: they accept, open, explain
- * that no model is attached yet, and settle. Nothing here talks to the daemon
- * beyond the health probe — the resident-session wiring (`create`, attach,
- * prompt round-trips, delta translation) is bbpa-ggf.3, which fills the turn
- * and session handlers in place.
+ * The chat path is real: `thread/start` creates a daemon-resident prime session
+ * named with the "[bb] " prefix in the bb environment's cwd
+ * (`src/session-params.ts` is the only place those params are built),
+ * `turn/start` prompts it and streams prime's session events into the bb
+ * timeline as deltas (`src/delta-translation.ts`), and `thread/stop` soft-stops
+ * (`abort`) so the session file survives. Discard still leaves the daemon
+ * session in place — deleting it (`kill` + `delete_saved_session`) is
+ * bbpa-ggf.4, together with cross-process session discovery.
  */
 type JsonRpcId = string | number;
 
@@ -61,46 +69,30 @@ function notify(method: string, params: Record<string, unknown>): void {
   io.send(message);
 }
 
-function emitDeltas(threadId: string, deltas: ThreadDelta[]): void {
-  notify(THREAD_DELTA_NOTIFICATION_METHOD, { threadId, deltas });
+function emitDeltas(threadId: string, deltas: readonly ThreadDelta[]): void {
+  if (deltas.length === 0) {
+    return;
+  }
+  notify(THREAD_DELTA_NOTIFICATION_METHOD, { threadId, deltas: [...deltas] });
 }
-
-/**
- * What the skeleton turn tells the user. Deliberately loud: a thread that
- * silently "completed" without a model would be a lie; a warning row says
- * exactly what happened and which ticket wires it.
- */
-const SKELETON_TURN_SUMMARY =
-  "prime-agent bridge skeleton: the prompt was not sent to prime-agent yet";
-
-const SKELETON_TURN_DETAILS = `${PRIME_NO_SANDBOX_NOTICE} (Live chat — resident daemon sessions, turn streaming, steering — arrives with bbpa-ggf.3.)`;
 
 /** Session records, one per bb thread; process-local by design (see module docs). */
 const sessions = new SessionTable();
 
-/** Skill roots from `skills/configure`, consumed when sessions become real. */
+/** Skill roots from `skills/configure`, consumed when sessions are created. */
 let configuredSkillRoots: readonly ConfiguredSkillRoot[] = [];
 
 let bridgeContext: ProviderBridgeContext | undefined;
 
-/** Minted provider thread ids never collide across bridge process restarts. */
-const instanceNonce = randomUUID().replaceAll("-", "").slice(0, 12);
-let threadCounter = 0;
-
-function nextProviderThreadId(): string {
-  threadCounter += 1;
-  return `prime_skeleton_${instanceNonce}_${threadCounter}`;
-}
-
 function registerSession(args: {
   threadId: string;
-  providerThreadId: string;
+  providerThreadId?: string;
   cwd: string;
-  dynamicTools: readonly DynamicTool[];
+  dynamicTools: SessionRecord["dynamicTools"];
 }): SessionRecord {
   return sessions.register({
     threadId: args.threadId,
-    providerThreadId: args.providerThreadId,
+    providerThreadId: args.providerThreadId ?? `prime_pending_${args.threadId}`,
     cwd: args.cwd,
     createdAt: Date.now(),
     dynamicTools: args.dynamicTools,
@@ -110,8 +102,7 @@ function registerSession(args: {
 
 /**
  * Every session construction is a provider id-space boundary: identity first,
- * then `session.reset`, then the result. bbpa-ggf.3 keeps this order when the
- * record becomes a real resident session.
+ * then `session.reset`, then the result — in that order, on the wire.
  */
 function announceSession(record: SessionRecord): void {
   notify(BRIDGE_NOTIFICATION_METHODS.threadIdentity, {
@@ -121,26 +112,81 @@ function announceSession(record: SessionRecord): void {
   emitDeltas(record.threadId, [{ kind: "session.reset" }]);
 }
 
-function runSkeletonTurn(args: {
-  record: SessionRecord;
-  clientRequestId?: ClientTurnRequestId;
-}): void {
-  args.record.turns += 1;
-  const deltas: ThreadDelta[] = [];
-  if (args.clientRequestId !== undefined) {
-    deltas.push({ kind: "input.accepted", clientRequestId: args.clientRequestId });
+/** The daemon session handle behind a provider thread id this bridge minted. */
+function activeSessionIdFrom(providerThreadId: string): string | undefined {
+  const prefix = "prime_";
+  return providerThreadId.startsWith(prefix) && providerThreadId.length > prefix.length
+    ? providerThreadId.slice(prefix.length)
+    : undefined;
+}
+
+function sessionFor(record: SessionRecord): PrimeSession {
+  const session = record.session;
+  if (session === undefined) {
+    throw new Error(
+      `the prime session for thread ${record.threadId} is not attached yet`,
+    );
   }
-  deltas.push(
-    { kind: "turn.open" },
-    {
-      kind: "provider.warning",
-      category: "general",
-      summary: SKELETON_TURN_SUMMARY,
-      details: SKELETON_TURN_DETAILS,
-    },
-    { kind: "turn.boundary", status: "completed" },
-  );
-  emitDeltas(args.record.threadId, deltas);
+  return session;
+}
+
+function laneFor(record: SessionRecord): PrimeSession {
+  const session = new PrimeSession({
+    record,
+    emit: ({ threadId, deltas }) => emitDeltas(threadId, deltas),
+    subscribePush: onDaemonPush,
+    request: (command, args) => daemonRequest(command, args),
+    ensureConnected: ensureDaemonConnection,
+  });
+  record.session = session;
+  return session;
+}
+
+/** Create the resident session, announce it, and stream its first turn. */
+async function startSession(args: {
+  record: SessionRecord;
+  title?: string | undefined;
+  model?: string | undefined;
+  reasoningLevel?: ReasoningLevel | undefined;
+  input: readonly PromptInput[] | undefined;
+}): Promise<void> {
+  const { record } = args;
+  try {
+    const session = laneFor(record);
+    const identity = await session.start({
+      threadId: record.threadId,
+      cwd: record.cwd,
+      title: args.title,
+      model: args.model,
+      reasoningLevel: args.reasoningLevel,
+    });
+    sessions.adoptProviderThreadId(record, identity.providerThreadId);
+  } catch (error) {
+    sessions.drop(record.threadId);
+    throw error;
+  }
+  announceSession(record);
+  if (args.input !== undefined && args.input.length > 0) {
+    await runTurn({ record, input: args.input, clientRequestId: undefined });
+  }
+}
+
+async function runTurn(args: {
+  record: SessionRecord;
+  input: readonly PromptInput[];
+  clientRequestId: ClientTurnRequestId | undefined;
+}): Promise<void> {
+  const { record } = args;
+  record.turns += 1;
+  if (args.clientRequestId !== undefined) {
+    emitDeltas(record.threadId, [
+      { kind: "input.accepted", clientRequestId: args.clientRequestId },
+    ]);
+  }
+  await sessionFor(record).turn({
+    clientRequestId: args.clientRequestId,
+    input: args.input,
+  });
 }
 
 type RequestHandler = (id: JsonRpcId, params: unknown) => void | Promise<void>;
@@ -167,7 +213,8 @@ const handlers: Record<string, RequestHandler> = {
       capabilities: {
         // The assembler speaks v3 only; a narrower range is refused at spawn.
         grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3],
-        // Sessions are process-local until bbpa-ggf.3 makes them resident.
+        // Sessions are daemon-resident, but restoring a provider thread across
+        // bridge processes (saved-session discovery) is bbpa-ggf.4.
         sessionRestore: false,
         threadArchive: false,
         threadRename: false,
@@ -175,8 +222,7 @@ const handlers: Record<string, RequestHandler> = {
         fork: "none",
         // prime-agent has no approval gate; bb runs the policy it declares.
         approvalEnforcedBy: "runtime",
-        // Skeleton turns never stay open, so no steer is ever delivered; the
-        // conservative reading until bbpa-ggf.3 maps prime's steer semantics.
+        // bbpa-ggf.5 maps prime's steer/follow-up semantics onto turn/steer.
         steerMode: "queue",
         // Accepted and stored (see skills/configure) so bb can hand the
         // catalog over before the first real session.
@@ -192,7 +238,7 @@ const handlers: Record<string, RequestHandler> = {
       return;
     }
     throw new Error(
-      "prime-agent model catalog is not wired yet: it arrives with the resident-session work (bbpa-ggf.3), translated from the daemon's get_model_catalog",
+      "prime-agent model catalog is not wired yet: it is translated from the daemon's get_model_catalog with the models ticket (bbpa-ggf.6)",
     );
   },
 
@@ -252,18 +298,23 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.threadStart, parsed.error.issues);
       return;
     }
-    const providerThreadId = nextProviderThreadId();
     const record = registerSession({
       threadId: parsed.data.threadId,
-      providerThreadId,
       cwd: parsed.data.cwd,
       dynamicTools: parsed.data.dynamicTools ?? [],
     });
-    announceSession(record);
-    io.sendResult(id, { providerThreadId, sessionRestorable: false });
-    if (parsed.data.input !== undefined && parsed.data.input.length > 0) {
-      runSkeletonTurn({ record });
-    }
+    return startSession({
+      record,
+      title: PrimeSession.titleFromInput(parsed.data.input),
+      model: parsed.data.options.model,
+      reasoningLevel: parsed.data.options.reasoningLevel,
+      input: parsed.data.input,
+    }).then(() => {
+      io.sendResult(id, {
+        providerThreadId: record.providerThreadId,
+        sessionRestorable: true,
+      });
+    });
   },
 
   [BRIDGE_REQUEST_METHODS.threadResume]: (id, params) => {
@@ -272,20 +323,53 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.threadResume, parsed.error.issues);
       return;
     }
-    const existing = sessions.byProviderThread(parsed.data.providerThreadId);
-    const record =
-      existing ??
-      registerSession({
-        threadId: parsed.data.threadId,
-        providerThreadId: parsed.data.providerThreadId,
-        cwd: parsed.data.cwd,
-        dynamicTools: parsed.data.dynamicTools ?? [],
+    return (async () => {
+      const existing = sessions.byProviderThread(parsed.data.providerThreadId);
+      const adopted = existing === undefined;
+      const record =
+        existing ??
+        registerSession({
+          threadId: parsed.data.threadId,
+          providerThreadId: parsed.data.providerThreadId,
+          cwd: parsed.data.cwd,
+          dynamicTools: parsed.data.dynamicTools ?? [],
+        });
+      try {
+        if (record.session === undefined) {
+          const activeSessionId = activeSessionIdFrom(record.providerThreadId);
+          if (activeSessionId === undefined) {
+            throw new Error(
+              `cannot resume ${record.providerThreadId}: it is not a prime-agent session id this bridge created`,
+            );
+          }
+          record.activeSessionId = activeSessionId;
+          const session = laneFor(record);
+          await session.attach();
+          // Every session construction is an id-space boundary, and the snapshot
+          // content — when it is replayed at all — belongs to the new space.
+          announceSession(record);
+          // bb persists this thread's timeline, so the snapshot is not replayed
+          // as content — except when the session was adopted from a previous
+          // bridge process, where the snapshot is the only source the bridge
+          // ever sees. bbpa-ggf.4 revisits this with saved-session discovery.
+          if (adopted) {
+            session.snapshotDeltas();
+          }
+        } else {
+          await sessionFor(record).attach();
+          announceSession(record);
+        }
+      } catch (error) {
+        if (adopted) {
+          sessions.drop(record.threadId);
+        }
+        throw error;
+      }
+      io.sendResult(id, {
+        providerThreadId: record.providerThreadId,
+        sessionRestorable: true,
       });
-    announceSession(record);
-    io.sendResult(id, {
-      providerThreadId: record.providerThreadId,
-      sessionRestorable: false,
-    });
+    })();
   },
 
   [BRIDGE_REQUEST_METHODS.threadFork]: (id, params) => {
@@ -295,7 +379,7 @@ const handlers: Record<string, RequestHandler> = {
       return;
     }
     throw new Error(
-      "prime-agent fork is not wired yet: the handshake declares fork \"none\" until the resident-session work (bbpa-ggf.3) lands it",
+      "prime-agent fork is not wired yet: the handshake declares fork \"none\" until the persistence work lands it (bbpa-ggf.4)",
     );
   },
 
@@ -305,10 +389,29 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.threadStop, parsed.error.issues);
       return;
     }
-    // Nothing is ever mid-turn in the skeleton, so `interrupt` has no turn to
-    // settle and `release` must not fabricate one: both drop the record only.
-    sessions.drop(parsed.data.threadId);
-    io.sendResult(id, { ok: true });
+    return (async () => {
+      const record = sessions.byThread(parsed.data.threadId);
+      const session = record?.session;
+      if (parsed.data.intent === "interrupt" && session !== undefined) {
+        // Soft stop: prime stops streaming and the transcript keeps what it
+        // already wrote. The bridge settles the turn itself so bb never waits
+        // on the daemon to agree.
+        emitDeltas(record!.threadId, await session.interrupt());
+        io.sendResult(id, { ok: true });
+        return;
+      }
+      // release (or an interrupt of a session we never attached): detach from
+      // the resident session and drop the record. The session file survives —
+      // the thread can come back through resume. No interruption is ever
+      // fabricated, even if a turn is still streaming.
+      if (session !== undefined) {
+        await session.release();
+      }
+      if (record !== undefined) {
+        sessions.drop(record.threadId);
+      }
+      io.sendResult(id, { ok: true });
+    })();
   },
 
   [BRIDGE_REQUEST_METHODS.threadDiscard]: (id, params) => {
@@ -317,10 +420,19 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.threadDiscard, parsed.error.issues);
       return;
     }
-    // No daemon session exists to delete, so dropping the record is the whole
-    // truth; bbpa-ggf.3 adds the daemon-side cleanup (stop + delete_saved_session).
-    sessions.drop(parsed.data.threadId);
-    io.sendResult(id, { ok: true });
+    return (async () => {
+      const record = sessions.byThread(parsed.data.threadId);
+      if (record?.session !== undefined) {
+        await record.session.release();
+      }
+      if (record !== undefined) {
+        sessions.drop(record.threadId);
+      }
+      // The daemon session file is deliberately left in place until bbpa-ggf.4
+      // wires the daemon cleanup (`kill` + `delete_saved_session`); it stays a
+      // "[bb] "-prefixed session the user can still see from prime itself.
+      io.sendResult(id, { ok: true });
+    })();
   },
 
   [BRIDGE_REQUEST_METHODS.threadNameSet]: (id, params) => {
@@ -330,7 +442,7 @@ const handlers: Record<string, RequestHandler> = {
       return;
     }
     throw new Error(
-      "prime-agent thread rename is not wired yet: the handshake declares no threadRename until resident sessions land (bbpa-ggf.3)",
+      "prime-agent thread rename is not wired yet: the handshake declares no threadRename until the persistence work lands it (bbpa-ggf.4)",
     );
   },
 
@@ -378,8 +490,13 @@ const handlers: Record<string, RequestHandler> = {
       );
       return;
     }
-    io.sendResult(id, {});
-    runSkeletonTurn({ record, clientRequestId: parsed.data.clientRequestId });
+    return runTurn({
+      record,
+      input: parsed.data.input,
+      clientRequestId: parsed.data.clientRequestId,
+    }).then(() => {
+      io.sendResult(id, {});
+    });
   },
 
   [BRIDGE_REQUEST_METHODS.turnSteer]: (id, params) => {
@@ -388,6 +505,8 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.turnSteer, parsed.error.issues);
       return;
     }
+    // Steering maps onto prime's `steer` with bbpa-ggf.5; until then a steer is
+    // refused rather than silently queued behind the running turn.
     io.sendError(
       id,
       BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN,
@@ -429,8 +548,8 @@ export function handleLine(line: string): void {
     params?: unknown;
   };
   if (typeof method !== "string") {
-    // A response (to an item/tool/call we sent) — none are pending in the
-    // skeleton, so this is a no-op kept for reply hygiene.
+    // A response (to an item/tool/call we sent) — none are pending, so this is
+    // a no-op kept for reply hygiene.
     return;
   }
   if (typeof id !== "string" && typeof id !== "number") {
@@ -452,7 +571,7 @@ export function handleLine(line: string): void {
   });
 }
 
-/** The skills/configure catalog, for tests and for bbpa-ggf.3's session params. */
+/** The skills/configure catalog, for tests and for session creation. */
 export function currentConfiguredSkillRoots(): readonly ConfiguredSkillRoot[] {
   return configuredSkillRoots;
 }
@@ -462,14 +581,30 @@ export function sessionTableForTests(): SessionTable {
   return sessions;
 }
 
+/** Test seam: forget the shared daemon connection (a new one is built lazily). */
+export function resetDaemonForTests(): void {
+  resetDaemonConnectionForTests();
+}
+
+/** The socket path this bridge would dial (tests and the health probe use it). */
+export function daemonSocketPathForTests(): string {
+  return resolveDaemonSocketPath();
+}
+
 export const experimental_providerBridge = experimental_defineProviderBridge({
   handleLine,
   start(context) {
     bridgeContext = context;
   },
   onClose() {
+    for (const record of sessions.all()) {
+      // Fire and forget: the daemon outlives this process, and a failed detach
+      // on the way down is not an error the runtime can act on.
+      record.session?.release().catch(() => {});
+    }
     sessions.clear();
     bridgeContext = undefined;
+    resetDaemonConnectionForTests();
   },
 });
 

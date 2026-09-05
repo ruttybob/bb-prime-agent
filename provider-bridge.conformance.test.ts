@@ -11,8 +11,16 @@ import type { CapturedBridgeJsonRpcOutput } from "@get-bb/plugin-sdk/provider-br
 
 import {
   handleLine,
+  resetDaemonForTests,
   sessionTableForTests,
 } from "./src/provider-bridge.js";
+import {
+  setPrimeDaemonTransportFactoryForTests,
+} from "./src/daemon/connection.js";
+import {
+  createScriptedDaemon,
+  textTurnEvents,
+} from "./test-support/scripted-daemon.js";
 
 let output: CapturedBridgeJsonRpcOutput;
 let workspaceDir: string;
@@ -20,10 +28,37 @@ let workspaceDir: string;
 beforeEach(() => {
   workspaceDir = mkdtempSync(join(tmpdir(), "bb-prime-conformance-"));
   output = captureBridgeJsonRpcOutput();
+  // The suite stays hermetic: the bridge runs its real chat path against a
+  // scripted daemon instead of the machine's prime install.
+  const daemon = createScriptedDaemon({
+    session: {
+      activeSessionId: "sess_conformance",
+      sessionFile: "/tmp/prime/sessions/sess_conformance.jsonl",
+      sessionName: "[bb] say hello (thr_conformance_1)",
+      cwd: workspaceDir,
+    },
+  });
+  daemon.enqueueCreate();
+  daemon.enqueueAttach();
+  daemon.enqueuePrompt({ events: textTurnEvents({ text: "hello" }) });
+  daemon.enqueueOk("abort");
+  daemon.enqueueOk("detach");
+  daemon.enqueueAttach();
+  daemon.enqueuePrompt({ events: textTurnEvents({ text: "hello again" }) });
+  // The zero-work prompt: prime ran a turn that produced nothing observable,
+  // which still has to settle the turn bb accepted.
+  daemon.enqueuePrompt({
+    events: [{ type: "agent_start" }, { type: "agent_end", messages: [] }],
+  });
+  daemon.enqueueOk("abort");
+  daemon.enqueueOk("detach");
+  setPrimeDaemonTransportFactoryForTests(() => daemon.transport);
 });
 
 afterEach(() => {
   output.restore();
+  setPrimeDaemonTransportFactoryForTests(undefined);
+  resetDaemonForTests();
   sessionTableForTests().clear();
   rmSync(workspaceDir, { recursive: true, force: true });
 });

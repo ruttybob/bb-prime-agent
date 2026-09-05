@@ -124,6 +124,14 @@ export class PrimeDaemonClient {
   /** Push messages (session events, progress, …) that are not responses. */
   onPush: ((message: DaemonPushMessage) => void) | undefined;
 
+  /**
+   * Wire taps, used by the provider-side recording lanes (`bridge→provider`,
+   * `provider→bridge`): every JSONL line exactly as it crosses the socket,
+   * greeting included. They are notifications, never a gate.
+   */
+  onWireWrite: ((line: string) => void) | undefined;
+  onWireRead: ((line: string) => void) | undefined;
+
   constructor(options: PrimeDaemonClientOptions) {
     this.socketPath = options.socketPath;
     this.clientId = options.clientId;
@@ -340,7 +348,9 @@ export class PrimeDaemonClient {
     if (socket === null || socket.destroyed) {
       throw new DaemonConnectionClosedError(this.socketPath, "not connected");
     }
-    socket.write(`${JSON.stringify(envelope)}\n`);
+    const line = JSON.stringify(envelope);
+    this.onWireWrite?.(line);
+    socket.write(`${line}\n`);
   }
 
   private handleData(chunk: Buffer): void {
@@ -357,6 +367,7 @@ export class PrimeDaemonClient {
   }
 
   private handleLine(line: string): void {
+    this.onWireRead?.(line);
     let message: unknown;
     try {
       message = JSON.parse(line);
