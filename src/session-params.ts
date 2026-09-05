@@ -74,19 +74,25 @@ export function primeThinkingLevel(
 }
 
 /**
- * The prime session name for a bb thread. bb does not send a thread title over
- * the bridge protocol, so the title is the thread's first prompt text when
- * there is one and the bb thread id otherwise — either way the "[bb] " prefix
- * is what prime's catalog (and this repo's tests) key on.
+ * The prime session name for a bb thread.
+ *
+ * bb does not send a thread title over the bridge protocol, so the title is the
+ * thread's first prompt text; the "[bb] " prefix is what prime's catalog (and
+ * this repo's tests) key on. The bb thread id is part of the name because prime
+ * requires agent names to be unique among its resident sessions ("an agent of
+ * that name already exists at depth 0 under this parent"): two bb threads whose
+ * first message happens to match must not collide, and a repeat create for the
+ * same thread keeps converging on the same name.
  */
 export function primeSessionName(args: {
   threadId: string;
   title?: string | undefined;
 }): string {
   const title = args.title?.trim() ?? "";
-  const trimmed =
-    title.length > 0 ? truncate(title, 80) : truncate(args.threadId, 80);
-  return `${BB_SESSION_NAME_PREFIX}${trimmed}`;
+  if (title.length === 0) {
+    return `${BB_SESSION_NAME_PREFIX}${args.threadId}`;
+  }
+  return `${BB_SESSION_NAME_PREFIX}${truncate(title, 64)} (${args.threadId})`;
 }
 
 function truncate(text: string, max: number): string {

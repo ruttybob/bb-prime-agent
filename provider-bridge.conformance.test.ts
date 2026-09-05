@@ -34,7 +34,7 @@ beforeEach(() => {
     session: {
       activeSessionId: "sess_conformance",
       sessionFile: "/tmp/prime/sessions/sess_conformance.jsonl",
-      sessionName: "[bb] say hello",
+      sessionName: "[bb] say hello (thr_conformance_1)",
       cwd: workspaceDir,
     },
   });

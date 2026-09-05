@@ -5,8 +5,10 @@ import { experimental_scanPublicSdkOnly as scanPublicSdkOnly } from "@get-bb/plu
 
 const scan = scanPublicSdkOnly(dirname(fileURLToPath(import.meta.url)), {
   // vitest.config.ts imports the runner's own module — test tooling, not
-  // plugin runtime surface.
-  allow: [/^vitest\/config$/u],
+  // plugin runtime surface. scripts/package-recording.mjs imports the SDK's
+  // public provider-bridge TESTING subpath — dev tooling for re-pinning the
+  // recorded parity lane, published as part of the SDK surface.
+  allow: [/^vitest\/config$/u, /^@get-bb\/plugin-sdk\/provider-bridge\/testing$/u],
 });
 
 describe("the prime-agent plugin imports only the public SDK", () => {

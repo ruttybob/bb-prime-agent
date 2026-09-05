@@ -174,8 +174,10 @@ describe("resident session construction", () => {
     // The provider thread id is daemon-derived, so it survives a restart.
     expect(providerThreadId).toBe("prime_sess_1");
     const create = daemon.commands.find((command) => command.type === "create");
+    // The bb thread id rides along: prime requires unique names among its
+    // resident agents, so two threads with the same first message cannot collide.
     expect(create).toMatchObject({
-      name: "[bb] count the stars",
+      name: "[bb] count the stars (thr_1)",
       lifecycle: "resident",
       config: {
         cwd,
