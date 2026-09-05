@@ -5,14 +5,16 @@ import { experimental_scanPublicSdkOnly as scanPublicSdkOnly } from "@get-bb/plu
 
 const scan = scanPublicSdkOnly(dirname(fileURLToPath(import.meta.url)), {
   // vitest.config.ts imports the runner's own module — test tooling, not
-  // plugin runtime surface. scripts/package-recording.mjs imports the SDK's
-  // public provider-bridge TESTING subpath — dev tooling for re-pinning the
-  // recorded parity lane, published as part of the SDK surface. React is the
-  // host's own runtime slot (shimmed by `bb plugin build`, never bundled);
-  // the testing library and jsdom are test-only.
+  // plugin runtime surface. scripts/package-recording.mjs and
+  // scripts/live-smoke.ts import the SDK's public TESTING subpaths — dev
+  // tooling (re-pinning the recorded parity lane; the bbpa-ggf.14 live smoke),
+  // published as part of the SDK surface. React is the host's own runtime slot
+  // (shimmed by `bb plugin build`, never bundled); the testing library and
+  // jsdom are test-only.
   allow: [
     /^vitest\/config$/u,
     /^@get-bb\/plugin-sdk\/provider-bridge\/testing$/u,
+    /^@get-bb\/plugin-sdk\/testing(\/|$)/u,
     /^react(\/|$)/u,
     /^react-dom(\/|$)/u,
     /^@testing-library\//u,
