@@ -7,6 +7,7 @@ import type {
 import type { DaemonCommandResult } from "./daemon/client.js";
 import type { DaemonConnectionEvent } from "./daemon/connection.js";
 import type { DaemonHello, DaemonPushMessage } from "./daemon/protocol.js";
+import { readCommandData } from "./daemon/answer.js";
 import {
   createPrimeDeltaTranslator,
   type PrimeDeltaTranslator,
@@ -40,6 +41,7 @@ import {
   type PrimeThinkingLevel,
 } from "./session-params.js";
 import { primePromptText } from "./skill-mentions.js";
+import { primeProviderThreadId } from "./vocabulary.js";
 import { forkCheckpointFor } from "./fork-points.js";
 import { asWireCommand } from "./daemon/transport.js";
 import type { SessionRecord } from "./session-table.js";
@@ -136,25 +138,6 @@ export interface PrimeSessionOptions {
    * honest carrier (and what the live lane asserts against).
    */
   onState?: (state: PrimeSessionState, source: PrimeSessionStateSource) => void;
-}
-
-function readCommandData<T>(
-  result: DaemonCommandResult,
-  command: string,
-  parse: (data: unknown) => { success: true; data: T } | { success: false; issues: string },
-): T {
-  if (!result.success) {
-    throw new Error(
-      `prime-agent refused "${command}": ${result.error ?? "unknown daemon error"}`,
-    );
-  }
-  const parsed = parse(result.data);
-  if (!parsed.success) {
-    throw new Error(
-      `prime-agent answered "${command}" with something this bridge cannot read (${parsed.issues})`,
-    );
-  }
-  return parsed.data;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -314,7 +297,8 @@ export class PrimeSession {
     // the same session no matter which bridge process created it. The bridge
     // re-indexes the record under it (`adoptProviderThreadId`).
     return {
-      providerThreadId: `prime_${created.activeSessionId}`,
+      // The create parse above admits only answers with an activeSessionId.
+      providerThreadId: primeProviderThreadId(created.activeSessionId!),
       sessionRestorable: true,
     };
   }
@@ -960,11 +944,6 @@ export class PrimeSession {
     }
   }
 
-  /** bb prompt text: skill mentions in prime's command form, parts joined. */
-  static promptText(input: readonly PromptInput[]): string {
-    return primePromptText(input);
-  }
-
   /** The bb thread title as the bridge can see it: the first prompt text. */
   static titleFromInput(
     input: readonly PromptInput[] | undefined,
@@ -993,13 +972,13 @@ export class PrimeSession {
     // The anchor is queued with the send: prime settles every admitted input
     // with an agent_end, which consumes it. If the prompt is refused, the
     // anchor is taken back so the FIFO stays aligned with prime's runs.
-    this.queueCheckpoint(PrimeSession.promptText(args.input));
+    this.queueCheckpoint(primePromptText(args.input));
     try {
       await this.request(
         asWireCommand({
           type: "prompt",
           activeSessionId: this.record.activeSessionId,
-          message: PrimeSession.promptText(args.input),
+          message: primePromptText(args.input),
           // Prime refuses a bare prompt while it is streaming ("Specify
           // streamingBehavior …"), and a prompt that lands on a busy session
           // must not take the session away from the running turn: the
@@ -1036,7 +1015,7 @@ export class PrimeSession {
     await this.awaitLive();
     const midTurn = this.hasOpenTurn;
     this.openTurn = { settledLocally: false };
-    this.queueCheckpoint(PrimeSession.promptText(args.input));
+    this.queueCheckpoint(primePromptText(args.input));
     try {
       await readCommandData(
         await this.request(
@@ -1045,14 +1024,14 @@ export class PrimeSession {
               ? {
                   type: "prompt",
                   activeSessionId: this.record.activeSessionId,
-                  message: PrimeSession.promptText(args.input),
+                  message: primePromptText(args.input),
                   streamingBehavior: "steer",
                   queueIfBusy: true,
                 }
               : {
                   type: "steer",
                   activeSessionId: this.record.activeSessionId,
-                  message: PrimeSession.promptText(args.input),
+                  message: primePromptText(args.input),
                 },
           ),
         ),

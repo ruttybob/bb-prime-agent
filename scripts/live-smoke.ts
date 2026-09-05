@@ -67,6 +67,7 @@ import {
 } from "../src/subagents/backend-connection.js";
 import type { PrimeChild } from "../src/subagents/children.js";
 import { createPrimeSubagentsHostEntry } from "../src/subagents/host-entry.js";
+import { PRIME_PROVIDER_THREAD_PREFIX } from "../src/vocabulary.js";
 
 /** The child session name the spawn prompt asks the parent to use. */
 const CHILD_NAME = "bb-smoke-child";
@@ -507,7 +508,7 @@ async function bridgeLayer(): Promise<void> {
     throw new Error(`thread/start failed: ${JSON.stringify(startReply.error)}`);
   }
   subject.providerThreadId = String(startReply.result?.providerThreadId);
-  if (!subject.providerThreadId.startsWith("prime_")) {
+  if (!subject.providerThreadId.startsWith(PRIME_PROVIDER_THREAD_PREFIX)) {
     throw new Error(
       `thread/start answered a non-daemon provider thread id: ${subject.providerThreadId}`,
     );

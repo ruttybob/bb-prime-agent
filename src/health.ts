@@ -53,10 +53,6 @@ function primeHealth(
 
 const INSTALL_GUIDANCE = `Install prime-agent ${PRIME_MINIMUM_SUPPORTED_VERSION} or newer: ${PRIME_INSTALL_URL}`;
 
-function installGuidance(): string {
-  return INSTALL_GUIDANCE;
-}
-
 /**
  * Map a daemon probe onto the provider health bb renders. The mapping is the
  * visibility contract: only `not_installed` hides the provider from the
@@ -76,14 +72,14 @@ export async function primeProviderHealth(
   switch (probe.status) {
     case "unreachable":
       return primeHealth("not_installed", {
-        statusMessage: `No prime-agent daemon answered at ${probe.socketPath} (${probe.reason}). Start prime-agent once, or install it: ${installGuidance()}`,
+        statusMessage: `No prime-agent daemon answered at ${probe.socketPath} (${probe.reason}). Start prime-agent once, or install it: ${INSTALL_GUIDANCE}`,
       });
     case "handshake_failed": {
       if (probe.rejection.kind === "protocol_too_old") {
         const version = probe.hello?.appVersion ?? null;
         return primeHealth("unsupported_version", {
           installedVersion: version,
-          statusMessage: `${version === null ? "The installed prime-agent" : `prime-agent ${version}`} speaks daemon protocol ${probe.rejection.protocolVersion}; this bridge needs ${DAEMON_MIN_PROTOCOL_VERSION} or newer. ${installGuidance()}`,
+          statusMessage: `${version === null ? "The installed prime-agent" : `prime-agent ${version}`} speaks daemon protocol ${probe.rejection.protocolVersion}; this bridge needs ${DAEMON_MIN_PROTOCOL_VERSION} or newer. ${INSTALL_GUIDANCE}`,
         });
       }
       return primeHealth("unknown", {

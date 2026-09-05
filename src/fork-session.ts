@@ -1,4 +1,5 @@
-import type { DaemonCommandResult } from "./daemon/client.js";
+import type { AnswerRead, DaemonRequest } from "./daemon/answer.js";
+import { ask } from "./daemon/answer.js";
 import {
   daemonForkResultSchema,
   daemonSessionSummarySchema,
@@ -41,11 +42,6 @@ import { resolveForkTarget } from "./fork-points.js";
  * across such windows is bbpa-ggf.11's business).
  */
 
-type Request = (
-  command: { type: string } & Record<string, unknown>,
-  args?: { timeoutMs?: number },
-) => Promise<DaemonCommandResult>;
-
 export interface PrimeForkOutcome {
   /**
    * The branched transcript file for the new thread's session to adopt, or
@@ -55,38 +51,8 @@ export interface PrimeForkOutcome {
   sessionFile: string | undefined;
 }
 
-interface AskResult<T> {
-  success: true;
-  data: T;
-}
-interface AskIssue {
-  success: false;
-  issues: string;
-}
-
-/** Send one command and read its answer, with prime's refusals legible. */
-async function ask<T>(
-  request: Request,
-  command: { type: string } & Record<string, unknown>,
-  parse: (data: unknown) => AskResult<T> | AskIssue,
-): Promise<T> {
-  const result = await request(command);
-  if (!result.success) {
-    throw new Error(
-      `prime-agent refused "${command.type}": ${result.error ?? "unknown daemon error"}`,
-    );
-  }
-  const parsed = parse(result.data);
-  if (!parsed.success) {
-    throw new Error(
-      `prime-agent answered "${command.type}" with something this bridge cannot read (${parsed.issues})`,
-    );
-  }
-  return parsed.data;
-}
-
 /** The transcript file a session summary names — the thing fork reads twice. */
-function transcriptFile(data: unknown): AskResult<string> | AskIssue {
+function transcriptFile(data: unknown): AnswerRead<string> {
   const parsed = daemonSessionSummarySchema.safeParse(data);
   if (!parsed.success || parsed.data.sessionFile === undefined) {
     return { success: false, issues: "the summary carries no sessionFile" };
@@ -99,7 +65,7 @@ function transcriptFile(data: unknown): AskResult<string> | AskIssue {
  * transcript back. Returns the branch file for the caller's `create`.
  */
 export async function forkPrimeSession(args: {
-  request: Request;
+  request: DaemonRequest;
   sourceActiveSessionId: string;
   /** bb's `sourceProviderCheckpointId`; absent means fork at the tip. */
   checkpointId: string | undefined;

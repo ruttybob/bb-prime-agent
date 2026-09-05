@@ -1,4 +1,3 @@
-import type { ThreadDelta } from "@get-bb/plugin-sdk/provider-bridge";
 import { z } from "zod";
 import { PRIME_PLUGIN_ID } from "./vocabulary.js";
 
@@ -54,13 +53,4 @@ export function queueStatePayload(
   return queue.steering.length === 0 && queue.followUps.length === 0
     ? null
     : { steering: [...queue.steering], followUps: [...queue.followUps] };
-}
-
-/** The `extension.state` delta carrying that payload. */
-export function queueStateDelta(queue: PrimeQueueState): ThreadDelta {
-  return {
-    kind: "extension.state",
-    extensionKind: PRIME_QUEUE_EXTENSION_KIND,
-    payload: queueStatePayload(queue),
-  };
 }

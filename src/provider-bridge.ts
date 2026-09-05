@@ -51,6 +51,11 @@ import { resolveDaemonSocketPath } from "./daemon/socket.js";
 import { asWireCommand } from "./daemon/transport.js";
 import { daemonSessionSummarySchema } from "./daemon/wire.js";
 import { primeSessionName } from "./session-params.js";
+import { primePromptText } from "./skill-mentions.js";
+import {
+  primeActiveSessionIdFrom,
+  provisionalPrimeProviderThreadId,
+} from "./vocabulary.js";
 import { PrimeSession } from "./prime-session.js";
 import { forkPrimeSession } from "./fork-session.js";
 import { enabledExtensionsFromProviderOptions } from "./user-extensions.js";
@@ -148,7 +153,7 @@ function registerSession(args: {
 }): SessionRecord {
   return sessions.register({
     threadId: args.threadId,
-    providerThreadId: args.providerThreadId ?? `prime_pending_${args.threadId}`,
+    providerThreadId: args.providerThreadId ?? provisionalPrimeProviderThreadId(args.threadId),
     cwd: args.cwd,
     createdAt: Date.now(),
     dynamicTools: args.dynamicTools,
@@ -244,14 +249,6 @@ function stopDynamicTools(record: SessionRecord | undefined): Promise<void> {
   return dynamicTools.stop(record.threadId);
 }
 
-/** The daemon session handle behind a provider thread id this bridge minted. */
-function activeSessionIdFrom(providerThreadId: string): string | undefined {
-  const prefix = "prime_";
-  return providerThreadId.startsWith(prefix) && providerThreadId.length > prefix.length
-    ? providerThreadId.slice(prefix.length)
-    : undefined;
-}
-
 function sessionFor(record: SessionRecord): PrimeSession {
   const session = record.session;
   if (session === undefined) {
@@ -276,7 +273,7 @@ async function sessionFileForRenaming(
   if (record?.sessionFile !== undefined) {
     return record.sessionFile;
   }
-  const activeSessionId = activeSessionIdFrom(providerThreadId);
+  const activeSessionId = primeActiveSessionIdFrom(providerThreadId);
   if (activeSessionId !== undefined) {
     const state = await daemonRequest(
       asWireCommand({ type: "get_state", activeSessionId }),
@@ -453,538 +450,532 @@ function invalidParams(id: JsonRpcId, method: string, issues: unknown): void {
   );
 }
 
+/**
+ * The one parse prologue every method shares: params that do not satisfy the
+ * method's schema answer -32602 carrying the issues, and valid params reach
+ * the handler already typed. The method name rides along because it is part
+ * of the refusal text.
+ */
+function withParsed<T>(
+  method: string,
+  schema: { safeParse(params: unknown): { success: true; data: T } | { success: false; error: { issues: unknown } } },
+  handler: (id: JsonRpcId, data: T) => void | Promise<void>,
+): RequestHandler {
+  return (id, params) => {
+    const parsed = schema.safeParse(params);
+    if (!parsed.success) {
+      invalidParams(id, method, parsed.error.issues);
+      return;
+    }
+    return handler(id, parsed.data);
+  };
+}
 const handlers: Record<string, RequestHandler> = {
-  [BRIDGE_REQUEST_METHODS.initialize]: (id, params) => {
-    const parsed = initializeParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.initialize, parsed.error.issues);
-      return;
-    }
-    io.sendResult(id, {
-      protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
-      capabilities: {
-        // The assembler speaks v3 only; a narrower range is refused at spawn.
-        grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3],
-        // A bb thread survives its bridge process: the provider thread id is
-        // daemon-derived (`prime_<activeSessionId>`), so a reopened thread
-        // attaches to the same resident session and rebuilds its timeline from
-        // the attach snapshot. Restore needs the daemon holding the session —
-        // when the daemon itself is gone, resume answers a legible error
-        // (recovery across a daemon restart is bbpa-ggf.11).
-        sessionRestore: true,
-        threadArchive: false,
-        // Renames apply to prime's catalog name with the "[bb] " prefix kept
-        // (bbpa-ggf.7): the resident session is renamed in place, and a
-        // released thread's saved transcript is renamed by file.
-        threadRename: true,
-        threadGoalClear: false,
-        // Checkpoint forks (bbpa-ggf.7): every settled prompt-carrying turn
-        // mints a fork anchor on its boundary, and `thread/fork` branches the
-        // source session's transcript at that anchor into a NEW session for
-        // the new thread.
-        fork: "checkpoint",
-        // prime-agent has no approval gate; bb runs the policy it declares.
-        approvalEnforcedBy: "runtime",
-        // Steers are queued, not injected: `turn/steer` rides prime's steering
-        // lane (delivered after the work in flight, never interrupting), and a
-        // prompt landing on a busy session rides the follow-up lane
-        // (bbpa-ggf.5).
-        steerMode: "queue",
-        // Accepted and stored (see skills/configure) so bb can hand the
-        // catalog over before the first real session.
-        skills: { configure: true },
-      },
-    });
-  },
+  [BRIDGE_REQUEST_METHODS.initialize]: withParsed(
+    BRIDGE_REQUEST_METHODS.initialize,
+    initializeParamsSchema,
+    (id, data) => {
+      io.sendResult(id, {
+        protocolVersion: PROVIDER_BRIDGE_PROTOCOL_VERSION,
+        capabilities: {
+          // The assembler speaks v3 only; a narrower range is refused at spawn.
+          grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3],
+          // A bb thread survives its bridge process: the provider thread id is
+          // daemon-derived (`prime_<activeSessionId>`), so a reopened thread
+          // attaches to the same resident session and rebuilds its timeline from
+          // the attach snapshot. Restore needs the daemon holding the session —
+          // when the daemon itself is gone, resume answers a legible error
+          // (recovery across a daemon restart is bbpa-ggf.11).
+          sessionRestore: true,
+          threadArchive: false,
+          // Renames apply to prime's catalog name with the "[bb] " prefix kept
+          // (bbpa-ggf.7): the resident session is renamed in place, and a
+          // released thread's saved transcript is renamed by file.
+          threadRename: true,
+          threadGoalClear: false,
+          // Checkpoint forks (bbpa-ggf.7): every settled prompt-carrying turn
+          // mints a fork anchor on its boundary, and `thread/fork` branches the
+          // source session's transcript at that anchor into a NEW session for
+          // the new thread.
+          fork: "checkpoint",
+          // prime-agent has no approval gate; bb runs the policy it declares.
+          approvalEnforcedBy: "runtime",
+          // Steers are queued, not injected: `turn/steer` rides prime's steering
+          // lane (delivered after the work in flight, never interrupting), and a
+          // prompt landing on a busy session rides the follow-up lane
+          // (bbpa-ggf.5).
+          steerMode: "queue",
+          // Accepted and stored (see skills/configure) so bb can hand the
+          // catalog over before the first real session.
+          skills: { configure: true },
+        },
+      });
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.modelList]: (id, params) => {
-    const parsed = modelListParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.modelList, parsed.error.issues);
-      return;
-    }
-    // prime's own catalog, no curated list on our side. A daemon that cannot
-    // answer (no `model_catalog` capability, no signed-in provider) is an
-    // honest error for the picker, never a crash.
-    return primeAvailableModels({ cwd: parsed.data.cwd }).then(
-      (answer) => {
-        io.sendResult(id, answer);
-      },
-      (error: unknown) => {
-        io.sendError(
-          id,
-          BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
-          error instanceof Error ? error.message : String(error),
-        );
-      },
-    );
-  },
-
-  [BRIDGE_REQUEST_METHODS.providerHealth]: (id, params) => {
-    const parsed = providerMaintenanceParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.providerHealth, parsed.error.issues);
-      return;
-    }
-    return primeProviderHealthCached().then((result) => {
-      io.sendResult(id, result);
-    });
-  },
-
-  [BRIDGE_REQUEST_METHODS.providerUsage]: (id, params) => {
-    const parsed = providerMaintenanceParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.providerUsage, parsed.error.issues);
-      return;
-    }
-    io.sendResult(id, { supported: false });
-  },
-
-  [BRIDGE_REQUEST_METHODS.providerInstallationStatus]: (id, params) => {
-    const parsed = providerInstallationStatusParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(
-        id,
-        BRIDGE_REQUEST_METHODS.providerInstallationStatus,
-        parsed.error.issues,
+  [BRIDGE_REQUEST_METHODS.modelList]: withParsed(
+    BRIDGE_REQUEST_METHODS.modelList,
+    modelListParamsSchema,
+    (id, data) => {
+      // prime's own catalog, no curated list on our side. A daemon that cannot
+      // answer (no `model_catalog` capability, no signed-in provider) is an
+      // honest error for the picker, never a crash.
+      return primeAvailableModels({ cwd: data.cwd }).then(
+        (answer) => {
+          io.sendResult(id, answer);
+        },
+        (error: unknown) => {
+          io.sendError(
+            id,
+            BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
+            error instanceof Error ? error.message : String(error),
+          );
+        },
       );
-      return;
-    }
-    throw new Error(
-      "prime-agent installation management is not offered: install it with the official installer, bb never installs or updates it",
-    );
-  },
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.providerInstallationRun]: (id, params) => {
-    const parsed = providerInstallationRunParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(
-        id,
-        BRIDGE_REQUEST_METHODS.providerInstallationRun,
-        parsed.error.issues,
+  [BRIDGE_REQUEST_METHODS.providerHealth]: withParsed(
+    BRIDGE_REQUEST_METHODS.providerHealth,
+    providerMaintenanceParamsSchema,
+    (id) => {
+      return primeProviderHealthCached().then((result) => {
+        io.sendResult(id, result);
+      });
+    },
+  ),
+
+  [BRIDGE_REQUEST_METHODS.providerUsage]: withParsed(
+    BRIDGE_REQUEST_METHODS.providerUsage,
+    providerMaintenanceParamsSchema,
+    (id) => {
+      io.sendResult(id, { supported: false });
+    },
+  ),
+
+  [BRIDGE_REQUEST_METHODS.providerInstallationStatus]: withParsed(
+    BRIDGE_REQUEST_METHODS.providerInstallationStatus,
+    providerInstallationStatusParamsSchema,
+    () => {
+      throw new Error(
+        "prime-agent installation management is not offered: install it with the official installer, bb never installs or updates it",
       );
-      return;
-    }
-    throw new Error(
-      "prime-agent installation management is not offered: install it with the official installer, bb never installs or updates it",
-    );
-  },
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.threadStart]: (id, params) => {
-    const parsed = threadStartParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.threadStart, parsed.error.issues);
-      return;
-    }
-    const record = registerSession({
-      threadId: parsed.data.threadId,
-      cwd: parsed.data.cwd,
-      dynamicTools: parsed.data.dynamicTools ?? [],
-    });
-    // The channel listens before `create` so the companion extension finds it
-    // while the prime worker boots (bbpa-ggf.13).
-    return ensureDynamicToolsChannel(record)
-      .then(() =>
-        startSession({
-          record,
-          title: PrimeSession.titleFromInput(parsed.data.input),
-          model: parsed.data.options.model,
-          reasoningLevel: parsed.data.options.reasoningLevel,
-          // The provider settings' extension picker (bbpa-ggf.12) reaches the
-          // session here and only here: `create` is written once per session,
-          // so the selection is a new-sessions-only knob — the resume below
-          // attaches to the resident worker and never re-reads it.
-          enabledExtensions: enabledExtensionsFromProviderOptions(
-            parsed.data.options.providerOptions,
-          ),
-          // The skills/configure catalog (bb's own skills), read at create
-          // time like the picker's selection: a session created before the
-          // configure arrived cannot have it, and a resume attaches to the
-          // resident worker without re-sending anything.
-          skillRoots: configuredSkillRootPaths(),
-          input: parsed.data.input,
-          beforeFirstTurn: () => publishDynamicTools(record),
-        }),
-      )
-      .then(() => {
+  [BRIDGE_REQUEST_METHODS.providerInstallationRun]: withParsed(
+    BRIDGE_REQUEST_METHODS.providerInstallationRun,
+    providerInstallationRunParamsSchema,
+    () => {
+      throw new Error(
+        "prime-agent installation management is not offered: install it with the official installer, bb never installs or updates it",
+      );
+    },
+  ),
+
+  [BRIDGE_REQUEST_METHODS.threadStart]: withParsed(
+    BRIDGE_REQUEST_METHODS.threadStart,
+    threadStartParamsSchema,
+    (id, data) => {
+      const record = registerSession({
+        threadId: data.threadId,
+        cwd: data.cwd,
+        dynamicTools: data.dynamicTools ?? [],
+      });
+      // The channel listens before `create` so the companion extension finds it
+      // while the prime worker boots (bbpa-ggf.13).
+      return ensureDynamicToolsChannel(record)
+        .then(() =>
+          startSession({
+            record,
+            title: PrimeSession.titleFromInput(data.input),
+            model: data.options.model,
+            reasoningLevel: data.options.reasoningLevel,
+            // The provider settings' extension picker (bbpa-ggf.12) reaches the
+            // session here and only here: `create` is written once per session,
+            // so the selection is a new-sessions-only knob — the resume below
+            // attaches to the resident worker and never re-reads it.
+            enabledExtensions: enabledExtensionsFromProviderOptions(
+              data.options.providerOptions,
+            ),
+            // The skills/configure catalog (bb's own skills), read at create
+            // time like the picker's selection: a session created before the
+            // configure arrived cannot have it, and a resume attaches to the
+            // resident worker without re-sending anything.
+            skillRoots: configuredSkillRootPaths(),
+            input: data.input,
+            beforeFirstTurn: () => publishDynamicTools(record),
+          }),
+        )
+        .then(() => {
+          io.sendResult(id, {
+            providerThreadId: record.providerThreadId,
+            sessionRestorable: true,
+          });
+        });
+    },
+  ),
+
+  [BRIDGE_REQUEST_METHODS.threadResume]: withParsed(
+    BRIDGE_REQUEST_METHODS.threadResume,
+    threadResumeParamsSchema,
+    (id, data) => {
+      return (async () => {
+        const existing = sessions.byProviderThread(data.providerThreadId);
+        const adopted = existing === undefined;
+        const record =
+          existing ??
+          registerSession({
+            threadId: data.threadId,
+            providerThreadId: data.providerThreadId,
+            cwd: data.cwd,
+            dynamicTools: data.dynamicTools ?? [],
+          });
+        try {
+          if (record.session === undefined) {
+            const activeSessionId = primeActiveSessionIdFrom(record.providerThreadId);
+            if (activeSessionId === undefined) {
+              throw new Error(
+                `cannot resume ${record.providerThreadId}: it is not a prime-agent session id this bridge created`,
+              );
+            }
+            record.activeSessionId = activeSessionId;
+            const session = laneFor(record);
+            await session.attach();
+            // Every session construction is an id-space boundary, and the snapshot
+            // content — when it is replayed at all — belongs to the new space.
+            announceSession(record);
+            // bb persists this thread's timeline, so the snapshot is not replayed
+            // as content — except when the session was adopted from a previous
+            // bridge process (a reopened thread, or work that continued in the
+            // daemon after bb closed), where the snapshot is the only source of
+            // that history the bridge ever sees.
+            if (adopted) {
+              session.snapshotDeltas();
+            }
+          } else {
+            await sessionFor(record).attach();
+            announceSession(record);
+          }
+          // The worker kept the companion extension from its create, but the
+          // channel socket this process mints is new — re-listen on the same
+          // path (thread-id keyed) and re-publish; the extension reconnects and
+          // the protocol re-syncs its tool set (bbpa-ggf.13).
+          await ensureDynamicToolsChannel(record);
+          await publishDynamicTools(record);
+        } catch (error) {
+          if (adopted) {
+            sessions.drop(record.threadId);
+          }
+          throw error;
+        }
         io.sendResult(id, {
           providerThreadId: record.providerThreadId,
           sessionRestorable: true,
         });
-      });
-  },
+      })();
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.threadResume]: (id, params) => {
-    const parsed = threadResumeParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.threadResume, parsed.error.issues);
-      return;
-    }
-    return (async () => {
-      const existing = sessions.byProviderThread(parsed.data.providerThreadId);
-      const adopted = existing === undefined;
-      const record =
-        existing ??
-        registerSession({
-          threadId: parsed.data.threadId,
-          providerThreadId: parsed.data.providerThreadId,
-          cwd: parsed.data.cwd,
-          dynamicTools: parsed.data.dynamicTools ?? [],
+  [BRIDGE_REQUEST_METHODS.threadFork]: withParsed(
+    BRIDGE_REQUEST_METHODS.threadFork,
+    threadForkParamsSchema,
+    (id, data) => {
+      return (async () => {
+        const sourceActiveSessionId = primeActiveSessionIdFrom(
+          data.sourceProviderThreadId,
+        );
+        if (sourceActiveSessionId === undefined) {
+          io.sendError(
+            id,
+            BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
+            `cannot fork ${data.sourceProviderThreadId}: it is not a prime-agent session id this bridge created`,
+          );
+          return;
+        }
+        // The fork's NEW thread gets the full construction funnel: its own bb
+        // thread id names its own "[bb] " session, and the channel listens
+        // before `create` exactly as in thread/start (bbpa-ggf.13).
+        const record = registerSession({
+          threadId: data.threadId,
+          cwd: data.cwd,
+          dynamicTools: data.dynamicTools ?? [],
         });
-      try {
-        if (record.session === undefined) {
-          const activeSessionId = activeSessionIdFrom(record.providerThreadId);
-          if (activeSessionId === undefined) {
+        try {
+          // The channel listens before `create` so the companion extension finds
+          // it while the prime worker boots (bbpa-ggf.13) — mirror thread/start.
+          await ensureDynamicToolsChannel(record);
+          // Branch the source session's transcript at the requested fork point
+          // and hand the source session back its own transcript — see
+          // `forkPrimeSession` for why prime's fork is a replace-in-place that
+          // has to be bracketed. bb has already copied the inherited timeline
+          // into the new thread itself, so the snapshot below arms the boundary
+          // without being replayed as content.
+          const branched = await forkPrimeSession({
+            request: (command, requestArgs) => daemonRequest(command, requestArgs),
+            sourceActiveSessionId,
+            checkpointId: data.sourceProviderCheckpointId,
+          });
+          await startSession({
+            record,
+            model: data.options.model,
+            reasoningLevel: data.options.reasoningLevel,
+            enabledExtensions: enabledExtensionsFromProviderOptions(
+              data.options.providerOptions,
+            ),
+            // The branch file: the new resident session opens the forked
+            // transcript instead of a fresh one.
+            sessionPath: branched.sessionFile,
+            input: undefined,
+            beforeFirstTurn: () => publishDynamicTools(record),
+          });
+          if (
+            branched.sessionFile !== undefined &&
+            record.activeSessionId === sourceActiveSessionId
+          ) {
             throw new Error(
-              `cannot resume ${record.providerThreadId}: it is not a prime-agent session id this bridge created`,
+              "prime-agent answered the fork's create with the source session itself; the new thread must not adopt it",
             );
           }
-          record.activeSessionId = activeSessionId;
-          const session = laneFor(record);
-          await session.attach();
-          // Every session construction is an id-space boundary, and the snapshot
-          // content — when it is replayed at all — belongs to the new space.
-          announceSession(record);
-          // bb persists this thread's timeline, so the snapshot is not replayed
-          // as content — except when the session was adopted from a previous
-          // bridge process (a reopened thread, or work that continued in the
-          // daemon after bb closed), where the snapshot is the only source of
-          // that history the bridge ever sees.
-          if (adopted) {
-            session.snapshotDeltas();
+        } catch (error) {
+          // A half-built fork leaves nothing behind: no channel, no record.
+          await stopDynamicTools(record);
+          if (sessions.byThread(record.threadId) === record) {
+            sessions.drop(record.threadId);
           }
-        } else {
-          await sessionFor(record).attach();
-          announceSession(record);
+          throw error;
         }
-        // The worker kept the companion extension from its create, but the
-        // channel socket this process mints is new — re-listen on the same
-        // path (thread-id keyed) and re-publish; the extension reconnects and
-        // the protocol re-syncs its tool set (bbpa-ggf.13).
-        await ensureDynamicToolsChannel(record);
-        await publishDynamicTools(record);
-      } catch (error) {
-        if (adopted) {
-          sessions.drop(record.threadId);
-        }
-        throw error;
-      }
-      io.sendResult(id, {
-        providerThreadId: record.providerThreadId,
-        sessionRestorable: true,
-      });
-    })();
-  },
+        io.sendResult(id, {
+          providerThreadId: record.providerThreadId,
+          sessionRestorable: true,
+        });
+      })();
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.threadFork]: (id, params) => {
-    const parsed = threadForkParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.threadFork, parsed.error.issues);
-      return;
-    }
-    return (async () => {
-      const sourceActiveSessionId = activeSessionIdFrom(
-        parsed.data.sourceProviderThreadId,
-      );
-      if (sourceActiveSessionId === undefined) {
-        io.sendError(
-          id,
-          BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
-          `cannot fork ${parsed.data.sourceProviderThreadId}: it is not a prime-agent session id this bridge created`,
-        );
-        return;
-      }
-      // The fork's NEW thread gets the full construction funnel: its own bb
-      // thread id names its own "[bb] " session, and the channel listens
-      // before `create` exactly as in thread/start (bbpa-ggf.13).
-      const record = registerSession({
-        threadId: parsed.data.threadId,
-        cwd: parsed.data.cwd,
-        dynamicTools: parsed.data.dynamicTools ?? [],
-      });
-      try {
-        // The channel listens before `create` so the companion extension finds
-        // it while the prime worker boots (bbpa-ggf.13) — mirror thread/start.
-        await ensureDynamicToolsChannel(record);
-        // Branch the source session's transcript at the requested fork point
-        // and hand the source session back its own transcript — see
-        // `forkPrimeSession` for why prime's fork is a replace-in-place that
-        // has to be bracketed. bb has already copied the inherited timeline
-        // into the new thread itself, so the snapshot below arms the boundary
-        // without being replayed as content.
-        const branched = await forkPrimeSession({
-          request: (command, requestArgs) => daemonRequest(command, requestArgs),
-          sourceActiveSessionId,
-          checkpointId: parsed.data.sourceProviderCheckpointId,
-        });
-        await startSession({
-          record,
-          model: parsed.data.options.model,
-          reasoningLevel: parsed.data.options.reasoningLevel,
-          enabledExtensions: enabledExtensionsFromProviderOptions(
-            parsed.data.options.providerOptions,
-          ),
-          // The branch file: the new resident session opens the forked
-          // transcript instead of a fresh one.
-          sessionPath: branched.sessionFile,
-          input: undefined,
-          beforeFirstTurn: () => publishDynamicTools(record),
-        });
-        if (
-          branched.sessionFile !== undefined &&
-          record.activeSessionId === sourceActiveSessionId
-        ) {
-          throw new Error(
-            "prime-agent answered the fork's create with the source session itself; the new thread must not adopt it",
-          );
+  [BRIDGE_REQUEST_METHODS.threadStop]: withParsed(
+    BRIDGE_REQUEST_METHODS.threadStop,
+    threadStopParamsSchema,
+    (id, data) => {
+      return (async () => {
+        const record = sessions.byThread(data.threadId);
+        const session = record?.session;
+        if (data.intent === "interrupt" && session !== undefined) {
+          // Soft stop: prime stops streaming and the transcript keeps what it
+          // already wrote. The bridge settles the turn itself so bb never waits
+          // on the daemon to agree.
+          emitDeltas(record!.threadId, await session.interrupt());
+          io.sendResult(id, { ok: true });
+          return;
         }
-      } catch (error) {
-        // A half-built fork leaves nothing behind: no channel, no record.
+        // release (or an interrupt of a session we never attached): detach from
+        // the resident session and drop the record. The session file survives —
+        // the thread can come back through resume. No interruption is ever
+        // fabricated, even if a turn is still streaming.
+        if (session !== undefined) {
+          await session.release();
+        }
         await stopDynamicTools(record);
-        if (sessions.byThread(record.threadId) === record) {
+        if (record !== undefined) {
           sessions.drop(record.threadId);
         }
-        throw error;
-      }
-      io.sendResult(id, {
-        providerThreadId: record.providerThreadId,
-        sessionRestorable: true,
-      });
-    })();
-  },
-
-  [BRIDGE_REQUEST_METHODS.threadStop]: (id, params) => {
-    const parsed = threadStopParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.threadStop, parsed.error.issues);
-      return;
-    }
-    return (async () => {
-      const record = sessions.byThread(parsed.data.threadId);
-      const session = record?.session;
-      if (parsed.data.intent === "interrupt" && session !== undefined) {
-        // Soft stop: prime stops streaming and the transcript keeps what it
-        // already wrote. The bridge settles the turn itself so bb never waits
-        // on the daemon to agree.
-        emitDeltas(record!.threadId, await session.interrupt());
         io.sendResult(id, { ok: true });
-        return;
-      }
-      // release (or an interrupt of a session we never attached): detach from
-      // the resident session and drop the record. The session file survives —
-      // the thread can come back through resume. No interruption is ever
-      // fabricated, even if a turn is still streaming.
-      if (session !== undefined) {
-        await session.release();
-      }
-      await stopDynamicTools(record);
-      if (record !== undefined) {
-        sessions.drop(record.threadId);
-      }
-      io.sendResult(id, { ok: true });
-    })();
-  },
+      })();
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.threadDiscard]: (id, params) => {
-    const parsed = threadDiscardParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.threadDiscard, parsed.error.issues);
-      return;
-    }
-    return (async () => {
-      const record = sessions.byThread(parsed.data.threadId);
-      // The bb tools channel never outlives a discard attempt: bb is tearing
-      // the thread down, and a resume re-arms the channel if the discard fails.
-      await stopDynamicTools(record);
-      if (record?.session !== undefined) {
-        // Stop + cleanup: soft-stop the open turn, then `kill` +
-        // `delete_saved_session` for exactly the session id and file this
-        // thread's record names — never a session this bridge did not mint.
-        await record.session.destroy();
-      }
-      // A record without a session has no daemon identity to clean up (its
-      // `create` never answered), so there is nothing to address.
-      if (record !== undefined) {
-        sessions.drop(record.threadId);
-      }
-      io.sendResult(id, { ok: true });
-    })();
-  },
-
-  [BRIDGE_REQUEST_METHODS.threadNameSet]: (id, params) => {
-    const parsed = threadNameSetParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.threadNameSet, parsed.error.issues);
-      return;
-    }
-    return (async () => {
-      const { threadId, providerThreadId, title } = parsed.data;
-      // Same naming funnel as create: the "[bb] " prefix stays on (prime's
-      // catalog must keep telling bb's sessions apart from its own), and the
-      // bb thread id keeps agent names unique inside prime's family scope.
-      const name = primeSessionName({ threadId, title });
-      const record = sessions.byThread(threadId);
-      if (record?.session !== undefined && record.activeSessionId !== undefined) {
-        // Active: prime renames the resident session in place.
-        const renamed = await daemonRequest(
-          asWireCommand({
-            type: "rename",
-            activeSessionId: record.activeSessionId,
-            name,
-          }),
-        );
-        if (!renamed.success) {
-          throw new Error(
-            `prime-agent refused "rename": ${renamed.error ?? "unknown daemon error"}`,
-          );
+  [BRIDGE_REQUEST_METHODS.threadDiscard]: withParsed(
+    BRIDGE_REQUEST_METHODS.threadDiscard,
+    threadDiscardParamsSchema,
+    (id, data) => {
+      return (async () => {
+        const record = sessions.byThread(data.threadId);
+        // The bb tools channel never outlives a discard attempt: bb is tearing
+        // the thread down, and a resume re-arms the channel if the discard fails.
+        await stopDynamicTools(record);
+        if (record?.session !== undefined) {
+          // Stop + cleanup: soft-stop the open turn, then `kill` +
+          // `delete_saved_session` for exactly the session id and file this
+          // thread's record names — never a session this bridge did not mint.
+          await record.session.destroy();
         }
-        const summary = daemonSessionSummarySchema.safeParse(renamed.data);
-        if (summary.success && summary.data.sessionFile !== undefined) {
-          record.sessionFile = summary.data.sessionFile;
-        }
-        record.sessionName = summary.success
-          ? (summary.data.sessionName ?? name)
-          : name;
-      } else {
-        // Inactive (released, or resident without a lane in this process):
-        // prime renames the transcript file, and finds an active session by
-        // that file itself — both cases answered by one command.
-        const sessionFile = await sessionFileForRenaming(
-          record,
-          providerThreadId,
-          threadId,
-        );
-        const renamed = await daemonRequest(
-          asWireCommand({ type: "rename_saved_session", sessionPath: sessionFile, name }),
-        );
-        if (!renamed.success) {
-          throw new Error(
-            `prime-agent refused "rename_saved_session": ${renamed.error ?? "unknown daemon error"}`,
-          );
-        }
+        // A record without a session has no daemon identity to clean up (its
+        // `create` never answered), so there is nothing to address.
         if (record !== undefined) {
-          record.sessionName = name;
+          sessions.drop(record.threadId);
         }
-      }
-      io.sendResult(id, { ok: true });
-    })();
-  },
+        io.sendResult(id, { ok: true });
+      })();
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.threadArchive]: (id, params) => {
-    const parsed = threadArchiveParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.threadArchive, parsed.error.issues);
-      return;
-    }
-    throw new Error("prime-agent keeps no thread archive of its own: the handshake declares no threadArchive");
-  },
+  [BRIDGE_REQUEST_METHODS.threadNameSet]: withParsed(
+    BRIDGE_REQUEST_METHODS.threadNameSet,
+    threadNameSetParamsSchema,
+    (id, data) => {
+      return (async () => {
+        const { threadId, providerThreadId, title } = data;
+        // Same naming funnel as create: the "[bb] " prefix stays on (prime's
+        // catalog must keep telling bb's sessions apart from its own), and the
+        // bb thread id keeps agent names unique inside prime's family scope.
+        const name = primeSessionName({ threadId, title });
+        const record = sessions.byThread(threadId);
+        if (record?.session !== undefined && record.activeSessionId !== undefined) {
+          // Active: prime renames the resident session in place.
+          const renamed = await daemonRequest(
+            asWireCommand({
+              type: "rename",
+              activeSessionId: record.activeSessionId,
+              name,
+            }),
+          );
+          if (!renamed.success) {
+            throw new Error(
+              `prime-agent refused "rename": ${renamed.error ?? "unknown daemon error"}`,
+            );
+          }
+          const summary = daemonSessionSummarySchema.safeParse(renamed.data);
+          if (summary.success && summary.data.sessionFile !== undefined) {
+            record.sessionFile = summary.data.sessionFile;
+          }
+          record.sessionName = summary.success
+            ? (summary.data.sessionName ?? name)
+            : name;
+        } else {
+          // Inactive (released, or resident without a lane in this process):
+          // prime renames the transcript file, and finds an active session by
+          // that file itself — both cases answered by one command.
+          const sessionFile = await sessionFileForRenaming(
+            record,
+            providerThreadId,
+            threadId,
+          );
+          const renamed = await daemonRequest(
+            asWireCommand({ type: "rename_saved_session", sessionPath: sessionFile, name }),
+          );
+          if (!renamed.success) {
+            throw new Error(
+              `prime-agent refused "rename_saved_session": ${renamed.error ?? "unknown daemon error"}`,
+            );
+          }
+          if (record !== undefined) {
+            record.sessionName = name;
+          }
+        }
+        io.sendResult(id, { ok: true });
+      })();
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.threadUnarchive]: (id, params) => {
-    const parsed = threadUnarchiveParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.threadUnarchive, parsed.error.issues);
-      return;
-    }
-    throw new Error("prime-agent keeps no thread archive of its own: the handshake declares no threadArchive");
-  },
+  [BRIDGE_REQUEST_METHODS.threadArchive]: withParsed(
+    BRIDGE_REQUEST_METHODS.threadArchive,
+    threadArchiveParamsSchema,
+    () => {
+      throw new Error("prime-agent keeps no thread archive of its own: the handshake declares no threadArchive");
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.threadGoalClear]: (id, params) => {
-    const parsed = threadGoalClearParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.threadGoalClear, parsed.error.issues);
-      return;
-    }
-    throw new Error(
-      "prime-agent goal clearing is not wired yet: the handshake declares no threadGoalClear",
-    );
-  },
+  [BRIDGE_REQUEST_METHODS.threadUnarchive]: withParsed(
+    BRIDGE_REQUEST_METHODS.threadUnarchive,
+    threadUnarchiveParamsSchema,
+    () => {
+      throw new Error("prime-agent keeps no thread archive of its own: the handshake declares no threadArchive");
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.turnStart]: (id, params) => {
-    const parsed = turnStartParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.turnStart, parsed.error.issues);
-      return;
-    }
-    const record = sessions.byThread(parsed.data.threadId);
-    if (record === undefined) {
-      io.sendError(
-        id,
-        BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
-        `No session for thread ${parsed.data.threadId}; send thread/start or thread/resume first`,
+  [BRIDGE_REQUEST_METHODS.threadGoalClear]: withParsed(
+    BRIDGE_REQUEST_METHODS.threadGoalClear,
+    threadGoalClearParamsSchema,
+    () => {
+      throw new Error(
+        "prime-agent goal clearing is not wired yet: the handshake declares no threadGoalClear",
       );
-      return;
-    }
-    const settled = runTurnOrCompaction({
-      record,
-      input: parsed.data.input,
-      clientRequestId: parsed.data.clientRequestId,
-      model: parsed.data.options.model,
-      reasoningLevel: parsed.data.options.reasoningLevel,
-    });
-    return settled.then(() => {
-      io.sendResult(id, {});
-    });
-  },
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.turnSteer]: (id, params) => {
-    const parsed = turnSteerParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.turnSteer, parsed.error.issues);
-      return;
-    }
-    return (async () => {
-      // `expectedTurnId` stays diagnostic: this bridge mints no provider turn
-      // ids of its own, and staleness is the runtime's guard (it drops a steer
-      // whose turn is gone before the request ever lands here).
-      const record = sessions.byThread(parsed.data.threadId);
+  [BRIDGE_REQUEST_METHODS.turnStart]: withParsed(
+    BRIDGE_REQUEST_METHODS.turnStart,
+    turnStartParamsSchema,
+    (id, data) => {
+      const record = sessions.byThread(data.threadId);
       if (record === undefined) {
         io.sendError(
           id,
           BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
-          `No session for thread ${parsed.data.threadId}; send thread/start or thread/resume first`,
+          `No session for thread ${data.threadId}; send thread/start or thread/resume first`,
         );
         return;
       }
-      const text = PrimeSession.promptText(parsed.data.input);
-      if (text.trim() === "") {
-        io.sendError(
-          id,
-          BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
-          "Missing input text to steer with",
-        );
-        return;
-      }
-      // prime admits the message either way (bbpa-ggf.5) and the lane picks
-      // the form: mid-turn it is prime's steer semantic — after the work in
-      // flight, before the next model call — and on an idle session the
-      // daemon's resumeIfIdle starts a fresh run. The steered text shows on
-      // the timeline as a provider input row; the turn in flight settles
-      // itself, and a resumed run opens the turn that answers the steer.
-      await sessionFor(record).steer({ input: parsed.data.input });
-      emitDeltas(record.threadId, [
-        { kind: "input.accepted", clientRequestId: parsed.data.clientRequestId },
-        { kind: "input.provider", text },
-      ]);
-      io.sendResult(id, { threadId: record.threadId });
-    })();
-  },
+      const settled = runTurnOrCompaction({
+        record,
+        input: data.input,
+        clientRequestId: data.clientRequestId,
+        model: data.options.model,
+        reasoningLevel: data.options.reasoningLevel,
+      });
+      return settled.then(() => {
+        io.sendResult(id, {});
+      });
+    },
+  ),
 
-  [BRIDGE_REQUEST_METHODS.skillsConfigure]: (id, params) => {
-    const parsed = skillsConfigureParamsSchema.safeParse(params);
-    if (!parsed.success) {
-      invalidParams(id, BRIDGE_REQUEST_METHODS.skillsConfigure, parsed.error.issues);
-      return;
-    }
-    configuredSkillRoots = parsed.data.roots.map((root) => ({
-      id: root.id,
-      path: root.path,
-      skills: root.skills.map((skill) => ({
-        name: skill.name,
-        description: skill.description,
-      })),
-    }));
-    io.sendResult(id, { ok: true });
-  },
+  [BRIDGE_REQUEST_METHODS.turnSteer]: withParsed(
+    BRIDGE_REQUEST_METHODS.turnSteer,
+    turnSteerParamsSchema,
+    (id, data) => {
+      return (async () => {
+        // `expectedTurnId` stays diagnostic: this bridge mints no provider turn
+        // ids of its own, and staleness is the runtime's guard (it drops a steer
+        // whose turn is gone before the request ever lands here).
+        const record = sessions.byThread(data.threadId);
+        if (record === undefined) {
+          io.sendError(
+            id,
+            BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
+            `No session for thread ${data.threadId}; send thread/start or thread/resume first`,
+          );
+          return;
+        }
+        const text = primePromptText(data.input);
+        if (text.trim() === "") {
+          io.sendError(
+            id,
+            BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
+            "Missing input text to steer with",
+          );
+          return;
+        }
+        // prime admits the message either way (bbpa-ggf.5) and the lane picks
+        // the form: mid-turn it is prime's steer semantic — after the work in
+        // flight, before the next model call — and on an idle session the
+        // daemon's resumeIfIdle starts a fresh run. The steered text shows on
+        // the timeline as a provider input row; the turn in flight settles
+        // itself, and a resumed run opens the turn that answers the steer.
+        await sessionFor(record).steer({ input: data.input });
+        emitDeltas(record.threadId, [
+          { kind: "input.accepted", clientRequestId: data.clientRequestId },
+          { kind: "input.provider", text },
+        ]);
+        io.sendResult(id, { threadId: record.threadId });
+      })();
+    },
+  ),
+
+  [BRIDGE_REQUEST_METHODS.skillsConfigure]: withParsed(
+    BRIDGE_REQUEST_METHODS.skillsConfigure,
+    skillsConfigureParamsSchema,
+    (id, data) => {
+      configuredSkillRoots = data.roots.map((root) => ({
+        id: root.id,
+        path: root.path,
+        skills: root.skills.map((skill) => ({
+          name: skill.name,
+          description: skill.description,
+        })),
+      }));
+      io.sendResult(id, { ok: true });
+    },
+  ),
 };
 
 export function handleLine(line: string): void {

@@ -17,6 +17,34 @@ export const PRIME_DISPLAY_NAME = "Prime Agent";
  */
 export const PRIME_PROVIDER_THREAD_PREFIX = "prime_";
 
+/** The provider thread id for a resident session: `prime_<activeSessionId>`. */
+export function primeProviderThreadId(activeSessionId: string): string {
+  return `${PRIME_PROVIDER_THREAD_PREFIX}${activeSessionId}`;
+}
+
+/**
+ * The daemon session id inside a provider thread id this bridge minted, or
+ * `undefined` when the id is not ours (another provider's, or malformed).
+ */
+export function primeActiveSessionIdFrom(
+  providerThreadId: string,
+): string | undefined {
+  return providerThreadId.startsWith(PRIME_PROVIDER_THREAD_PREFIX) &&
+    providerThreadId.length > PRIME_PROVIDER_THREAD_PREFIX.length
+    ? providerThreadId.slice(PRIME_PROVIDER_THREAD_PREFIX.length)
+    : undefined;
+}
+
+/**
+ * The provisional id a record carries between registration and `create`'s
+ * answer (the daemon-derived id replaces it right after). Shape is the bridge
+ * prefix plus a marker, so a provisional id can never be mistaken for a
+ * resident session the daemon holds.
+ */
+export function provisionalPrimeProviderThreadId(threadId: string): string {
+  return `${PRIME_PROVIDER_THREAD_PREFIX}pending_${threadId}`;
+}
+
 /**
  * Operator override for the daemon socket; declared in the provider's
  * `env.passthrough` so the daemon forwards it into the bridge process.
