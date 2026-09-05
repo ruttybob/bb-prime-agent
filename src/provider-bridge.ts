@@ -149,7 +149,8 @@ async function ensureDynamicToolsChannel(
   if (record.dynamicTools.length === 0) {
     return undefined;
   }
-  await dynamicTools.start({
+  try {
+    await dynamicTools.start({
     providerThreadId: record.threadId,
     onToolCall: async (call) => {
       try {
@@ -171,7 +172,13 @@ async function ensureDynamicToolsChannel(
       }
     },
   });
-  return dynamicTools.sessionConfig(record.threadId);
+    return dynamicTools.sessionConfig(record.threadId);
+  } catch (error) {
+    // Degraded, not dead: the thread runs without bb tools rather than
+    // failing, and the runtime hears about it off the timeline.
+    notifyDynamicToolsDegraded(record, error);
+    return undefined;
+  }
 }
 
 /** Publish the thread's bb tool set to its (now connected) companion extension. */
@@ -179,7 +186,22 @@ async function publishDynamicTools(record: SessionRecord): Promise<void> {
   if (record.dynamicTools.length === 0) {
     return;
   }
-  await dynamicTools.setTools(record.threadId, record.dynamicTools);
+  try {
+    await dynamicTools.setTools(record.threadId, record.dynamicTools);
+  } catch (error) {
+    notifyDynamicToolsDegraded(record, error);
+  }
+}
+
+/** Off-timeline diagnostics for a thread whose bb tools could not be armed. */
+function notifyDynamicToolsDegraded(record: SessionRecord, error: unknown): void {
+  notify(BRIDGE_NOTIFICATION_METHODS.providerRaw, {
+    method: "dynamic-tools.degraded",
+    params: {
+      threadId: record.threadId,
+      error: error instanceof Error ? error.message : String(error),
+    },
+  });
 }
 
 /** Stop a thread's dynamic-tools channel (record dropped: release or discard). */
@@ -227,6 +249,10 @@ async function startSession(args: {
   model?: string | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
   input: readonly PromptInput[] | undefined;
+  /** Runs after the session exists but before the first prompt — the window
+   * where the dynamic-tools set must be published, so the model's first turn
+   * already sees the bb tools. */
+  beforeFirstTurn?: () => Promise<void>;
 }): Promise<void> {
   const { record } = args;
   try {
@@ -245,6 +271,7 @@ async function startSession(args: {
     throw error;
   }
   announceSession(record);
+  await args.beforeFirstTurn?.();
   if (args.input !== undefined && args.input.length > 0) {
     await runTurn({ record, input: args.input, clientRequestId: undefined });
   }
@@ -392,11 +419,9 @@ const handlers: Record<string, RequestHandler> = {
           model: parsed.data.options.model,
           reasoningLevel: parsed.data.options.reasoningLevel,
           input: parsed.data.input,
+          beforeFirstTurn: () => publishDynamicTools(record),
         }),
       )
-      .then(async () => {
-        await publishDynamicTools(record);
-      })
       .then(() => {
         io.sendResult(id, {
           providerThreadId: record.providerThreadId,

@@ -15,10 +15,13 @@ import {
   type CapturedBridgeJsonRpcOutput,
 } from "@get-bb/plugin-sdk/provider-bridge/testing";
 import {
+  dynamicToolsRegistryForTests,
   handleLine,
   resetDaemonForTests,
   sessionTableForTests,
 } from "./src/provider-bridge.js";
+import { BB_TOOLS_CHANNEL_FLAG } from "./src/dynamic-tools/protocol.js";
+import { FakeExtension } from "./test-support/fake-extension.js";
 import { PrimeDaemonClient } from "./src/daemon/client.js";
 import { resolveDaemonSocketPath } from "./src/daemon/socket.js";
 import {
@@ -54,6 +57,7 @@ let cleanupSession:
 
 const runtimeLines: string[] = [];
 const bridgeLines: string[] = [];
+let liveExtension: FakeExtension | undefined;
 
 beforeEach(() => {
   if (!LIVE) {
@@ -101,6 +105,9 @@ afterEach(async () => {
     cleanupSession = undefined;
   }
   rmSync(workspaceDir, { recursive: true, force: true });
+  await liveExtension?.close();
+  liveExtension = undefined;
+  await dynamicToolsRegistryForTests().clear();
 });
 
 async function withTestClient(
@@ -191,7 +198,8 @@ it.skipIf(!LIVE)(
   async () => {
     const nonce = Math.random().toString(36).slice(2, 8);
     const threadId = `thr_live_${nonce}`;
-    const prompt = "Reply with the single word: ok";
+    const prompt =
+      "Call the bb_echo tool right now with message 'ping from bb'. Do not use any other tool and do not investigate anything. Then reply with exactly what it returned.";
     // The name the bridge must give prime: prefix + title + thread id.
     const name = primeSessionName({ threadId, title: prompt });
     expect(name.startsWith(BB_SESSION_NAME_PREFIX)).toBe(true);
@@ -203,7 +211,24 @@ it.skipIf(!LIVE)(
       instructionMode: "append",
       options: FULL_OPTIONS,
       input: [{ type: "text", text: prompt, mentions: [] }],
+      dynamicTools: [
+        {
+          name: "bb_echo",
+          description: "Echo the provided message back, prefixed with [bb-echo].",
+          inputSchema: {
+            type: "object",
+            properties: { message: { type: "string", description: "Message to echo" } },
+            required: ["message"],
+          },
+        },
+      ],
     });
+    // The channel listens before `create`; the REAL companion extension
+    // (loaded by the prime worker from create.config.extensions) connects and
+    // acks, which lets the reply through.
+    await waitFor("the dynamic-tools channel", () =>
+      dynamicToolsRegistryForTests().channel(threadId) !== undefined,
+    );
     await waitFor("the thread/start response", () =>
       responses().some((reply) => reply.id === "s"),
     );
@@ -221,15 +246,61 @@ it.skipIf(!LIVE)(
       sessionFile: record?.sessionFile,
       name,
     };
+    // The companion extension actually registered the bb tool in the worker.
+    await withTestClient(async (client) => {
+      const tool = await client.request({
+        type: "get_tool_definition",
+        activeSessionId: record!.activeSessionId!,
+        name: "bb_echo",
+      });
+      expect(tool.success, `get_tool_definition failed: ${tool.error}`).toBe(true);
+    });
     expect(record?.sessionName).toBe(name);
     expect(record?.cwd).toBe(workspaceDir);
 
-    // A full streamed turn: opened, streamed, usage, settled.
+    // A full streamed turn: opened, streamed, usage, settled. While it runs,
+    // the runtime half of this harness answers the bridge's item/tool/call
+    // (the companion extension forwarded the model's bb_echo call) — the same
+    // {success, contentItems} shape the real bb runtime answers with.
+    let settled = false;
+    const answeredToolCalls = new Set<unknown>();
+    const toolCallAnswerer = (async () => {
+      for (;;) {
+        const calls = messages().filter(
+          (message) =>
+            (message as { method?: string }).method === "item/tool/call" &&
+            !answeredToolCalls.has((message as { id?: unknown }).id),
+        ) as Array<{ id: unknown; params: { tool: string; arguments: Record<string, unknown> } }>;
+        for (const call of calls) {
+          answeredToolCalls.add(call.id);
+          expect(call.params.tool).toBe("bb_echo");
+          handleLine(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: call.id,
+              result: {
+                success: true,
+                contentItems: [
+                  { type: "inputText", text: `[bb-echo] ${call.params.arguments.message}` },
+                ],
+              },
+            }),
+          );
+        }
+        if (settled) {
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    })();
     await waitFor("the first turn to settle", () =>
       deltas(threadId).some(
         (delta) => delta.kind === "turn.boundary" && delta.status === "completed",
       ),
     );
+    settled = true;
+    await toolCallAnswerer;
+    expect(answeredToolCalls.size).toBeGreaterThanOrEqual(1);
     const kinds = deltas(threadId).map((delta) => delta.kind);
     expect(kinds[0]).toBe("session.reset");
     for (const kind of ["turn.open", "item.textDelta", "item.textClose", "usage"]) {
@@ -239,7 +310,8 @@ it.skipIf(!LIVE)(
       .filter((delta) => delta.kind === "item.textDelta")
       .map((delta) => String(delta.text))
       .join("");
-    expect(streamed.toLowerCase()).toContain("ok");
+    // The answer quotes what the bb tool returned: the full round trip worked.
+    expect(streamed).toContain("[bb-echo] ping from bb");
     expect(deltas(threadId).find((delta) => delta.kind === "usage")).toMatchObject({
       last: { totalTokens: expect.any(Number) },
     });

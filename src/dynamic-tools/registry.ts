@@ -27,11 +27,14 @@ import {
 export class DynamicToolsRegistry {
   private readonly channels = new Map<string, DynamicToolsChannel>();
   private readonly socketDir: string | undefined;
-  private readonly extensionPath: string;
+  private readonly extensionPath: string | undefined;
 
   constructor(args: { socketDir?: string; extensionPath?: string } = {}) {
     this.socketDir = args.socketDir;
-    this.extensionPath = args.extensionPath ?? companionExtensionPath();
+    // Resolved lazily: a plugin whose extension artifact is missing must still
+    // load (sessions just run without bb tools) — the bridge module itself
+    // imports this registry at module scope.
+    this.extensionPath = args.extensionPath;
   }
 
   /** All channels started so far (provider thread id → channel). */
@@ -41,6 +44,10 @@ export class DynamicToolsRegistry {
 
   channel(providerThreadId: string): DynamicToolsChannel | undefined {
     return this.channels.get(providerThreadId);
+  }
+
+  private extensionModule(): string {
+    return this.extensionPath ?? companionExtensionPath();
   }
 
   /**
@@ -92,14 +99,14 @@ export class DynamicToolsRegistry {
     }
     return {
       noExtensions: true,
-      extensions: [this.extensionPath],
+      extensions: [this.extensionModule()],
       extensionFlagValues: { [BB_TOOLS_CHANNEL_FLAG]: channel.path },
     };
   }
 
   /** The absolute path of the companion extension this registry loads. */
   get extensionModulePath(): string {
-    return this.extensionPath;
+    return this.extensionModule();
   }
 
   /** Stop one session's channel (thread release / discard). */
@@ -145,20 +152,28 @@ export function toChannelTools(tools: readonly DynamicTool[]): BbChannelTool[] {
  * The companion extension artifact prime loads. The plugin ships it as
  * TypeScript source next to the bridge (`extension/bb-tools-extension.ts`);
  * prime transpiles extensions at load, so no build step is involved and the
- * installed plugin directory is self-contained.
+ * installed plugin directory is self-contained. Resolved from whichever
+ * layout this module runs in: `src/dynamic-tools/` (tests, `bb plugin dev`)
+ * or the built `dist/` bundle the host daemon actually executes.
  */
 export function companionExtensionPath(): string {
   const override = process.env.BB_TOOLS_EXTENSION_PATH;
   if (typeof override === "string" && override.trim() !== "") {
     return override;
   }
-  const candidate = fileURLToPath(new URL("../../extension/bb-tools-extension.ts", import.meta.url));
-  if (!existsSync(candidate)) {
-    throw new Error(
-      `the bb companion prime extension is missing at ${candidate}; reinstall the bb-plugin-prime-agent plugin`,
-    );
+  const here = new URL(".", import.meta.url);
+  const candidates = [
+    fileURLToPath(new URL("../../extension/bb-tools-extension.ts", here)),
+    fileURLToPath(new URL("../extension/bb-tools-extension.ts", here)),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
   }
-  return candidate;
+  throw new Error(
+    `the bb companion prime extension is missing (tried ${candidates.join(", ")}); reinstall the bb-plugin-prime-agent plugin`,
+  );
 }
 
 /** The default channel directory, re-exported for callers minting paths. */
