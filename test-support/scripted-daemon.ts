@@ -1,0 +1,360 @@
+import type { DaemonCommandResult } from "../src/daemon/client.js";
+import type {
+  DaemonHello,
+  DaemonPushMessage,
+} from "../src/daemon/protocol.js";
+import type { PrimeDaemonTransport } from "../src/daemon/transport.js";
+import { calibratedHello } from "./fake-daemon.js";
+
+/**
+ * A scripted stand-in for the prime-agent daemon, at the transport seam.
+ *
+ * The bridge hands its session lanes a `request`/`onPush` pair from
+ * `src/daemon/connection.ts`; tests install this transport instead of a socket
+ * one, and the whole chat path — create, attach, prompt, event streaming, abort
+ * — runs in-process with no daemon and no prime install. Blocks answer by
+ * command type in the order they were enqueued, so a bridge that drifts from
+ * the script fails loudly instead of inventing daemon traffic.
+ */
+
+interface ScriptedBlock {
+  commandType: string;
+  answer: DaemonCommandResult;
+  pushes: DaemonPushMessage[];
+}
+
+export interface ScriptedDaemonHandle {
+  transport: PrimeDaemonTransport;
+  /** Every command the bridge sent, in order. */
+  readonly commands: Array<Record<string, unknown>>;
+  enqueueCreate(args?: Partial<ScriptedSession>): void;
+  enqueueAttach(args?: {
+    messages?: readonly unknown[];
+    /** The session's live subagents, as `snapshot.children` carries them. */
+    children?: readonly unknown[];
+    lastEventSequence?: number;
+    lastEventCursor?: { generation: string; sequence: number };
+    /** prime's own report of the session (`AgentConnectionState`), read loosely. */
+    state?: Record<string, unknown>;
+    /** The session summary (`SessionSummary`), read loosely — the attached-client count rides it. */
+    summary?: Record<string, unknown>;
+  }): void;
+  /** Answer the next `prompt` with prime's early admission, then stream events. */
+  enqueuePrompt(args: { events: readonly unknown[] }): void;
+  /** Answer a command with `{success:true}` and no data. */
+  enqueueOk(commandType: string): void;
+  /** Answer a command with `{success:true}` and the given data payload. */
+  enqueueData(commandType: string, data: unknown): void;
+  /**
+   * Enqueue an arbitrary block: a `{success:true, data}` or `{success:false,
+   * error}` answer, plus session events pushed with it (compaction, abort, …).
+   */
+  enqueue(args: {
+    commandType: string;
+    data?: unknown;
+    error?: string;
+    events?: readonly unknown[];
+  }): void;
+  /** Answer a command with a daemon-side failure. */
+  enqueueFail(commandType: string, error: string): void;
+  /** Push a message to the bridge directly (out-of-band daemon chatter). */
+  push(message: DaemonPushMessage): void;
+  /**
+   * Drop the socket under the bridge (bbpa-ggf.11): the connection layer sees
+   * a dead wire and starts its bounded recovery. Commands sent while dropped
+   * are refused, like writes to a closed socket.
+   */
+  drop(args?: { cause?: string }): void;
+  /** The daemon answers again; `reconnect` settles with this hello. */
+  restore(args?: { hello?: DaemonHello }): void;
+  /** Whether the wire is currently dropped. */
+  isDropped(): boolean;
+}
+
+/** The session identity every block speaks about (one scripted session per daemon). */
+export interface ScriptedSession {
+  activeSessionId: string;
+  sessionFile: string;
+  sessionName: string;
+  cwd: string;
+}
+
+export function createScriptedDaemon(
+  args: {
+    hello?: DaemonHello;
+    session?: Partial<ScriptedSession>;
+    /**
+     * How long the transport's `reconnect` waits for `restore()` before giving
+     * up. Defaults to a short budget: the scripted daemon is a fixture, and a
+     * test that wants the give-up path sets it explicitly.
+     */
+    reconnectBudgetMs?: number;
+  } = {},
+): ScriptedDaemonHandle {
+  const session = {
+    activeSessionId: "sess_scripted",
+    sessionFile: "/tmp/prime/sessions/sess_scripted.jsonl",
+    sessionName: "[bb] scripted thread",
+    cwd: "/tmp/prime-workspace",
+    ...args.session,
+  };
+  const blocks: ScriptedBlock[] = [];
+  const commands: Array<Record<string, unknown>> = [];
+  const listeners = new Set<(message: DaemonPushMessage) => void>();
+  const peerCloseListeners = new Set<(error: Error | undefined) => void>();
+  /** The daemon's event clock; only a session replacement changes the generation. */
+  const generation = "gen-0";
+  let sequence = 0;
+  let hello = (args.hello ?? calibratedHello()) as DaemonHello;
+  let dropped = false;
+  const reconnectBudgetMs = args.reconnectBudgetMs ?? 5_000;
+
+  function nextBlock(commandType: string): ScriptedBlock {
+    const index = blocks.findIndex((block) => block.commandType === commandType);
+    if (index < 0) {
+      throw new Error(
+        `scripted prime daemon has no "${commandType}" block left (enqueued: ${
+          blocks.map((block) => block.commandType).join(", ") || "nothing"
+        })`,
+      );
+    }
+    const [block] = blocks.splice(index, 1);
+    return block!;
+  }
+
+  function push(message: DaemonPushMessage): void {
+    for (const listener of listeners) {
+      listener(message);
+    }
+  }
+
+  function ok(commandType: string, data?: unknown): DaemonCommandResult {
+    return {
+      command: commandType,
+      success: true,
+      ...(data === undefined ? {} : { data }),
+    };
+  }
+
+  const handle: ScriptedDaemonHandle = {
+    transport: {
+      describe: "scripted prime-agent daemon",
+      async connect() {
+        return hello;
+      },
+      async request(command) {
+        if (dropped) {
+          throw new Error(
+            "the scripted prime-agent daemon dropped the socket mid-command",
+          );
+        }
+        const payload = command as Record<string, unknown>;
+        const commandType = String(payload.type);
+        commands.push(payload);
+        // The real daemon always answers a queue read; when a test does not
+        // script one, the lanes are simply empty.
+        if (commandType === "get_queue" && !blocks.some((candidate) => candidate.commandType === "get_queue")) {
+          return ok("get_queue", { steering: [], followUp: [] });
+        }
+        const block = nextBlock(commandType);
+        for (const message of block.pushes) {
+          push(message);
+        }
+        return block.answer;
+      },
+      onPush(listener) {
+        listeners.add(listener);
+        return () => {
+          listeners.delete(listener);
+        };
+      },
+      onPeerClose(listener) {
+        peerCloseListeners.add(listener);
+        return () => {
+          peerCloseListeners.delete(listener);
+        };
+      },
+      async reconnect(reconnectArgs) {
+        const budgetMs = reconnectArgs?.budgetMs ?? reconnectBudgetMs;
+        const deadline = Date.now() + budgetMs;
+        while (dropped && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 2));
+        }
+        if (dropped) {
+          throw new Error(
+            `gave up reconnecting to the scripted prime-agent daemon after ${budgetMs}ms`,
+          );
+        }
+        // A fresh connection always earns the daemon's *current* greeting.
+        return hello;
+      },
+      close() {
+        dropped = false;
+        listeners.clear();
+        peerCloseListeners.clear();
+      },
+    },
+    commands,
+    drop({ cause } = {}) {
+      if (dropped) {
+        return;
+      }
+      dropped = true;
+      const error = new Error(cause ?? "the scripted daemon dropped the socket");
+      for (const listener of [...peerCloseListeners]) {
+        listener(error);
+      }
+    },
+    restore(args = {}) {
+      if (args.hello !== undefined) {
+        hello = args.hello;
+      }
+      dropped = false;
+    },
+    isDropped() {
+      return dropped;
+    },
+    enqueueCreate(args?: Partial<ScriptedSession>) {
+      blocks.push({
+        commandType: "create",
+        answer: ok("create", {
+          ...session,
+          ...args,
+          lifecycle: "resident",
+          isSessionActive: false,
+        }),
+        pushes: [],
+      });
+    },
+    enqueueAttach({
+      messages,
+      children,
+      lastEventSequence,
+      lastEventCursor,
+      state,
+      summary,
+    } = {}) {
+      // The reported cursor is the daemon's clock at snapshot time: events the
+      // bridge never saw (out-of-band work on a resident session) move it past
+      // anything this bridge has counted, and later prompts number from there.
+      if (lastEventSequence !== undefined) {
+        sequence = lastEventSequence;
+      }
+      const cursor = lastEventCursor ?? { generation, sequence };
+      blocks.push({
+        commandType: "attach",
+        answer: ok("attach", {
+          activeSessionId: session.activeSessionId,
+          snapshot: {
+            activeSessionId: session.activeSessionId,
+            ...(state === undefined ? {} : { state }),
+            ...(summary === undefined ? {} : { summary }),
+            messages: messages ?? [],
+            ...(children === undefined ? {} : { children }),
+            lastEventSequence: lastEventSequence ?? sequence,
+            lastEventCursor: cursor,
+          },
+          replay: { status: "complete" },
+          lastEventSequence: lastEventSequence ?? sequence,
+          lastEventCursor: cursor,
+        }),
+        pushes: [],
+      });
+    },
+    enqueuePrompt({ events }) {
+      blocks.push({
+        commandType: "prompt",
+        // Prime answers `prompt` as soon as the message is admitted; the turn
+        // then streams as session events.
+        answer: ok("prompt", { accepted: true }),
+        pushes: events.map((event) => {
+          sequence += 1;
+          return {
+            type: "session_event",
+            activeSessionId: session.activeSessionId,
+            event,
+            meta: { sequence, cursor: { generation, sequence } },
+          } satisfies DaemonPushMessage;
+        }),
+      });
+    },
+    enqueueOk(commandType) {
+      blocks.push({ commandType, answer: ok(commandType), pushes: [] });
+    },
+    enqueueData(commandType, data) {
+      blocks.push({ commandType, answer: ok(commandType, data), pushes: [] });
+    },
+    enqueue({ commandType, data, error, events = [] }) {
+      blocks.push({
+        commandType,
+        answer:
+          error !== undefined
+            ? { command: commandType, success: false, error }
+            : ok(commandType, data),
+        pushes: events.map((event) => {
+          sequence += 1;
+          return {
+            type: "session_event",
+            activeSessionId: session.activeSessionId,
+            event,
+            meta: { sequence, cursor: { generation, sequence } },
+          } satisfies DaemonPushMessage;
+        }),
+      });
+    },
+    enqueueFail(commandType, error) {
+      blocks.push({
+        commandType,
+        answer: { command: commandType, success: false, error },
+        pushes: [],
+      });
+    },
+    push,
+  };
+  return handle;
+}
+
+/** A prime turn that streams one text block and settles. */
+export function textTurnEvents(args: {
+  text: string;
+  usage?: { input: number; output: number; totalTokens: number };
+}): readonly unknown[] {
+  const usage = args.usage ?? { input: 7, output: 2, totalTokens: 9 };
+  return [
+    { type: "agent_start" },
+    {
+      type: "message_update",
+      message: { role: "assistant", content: [{ type: "text", text: args.text }] },
+      assistantMessageEvent: {
+        type: "text_delta",
+        contentIndex: 0,
+        delta: args.text,
+      },
+    },
+    {
+      type: "message_update",
+      assistantMessageEvent: {
+        type: "text_end",
+        contentIndex: 0,
+        content: args.text,
+      },
+    },
+    {
+      type: "agent_end",
+      messages: [
+        {
+          role: "assistant",
+          content: [{ type: "text", text: args.text }],
+          stopReason: "stop",
+          usage: {
+            input: usage.input,
+            output: usage.output,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: usage.totalTokens,
+          },
+        },
+      ],
+    },
+  ];
+}

@@ -1,0 +1,17 @@
+{
+  "provider": "prime-agent",
+  "cell": "live-turn",
+  "threadId": "thr_live_mhl8sq",
+  "scope": "thread",
+  "cliVersion": "bb-plugin-prime-agent 0.1.0",
+  "recordedAt": "2026-09-05",
+  "description": "One live prime-agent turn: the resident session is created in the bb workspace, the reply streams as text deltas with usage and a completed boundary; a second turn is soft-stopped (interrupt) and the session survives, then the bridge releases it.",
+  "note": "Recorded against the machine's installed prime-agent daemon (session [bb] Call the bb_echo tool right now with message 'ping from bb'. Do… (thr_live_mhl8sq), /Users/sergeykostrov/.prime/agent/sessions/01a07125-73d9-7087-bb95-754939bb9b33.jsonl, cwd /var/folders/_h/wfznvs_13l76lrxrhj7n1vvm0000gn/T/bb-prime-live-kSVyrQ); the provider lanes carry the daemon wire. Replayed with BB_PRIME_AGENT_DAEMON_REPLAY_CELL pointed at the cell, so no daemon is needed.",
+  "bridgeRuns": 1,
+  "lines": {
+    "runtime→bridge": 4,
+    "bridge→runtime": 160,
+    "provider→bridge": 190,
+    "bridge→provider": 6
+  }
+}
