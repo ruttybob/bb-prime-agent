@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import {
   describeHelloDrift,
-  driftWarnings,
+  helloWarnings,
   type DaemonHello,
   type HelloDrift,
 } from "./protocol.js";
@@ -72,7 +72,9 @@ export async function probeDaemon(
       socketPath,
       hello,
       drift: describeHelloDrift(hello),
-      warnings: driftWarnings(hello),
+      // Generation staleness first, calibration drift second: the health
+      // surface reads top to bottom and the generation is the bigger fact.
+      warnings: helloWarnings(hello),
     };
   } catch (error) {
     if (error instanceof DaemonHandshakeError) {

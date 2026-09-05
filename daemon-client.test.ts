@@ -226,6 +226,79 @@ describe("the daemon client reconnect", () => {
       client.enableAutoReconnect({ budgetMs: 300, attemptDelayMs: 50 }),
     ).rejects.toThrow(/gave up reconnecting/);
   });
+
+  it("tells a drop watcher about every drop, until the client is closed", async () => {
+    daemon = await FakeDaemon.start();
+    const client = new PrimeDaemonClient({ socketPath: daemon.socketPath });
+    await client.connect();
+
+    const drops: string[] = [];
+    client.onPeerClose((error) => {
+      drops.push(error?.message ?? "closed");
+    });
+
+    // Two drops in a row (a restart, then a crash): one subscription sees both,
+    // which is what a recovery loop built on this hook needs.
+    daemon.dropConnections();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    await client.enableAutoReconnect({ budgetMs: 2_000, attemptDelayMs: 20 });
+    daemon.dropConnections();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(drops.length).toBe(2);
+
+    // A close we asked for is not a drop: it retires the watchers instead.
+    client.close();
+    expect(drops.length).toBe(2);
+  });
+
+  it("answers a dropped capability with an honest pre-send error after a drift", async () => {
+    const respond = (envelope: Record<string, unknown>) => ({
+      type: "response",
+      id: envelope.id,
+      command: (envelope.command as Record<string, unknown>).type,
+      success: true,
+      data: {},
+    });
+    const first = await FakeDaemon.start({ respond });
+    const client = new PrimeDaemonClient({ socketPath: first.socketPath });
+    await client.connect();
+    await client.request({ type: "prompt" });
+    await first.close();
+
+    // The restarted daemon dropped the `session_input_admission` capability
+    // `prompt` needs (and advertises an older schema revision): the same
+    // command now fails on the client, before anything reaches the wire.
+    const restarted = await FakeDaemon.start({
+      hello: calibratedHello({
+        serverCapabilities: (calibratedHello().serverCapabilities as string[]).filter(
+          (capability) => capability !== "session_input_admission",
+        ),
+        schemaRevision: 7,
+      }),
+      respond,
+    });
+    try {
+      const drifted = new PrimeDaemonClient({ socketPath: restarted.socketPath });
+      await drifted.connect();
+      const error = await rejectionOf(drifted.request({ type: "prompt" }));
+      expect(error).toBeInstanceOf(DaemonCapabilityUnavailableError);
+      expect((error as DaemonCapabilityUnavailableError).message).toContain(
+        'cannot run "prompt"',
+      );
+      expect((error as DaemonCapabilityUnavailableError).missing).toMatchObject({
+        kind: "capability",
+        capability: "session_input_admission",
+      });
+      // A command the drifted daemon still supports goes straight through.
+      await expect(drifted.request({ type: "list" })).resolves.toMatchObject({
+        success: true,
+      });
+      drifted.close();
+    } finally {
+      await restarted.close();
+    }
+  });
 });
 
 describe("client hello routing", () => {

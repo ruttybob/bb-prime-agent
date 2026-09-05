@@ -531,3 +531,42 @@ export function driftWarnings(hello: DaemonHello): string[] {
   }
   return warnings;
 }
+
+function majorOf(version: string): string {
+  return version.split(/[.-]/u)[0] ?? version;
+}
+
+/**
+ * Whether the greeting names a daemon from a *different generation* than the
+ * one this bridge was calibrated for: a protocol version above the one this
+ * bridge speaks, or an app version on another side of the first version part.
+ * That is staleness, not mere drift — the daemon behind the socket was replaced
+ * by an install this bridge has never been tested against.
+ *
+ * The answer is a warning and nothing more (ADR-0002): the compat gate still
+ * gates every command against the *answered* hello, and bb never spawns,
+ * replaces, or shuts down a daemon it did not start.
+ */
+export function staleDaemonWarnings(hello: DaemonHello): string[] {
+  const warnings: string[] = [];
+  if (hello.protocol.version > DAEMON_PROTOCOL_VERSION) {
+    warnings.push(
+      `the running daemon speaks protocol ${hello.protocol.version}, newer than the protocol ${DAEMON_PROTOCOL_VERSION} this bridge speaks; commands travel as protocol ${DAEMON_PROTOCOL_VERSION} and newer daemon behavior is untested`,
+    );
+  }
+  const appVersion = hello.appVersion;
+  if (
+    appVersion !== undefined &&
+    majorOf(appVersion) !== majorOf(CALIBRATED_APP_VERSION)
+  ) {
+    warnings.push(
+      `the running daemon is prime-agent ${appVersion}, a different generation than the ${CALIBRATED_APP_VERSION} this bridge was calibrated against; bb leaves it alone — it never starts, replaces, or stops a daemon it did not start`,
+    );
+  }
+  return warnings;
+}
+
+/** Every warning a hello earns: generation staleness plus calibration drift. */
+export function helloWarnings(hello: DaemonHello): string[] {
+  return [...staleDaemonWarnings(hello), ...driftWarnings(hello)];
+}

@@ -7,7 +7,9 @@ import {
   createDaemonCommandEnvelope,
   describeHelloDrift,
   driftWarnings,
+  helloWarnings,
   parseDaemonHello,
+  staleDaemonWarnings,
   validateDaemonHello,
   type DaemonHello,
 } from "./src/daemon/protocol.js";
@@ -205,5 +207,40 @@ describe("calibration drift", () => {
 
   it("keeps the calibrated schema id constant", () => {
     expect(CALIBRATED_SCHEMA_ID).toBe("protocol-7-schema-16-1bcb9e7f1a49");
+  });
+});
+
+describe("generation staleness", () => {
+  it("says nothing about the calibrated greeting", () => {
+    expect(staleDaemonWarnings(hello)).toEqual([]);
+    expect(helloWarnings(hello)).toEqual([]);
+  });
+
+  it("warns when the daemon speaks a newer protocol generation", () => {
+    const warnings = staleDaemonWarnings(
+      calibratedHello({ protocol: { name: "prime-agent.daemon", version: 8 } }) as unknown as DaemonHello,
+    );
+    expect(warnings.join(" ")).toContain("protocol 8");
+    expect(warnings.join(" ")).toContain("newer daemon behavior is untested");
+  });
+
+  it("warns when the daemon is from another app generation", () => {
+    const warnings = staleDaemonWarnings(
+      calibratedHello({ appVersion: "1.0.0" }) as unknown as DaemonHello,
+    );
+    expect(warnings.join(" ")).toContain("different generation");
+  });
+
+  it("treats a minor version bump as drift, not staleness", () => {
+    expect(staleDaemonWarnings(calibratedHello({ appVersion: "0.8.0" }) as unknown as DaemonHello)).toEqual([]);
+    // …but drift still lands in the combined verdict.
+    expect(
+      helloWarnings(calibratedHello({ appVersion: "0.8.0" }) as unknown as DaemonHello).join(" "),
+    ).toContain("0.8.0 is newer");
+  });
+
+  it("tolerates a hello that reports no version at all", () => {
+    const { appVersion: _ignored, ...unreported } = calibratedHello();
+    expect(staleDaemonWarnings(unreported as unknown as DaemonHello)).toEqual([]);
   });
 });

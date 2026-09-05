@@ -42,6 +42,7 @@ import {
 import {
   daemonRequest,
   ensureDaemonConnection,
+  onDaemonConnectionEvent,
   onDaemonPush,
   resetDaemonConnectionForTests,
 } from "./daemon/connection.js";
@@ -241,6 +242,10 @@ function laneFor(record: SessionRecord): PrimeSession {
     record,
     emit: ({ threadId, deltas }) => emitDeltas(threadId, deltas),
     subscribePush: onDaemonPush,
+    // Daemon-restart resilience (bbpa-ggf.11): the lane hears the shared wire's
+    // drops and recoveries itself — it settles the turn that died with the
+    // socket, re-attaches on a fresh snapshot, and warns about hello drift.
+    subscribeConnection: onDaemonConnectionEvent,
     request: (command, args) => daemonRequest(command, args),
     ensureConnected: ensureDaemonConnection,
     // bb's delta grammar has no row for model/thinking/compaction *state*; the

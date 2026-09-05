@@ -3,6 +3,7 @@ import { join } from "node:path";
 import {
   PrimeDaemonClient,
   type DaemonCommandResult,
+  type ReconnectStatus,
 } from "./client.js";
 import type { DaemonHello, DaemonPushMessage } from "./protocol.js";
 import {
@@ -44,6 +45,26 @@ export interface PrimeDaemonTransport {
   request(command: DaemonCommand, args?: { timeoutMs?: number }): Promise<DaemonCommandResult>;
   onPush(listener: (message: DaemonPushMessage) => void): () => void;
   close(): void;
+  /**
+   * Subscribe to the transport dying under us (a socket drop). Optional: a
+   * recorded lane never dies, so it has nothing to report. `close()` is not a
+   * drop and never reaches these listeners.
+   */
+  onPeerClose?(
+    listener: (error: Error | undefined) => void,
+  ): () => void;
+  /**
+   * Recover after a drop: re-establish the wire and settle with the *fresh*
+   * hello. Implementations retry with capped backoff inside a bounded budget
+   * and reject once that budget is gone — the caller coalesces around one
+   * recovery. Optional: a transport that cannot recover simply never reports a
+   * drop.
+   */
+  reconnect?(args?: {
+    budgetMs?: number;
+    attemptDelayMs?: number;
+    onStatus?: (status: ReconnectStatus) => void;
+  }): Promise<DaemonHello>;
 }
 
 export function createSocketTransport(args: {
@@ -78,6 +99,12 @@ export function createSocketTransport(args: {
       return () => {
         client.onPush = previous;
       };
+    },
+    onPeerClose(listener) {
+      return client.onPeerClose(listener);
+    },
+    reconnect(reconnectArgs) {
+      return client.enableAutoReconnect(reconnectArgs);
     },
     close() {
       recorder?.close();
