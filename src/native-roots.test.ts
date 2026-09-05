@@ -5,9 +5,9 @@ import {
   experimental_nativeRootsResolveOutputSchema,
 } from "@get-bb/plugin-sdk/host";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { PRIME_NATIVE_ROOTS_DECLARATION } from "./native-roots-declaration.js";
 import {
   MAX_LOOSE_SKILL_FILES_PER_ROOT,
-  PRIME_NATIVE_ROOTS_DECLARATION,
   resolvePrimeNativeRoots,
 } from "./native-roots.js";
 import { primeAgentDir, primeProjectAgentDir } from "./session-params.js";
