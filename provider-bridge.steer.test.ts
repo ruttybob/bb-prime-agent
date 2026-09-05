@@ -189,17 +189,25 @@ describe("turn/steer onto prime's steering lane", () => {
     });
     collected = [];
 
-    daemon.enqueueOk("steer");
+    daemon.enqueueOk("prompt");
     const reply = await steer({ id: "t3", threadId: "thr_1", providerThreadId });
     expect(reply.error).toBeUndefined();
     expect(reply.result).toEqual({ threadId: "thr_1" });
 
-    // The daemon got prime's steer command for this session.
-    const steerCommand = daemon.commands.find((command) => command.type === "steer");
-    expect(steerCommand).toMatchObject({
+    // The daemon got prime's mid-turn prompt carrying the steer semantic:
+    // delivered after the current tool round, before the next model call
+    // (spike, wire facts) — and queued, so the running turn keeps its seat.
+    const prompts = daemon.commands.filter((command) => command.type === "prompt");
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toMatchObject({
       activeSessionId: "sess_1",
       message: "Also check the failing test",
+      streamingBehavior: "steer",
+      queueIfBusy: true,
     });
+    // Not the daemon's `steer` command: on the calibrated daemon it delivers
+    // when the run settles, which is not a mid-turn delivery.
+    expect(daemon.commands).not.toContainEqual(expect.objectContaining({ type: "steer" }));
 
     const threadDeltas = deltas("thr_1");
     // Correlated acceptance and the steered text as a provider input row.

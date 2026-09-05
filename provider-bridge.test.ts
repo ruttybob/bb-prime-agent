@@ -100,7 +100,7 @@ async function waitForResponse(id: string, timeoutMs = 2_000): Promise<Response>
 
 /**
  * `onClose` releases its sessions fire-and-forget (the runtime is already
- * gone); wait until the soft-stop chain has reached the daemon.
+ * gone); wait until the teardown chain has reached the daemon.
  */
 async function flushedTeardown(timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -1075,9 +1075,10 @@ describe("process teardown (closing bb)", () => {
   /**
    * The sessions are daemon-resident on purpose: the daemon outlives this
    * bridge process, so closing bb must let go of the sessions — never remove
-   * them. A released thread comes back through `thread/resume`.
+   * them, and never stop the work either (story 18). A released thread comes
+   * back through `thread/resume`.
    */
-  it("closing bb releases the sessions and keeps them resident: no kill on close", async () => {
+  it("closing bb detaches from the sessions and keeps them resident: no kill on close", async () => {
     await startThread("t1", "thr_1");
     daemon.enqueueOk("detach");
     experimental_providerBridge.onClose?.();
@@ -1095,7 +1096,7 @@ describe("process teardown (closing bb)", () => {
     expect(sessionTableForTests().all()).toEqual([]);
   });
 
-  it("closing bb mid-turn soft-stops the turn and still keeps the session", async () => {
+  it("closing bb mid-turn does not abort: the session keeps streaming", async () => {
     const providerThreadId = await startThread("t1", "thr_1");
     daemon.enqueuePrompt({ events: [{ type: "agent_start" }] });
     sendRequest("t2", "turn/start", {
@@ -1107,20 +1108,21 @@ describe("process teardown (closing bb)", () => {
     });
     await waitForResponse("t2");
 
-    daemon.enqueueOk("abort");
     daemon.enqueueOk("detach");
     experimental_providerBridge.onClose?.();
     await flushedTeardown();
-    // Even a running turn only gets the soft stop: the daemon session and its
-    // file survive the close, and the turn can continue for another client.
+    // The close detaches and nothing else: no abort, so prime keeps streaming
+    // the open turn for whoever is attached next — the work outlives the app
+    // (story 18). The daemon session and its file survive the close too;
+    // discard is the only path that removes them.
     expect(daemon.commands.map((command) => command.type)).toEqual([
       "create",
       "attach",
       "get_queue",
       "prompt",
-      "abort",
       "detach",
     ]);
+    expect(daemon.commands).not.toContainEqual(expect.objectContaining({ type: "abort" }));
     expect(daemon.commands).not.toContainEqual(expect.objectContaining({ type: "kill" }));
     expect(daemon.commands).not.toContainEqual(
       expect.objectContaining({ type: "delete_saved_session" }),

@@ -17,6 +17,7 @@ import {
   daemonAttachResultSchema,
   daemonCreateResultSchema,
   daemonQueueResultSchema,
+  daemonSessionSummarySchema,
   primeModelSchema,
   sessionClosedSchema,
   sessionEventEnvelopeSchema,
@@ -98,10 +99,21 @@ export interface PrimeSessionState {
   availableThinkingLevels: readonly PrimeThinkingLevel[];
   isCompacting: boolean;
   autoCompactionEnabled: boolean | undefined;
+  /**
+   * Clients the daemon reports on this session (story 21's "other clients"
+   * badge data; bb itself is one of them). Unknown until the first read —
+   * prime has no push for other clients' attach/detach (protocol spike, wire
+   * facts), so the lane only knows what it has asked or been snapshotted.
+   */
+  attachedClients: number | undefined;
 }
 
 /** Why the lane published a state snapshot off the timeline (`provider/raw`). */
-export type PrimeSessionStateSource = "attach" | "turn-options" | "daemon-event";
+export type PrimeSessionStateSource =
+  | "attach"
+  | "turn-options"
+  | "daemon-event"
+  | "clients-read";
 
 export interface PrimeSessionOptions {
   record: SessionRecord;
@@ -199,6 +211,7 @@ export class PrimeSession {
     availableThinkingLevels: [],
     isCompacting: false,
     autoCompactionEnabled: undefined,
+    attachedClients: undefined,
   };
   /**
    * Set when prime reports a manual compaction under way, cleared when it
@@ -208,6 +221,15 @@ export class PrimeSession {
    * itself (`compactManually`).
    */
   private compactionStarted = false;
+  /**
+   * The attached-client count's polling machinery (story 21): a slow interval
+   * that runs only while the lane is attached, and the clock of the last read,
+   * which windows the settle-time reads to one per interval. `undefined` once
+   * the lane is disposed — never a reason for the process to stay alive.
+   */
+  private static readonly CLIENTS_REFRESH_MS = 60_000;
+  private clientsTimer: ReturnType<typeof setInterval> | undefined;
+  private clientsReadAt = 0;
   /**
    * Fork anchors for the prompt-carrying runs sent but not yet settled
    * (bbpa-ggf.7), FIFO in the order prime will run them (steering and
@@ -334,8 +356,14 @@ export class PrimeSession {
     // flags. Everything the model/compaction work reconciles against.
     if (answer.snapshot?.state !== undefined) {
       this.adoptState(answer.snapshot.state);
+    }
+    // The snapshot's summary is a SessionSummary read, so the attached-client
+    // count (story 21) rides the attach for free — the badge's first datum.
+    const clientsLearned = this.learnClientsFromSummary(answer.snapshot?.summary);
+    if (answer.snapshot?.state !== undefined || clientsLearned) {
       this.publishState("attach");
     }
+    this.startClientsPoll();
     // The roster of live subagents as the daemon sees it right now: the panel's
     // seed and, for an adopted session, the only record of children spawned
     // while no bridge was attached.
@@ -409,12 +437,95 @@ export class PrimeSession {
       availableThinkingLevels: ladder,
       isCompacting: state.isCompacting ?? false,
       autoCompactionEnabled: state.autoCompactionEnabled,
+      // The connection state carries no client roster: the count is the poll's
+      // business (story 21), so an attach snapshot keeps what was last read.
+      attachedClients: this.state.attachedClients,
     };
   }
 
   /** Publish the session facts off the timeline (`provider/raw`, no deltas). */
   private publishState(source: PrimeSessionStateSource): void {
     this.onState?.({ ...this.state }, source);
+  }
+
+  /* --------------------- the attached-clients badge (story 21) --------------------- */
+
+  /**
+   * Adopt the attached-client count a session summary carried. Reports whether
+   * it moved, so the caller knows whether the mirror is worth republishing.
+   */
+  private learnClientsFromSummary(summary: unknown): boolean {
+    const parsed = daemonSessionSummarySchema.safeParse(summary);
+    const attached = parsed.success ? parsed.data.attachedClients : undefined;
+    if (typeof attached !== "number" || attached === this.state.attachedClients) {
+      return false;
+    }
+    this.state = { ...this.state, attachedClients: attached };
+    return true;
+  }
+
+  /**
+   * Re-read the attached-client count (`get_state`) and mirror it when it
+   * moved. Prime announces no other client's attach or detach (protocol spike,
+   * wire facts: `SessionSummary.attachedClients`, no push event), so the badge
+   * can only poll. Best-effort by design: a daemon that will not answer
+   * `get_state` says nothing, and the previously known count stands.
+   */
+  private async refreshClients(): Promise<void> {
+    if (
+      this.closed ||
+      !this.attached ||
+      this.wireDown ||
+      this.record.activeSessionId === undefined
+    ) {
+      return;
+    }
+    this.clientsReadAt = Date.now();
+    try {
+      const state = await this.request(
+        asWireCommand({
+          type: "get_state",
+          activeSessionId: this.record.activeSessionId,
+        }),
+      );
+      if (state.success && this.learnClientsFromSummary(state.data)) {
+        this.publishState("clients-read");
+      }
+    } catch {
+      // The badge is a mirror, never a dependency.
+    }
+  }
+
+  /** The windowed settle-time read: at most one per refresh interval. */
+  private refreshClientsWhenStale(): void {
+    if (Date.now() - this.clientsReadAt < PrimeSession.CLIENTS_REFRESH_MS) {
+      return;
+    }
+    void this.refreshClients();
+  }
+
+  /** Poll the count for as long as this lane is attached to the session. */
+  private startClientsPoll(): void {
+    if (this.clientsTimer !== undefined || this.closed) {
+      return;
+    }
+    // The attach itself observed the session (its summary), so the window
+    // starts here even when that summary carried no count.
+    if (this.clientsReadAt === 0) {
+      this.clientsReadAt = Date.now();
+    }
+    this.clientsTimer = setInterval(() => {
+      void this.refreshClients();
+    }, PrimeSession.CLIENTS_REFRESH_MS);
+    // Never a reason for the bridge process to stay alive on its own.
+    this.clientsTimer.unref?.();
+  }
+
+  private stopClientsPoll(): void {
+    if (this.clientsTimer !== undefined) {
+      clearInterval(this.clientsTimer);
+      this.clientsTimer = undefined;
+    }
   }
 
   /**
@@ -574,6 +685,7 @@ export class PrimeSession {
       // session file survives on disk; the lane stops streaming.
       this.daemonClosed = true;
       this.closed = true;
+      this.stopClientsPoll();
       return;
     }
     if (message.type === "session_resynced" || message.type === "session_replaced") {
@@ -790,6 +902,10 @@ export class PrimeSession {
         if (this.openTurn !== undefined) {
           this.openTurn.settledLocally = true;
         }
+        // A settled turn is a natural moment to re-read the attached-client
+        // count (story 21) — windowed, so a thread turning steadily costs no
+        // extra commands beyond the slow poll.
+        this.refreshClientsWhenStale();
       },
     };
     this.pushDeltas(this.translator.translate(push.event, context));
@@ -902,31 +1018,45 @@ export class PrimeSession {
 
   /**
    * Steer prime with a user message — the one primitive behind bb's steer,
-   * whatever the lane state. The message goes to prime's steering lane
-   * (`next_turn_boundary`): prime delivers it after the work in flight
-   * finishes and before whatever runs next, never interrupting anything. On
-   * an idle session the daemon's `resumeIfIdle` starts a fresh run with it,
-   * so a steer is never a silent no-op. (On the calibrated 0.7.3 daemon a
-   * steer of a streaming session is delivered when that run settles, and the
-   * steered answer streams as the follow-up run — a new bb turn.)
+   * whatever the lane state. While a turn of ours is open, the steer rides
+   * prime's mid-turn prompt (`prompt {streamingBehavior: "steer"}`): per the
+   * protocol spike (`docs/spikes/0001-prime-daemon-protocol.md`, wire facts)
+   * that message is delivered after the current tool round and before the next
+   * model call — exactly bbpa-ggf.5's acceptance criterion — and
+   * `queueIfBusy` keeps the streaming turn's seat. The daemon's `steer`
+   * command on the calibrated 0.7.3 delivers only when the run settles, so it
+   * is the idle-lane form alone: there `resumeIfIdle` starts the fresh run
+   * that answers the steer, so a steer is never a silent no-op. Neither form
+   * ever interrupts anything.
    */
   async steer(args: { input: readonly PromptInput[] }): Promise<void> {
     if (this.record.activeSessionId === undefined) {
       throw new Error("cannot steer before the session is created");
     }
     await this.awaitLive();
+    const midTurn = this.hasOpenTurn;
     this.openTurn = { settledLocally: false };
     this.queueCheckpoint(PrimeSession.promptText(args.input));
     try {
       await readCommandData(
         await this.request(
-          asWireCommand({
-            type: "steer",
-            activeSessionId: this.record.activeSessionId,
-            message: PrimeSession.promptText(args.input),
-          }),
+          asWireCommand(
+            midTurn
+              ? {
+                  type: "prompt",
+                  activeSessionId: this.record.activeSessionId,
+                  message: PrimeSession.promptText(args.input),
+                  streamingBehavior: "steer",
+                  queueIfBusy: true,
+                }
+              : {
+                  type: "steer",
+                  activeSessionId: this.record.activeSessionId,
+                  message: PrimeSession.promptText(args.input),
+                },
+          ),
         ),
-        "steer",
+        midTurn ? "prompt" : "steer",
         (data) => ({ success: true as const, data }),
       );
     } catch (error) {
@@ -986,10 +1116,21 @@ export class PrimeSession {
     }
   }
 
-  /** Release: soft-stop anything running, detach, and stop listening. */
-  async release(): Promise<void> {
+  /**
+   * Release: detach, stop listening, and — unless asked not to — soft-stop
+   * whatever is running. The interrupt is the *user-invoked* release's
+   * semantics (`thread/stop`): bb asked to let go, so the turn it owns stops.
+   * The process-close path (closing bb) releases with `interrupt: false`
+   * instead: the resident session is the artifact bb's threads point at, and
+   * story 18 wants long-running work to outlive the app — prime keeps
+   * streaming, and the turn's output reaches whoever attaches next.
+   */
+  async release(args: { interrupt?: boolean } = {}): Promise<void> {
     this.settleConnectionGap("unavailable");
-    await this.interrupt();
+    this.stopClientsPoll();
+    if (args.interrupt !== false) {
+      await this.interrupt();
+    }
     await this.detach();
     this.translator.resetThread(this.record.threadId);
     this.unsubscribe();

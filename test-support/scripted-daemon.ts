@@ -36,6 +36,8 @@ export interface ScriptedDaemonHandle {
     lastEventCursor?: { generation: string; sequence: number };
     /** prime's own report of the session (`AgentConnectionState`), read loosely. */
     state?: Record<string, unknown>;
+    /** The session summary (`SessionSummary`), read loosely — the attached-client count rides it. */
+    summary?: Record<string, unknown>;
   }): void;
   /** Answer the next `prompt` with prime's early admission, then stream events. */
   enqueuePrompt(args: { events: readonly unknown[] }): void;
@@ -230,6 +232,7 @@ export function createScriptedDaemon(
       lastEventSequence,
       lastEventCursor,
       state,
+      summary,
     } = {}) {
       // The reported cursor is the daemon's clock at snapshot time: events the
       // bridge never saw (out-of-band work on a resident session) move it past
@@ -245,6 +248,7 @@ export function createScriptedDaemon(
           snapshot: {
             activeSessionId: session.activeSessionId,
             ...(state === undefined ? {} : { state }),
+            ...(summary === undefined ? {} : { summary }),
             messages: messages ?? [],
             ...(children === undefined ? {} : { children }),
             lastEventSequence: lastEventSequence ?? sequence,

@@ -58,6 +58,13 @@ export const daemonSessionSummarySchema = z
     cwd: z.string().optional(),
     model: z.unknown().optional(),
     isStreaming: z.boolean().optional(),
+    /**
+     * How many clients are attached to the session right now (the story 21
+     * badge). Read off `get_state`/`list` and the attach snapshot's summary:
+     * prime announces no attach or detach of other clients, so there is no
+     * push to subscribe to (protocol spike, wire facts).
+     */
+    attachedClients: z.number().optional(),
   })
   .passthrough();
 export type DaemonSessionSummary = z.infer<typeof daemonSessionSummarySchema>;

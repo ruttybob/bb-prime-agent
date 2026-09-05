@@ -318,6 +318,14 @@ function laneFor(record: SessionRecord): PrimeSession {
           availableThinkingLevels: [...state.availableThinkingLevels],
           isCompacting: state.isCompacting,
           autoCompactionEnabled: state.autoCompactionEnabled,
+          // Story 21's badge: who else is attached to this resident session.
+          // Poll-sourced (prime has no push for other clients' attach/detach),
+          // and `undefined` until the first read — JSON drops the keys then.
+          attachedClients: state.attachedClients,
+          otherClients:
+            state.attachedClients === undefined
+              ? undefined
+              : Math.max(0, state.attachedClients - 1),
         },
       });
     },
@@ -946,12 +954,12 @@ const handlers: Record<string, RequestHandler> = {
         );
         return;
       }
-      // prime's `steer` admits the message either way (bbpa-ggf.5): it joins
-      // prime's steering lane — after the work in flight, before whatever
-      // runs next — and on an idle session the daemon's resumeIfIdle starts a
-      // fresh run. The steered text shows on the timeline as a provider input
-      // row; the turn in flight settles itself, and a resumed run opens the
-      // turn that answers the steer.
+      // prime admits the message either way (bbpa-ggf.5) and the lane picks
+      // the form: mid-turn it is prime's steer semantic — after the work in
+      // flight, before the next model call — and on an idle session the
+      // daemon's resumeIfIdle starts a fresh run. The steered text shows on
+      // the timeline as a provider input row; the turn in flight settles
+      // itself, and a resumed run opens the turn that answers the steer.
       await sessionFor(record).steer({ input: parsed.data.input });
       emitDeltas(record.threadId, [
         { kind: "input.accepted", clientRequestId: parsed.data.clientRequestId },
@@ -1057,8 +1065,11 @@ export const experimental_providerBridge = experimental_defineProviderBridge({
   onClose() {
     for (const record of sessions.all()) {
       // Fire and forget: the daemon outlives this process, and a failed detach
-      // on the way down is not an error the runtime can act on.
-      record.session?.release().catch(() => {});
+      // on the way down is not an error the runtime can act on. Detach only —
+      // a turn still running keeps streaming (story 18): the session is
+      // resident, and its output reaches whoever attaches next, be that a
+      // reopened bb or an out-of-band client.
+      record.session?.release({ interrupt: false }).catch(() => {});
     }
     dynamicTools.clear().catch(() => {});
     sessions.clear();

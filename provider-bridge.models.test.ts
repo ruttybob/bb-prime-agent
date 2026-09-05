@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   experimental_captureBridgeJsonRpcOutput as captureBridgeJsonRpcOutput,
   type CapturedBridgeJsonRpcOutput,
@@ -675,5 +675,85 @@ describe("manual compaction", () => {
     expect(primeProviderDeclaration().capabilities.supportsManualCompaction).toBe(
       true,
     );
+  });
+});
+
+describe("the attached-clients badge (story 21)", () => {
+  it("mirrors how many other clients are attached, from the attach summary and the poll", async () => {
+    vi.useFakeTimers();
+    try {
+      // bb is one of the attached clients; the badge counts the others.
+      daemon.enqueueCreate();
+      daemon.enqueueAttach({ summary: { attachedClients: 2 } });
+      // Prime has no push for other clients' attach/detach (spike, wire
+      // facts), so the lane polls: the scripted daemon now reports four.
+      daemon.enqueueData("get_state", {
+        activeSessionId: "sess_1",
+        attachedClients: 4,
+      });
+      sendRequest("s", "thread/start", {
+        threadId: "thr_badge",
+        cwd,
+        instructionMode: "append",
+        options: FULL_OPTIONS,
+      });
+      // The attach summary is the badge's first datum, free with the attach.
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sessionStateNotifications().at(-1)).toMatchObject({
+        threadId: "thr_badge",
+        source: "attach",
+        attachedClients: 2,
+        otherClients: 1,
+      });
+
+      // One slow poll later the mirror carries the count prime holds now.
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sessionStateNotifications().at(-1)).toMatchObject({
+        threadId: "thr_badge",
+        source: "clients-read",
+        attachedClients: 4,
+        otherClients: 3,
+      });
+      // Exactly one poll went out for the whole minute — the read is windowed.
+      expect(
+        daemon.commands.filter((command) => command.type === "get_state"),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling once the lane is released", async () => {
+    vi.useFakeTimers();
+    try {
+      daemon.enqueueCreate();
+      daemon.enqueueAttach({ summary: { attachedClients: 1 } });
+      sendRequest("s", "thread/start", {
+        threadId: "thr_badge",
+        cwd,
+        instructionMode: "append",
+        options: FULL_OPTIONS,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      messages();
+      daemon.enqueueOk("detach");
+      sendRequest("r", "thread/stop", {
+        threadId: "thr_badge",
+        providerThreadId: "prime_sess_1",
+        intent: "release",
+        activeTurnId: null,
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      const mirrorsBeforeRelease = sessionStateNotifications().length;
+
+      // Long past the release: no timer left, so no reads and no mirrors.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(
+        daemon.commands.filter((command) => command.type === "get_state"),
+      ).toEqual([]);
+      expect(sessionStateNotifications()).toHaveLength(mirrorsBeforeRelease);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
