@@ -1,5 +1,5 @@
 import type { PluginProviderDeclaration } from "@get-bb/plugin-sdk";
-import { PRIME_NATIVE_ROOTS_DECLARATION } from "./native-roots.js";
+import { PRIME_NATIVE_ROOTS_DECLARATION } from "./native-roots-declaration.js";
 import {
   enabledExtensionsProviderOptions,
   enabledUserExtensionPaths,

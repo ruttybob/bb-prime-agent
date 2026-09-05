@@ -1,6 +1,5 @@
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
-import type { PluginProviderDeclaration } from "@get-bb/plugin-sdk";
 import {
   experimental_filterResolvedNativeRoots,
   type ExperimentalNativeRootsResolveAnswer,
@@ -8,26 +7,21 @@ import {
 import { primeAgentDir, primeProjectAgentDir } from "./session-params.js";
 
 /**
- * prime-agent's native skill roots in bb's "/" menu (bbpa-ggf.8).
+ * The host-resolved half of prime-agent's native skill roots (bbpa-ggf.8):
+ * what only this host can name — the `skills` arrays of prime's user and
+ * project `settings.json`, plus the loose top-level `*.md` skill files prime
+ * discovers inside its two default skill directories. bb scans the answer
+ * beside the declared roots (`./native-roots-declaration.ts` holds the fixed
+ * directories) for the composer "/" menu; invoking an entry is the prompt
+ * path (`src/skill-mentions.ts`) — prime expands `/skill:<name>` in the
+ * session itself, so nothing here needs to reach the daemon's `create`.
  *
- * Two halves, per the SDK's native-roots contract:
- *
- * - **Declared roots** (`experimental_nativeSkillRoots`) are the fixed,
- *   machine-independent directories prime scans, relative to the host home
- *   (`user`) or the workspace (`project`) — the same convention pi declares,
- *   with prime's paths (`docs/skills.md` "Locations"): `~/.prime/agent/skills`
- *   and `~/.agents/skills` at the user level, `.prime/agent/skills` and the
- *   `.agents/skills` chain up to the repository root (`ancestors: true` —
- *   prime's `collectAncestorAgentsSkillDirs`) at the project level.
- * - **Resolved roots** (`experimental_resolvesNativeRoots` + the host entry's
- *   `resolveNativeRoots`) carry what only this host can name: the `skills`
- *   arrays of prime's user and project `settings.json`, plus the loose
- *   top-level `*.md` skill files prime discovers inside its two default skill
- *   directories. bb scans everything it finds here beside the declared roots.
- *
- * bb lists what these produce in the composer "/" menu; invoking an entry is
- * the prompt path (`src/skill-mentions.ts`) — prime expands `/skill:<name>` in
- * the session itself, so nothing here needs to reach the daemon's `create`.
+ * This module value-imports `@get-bb/plugin-sdk/host` lawfully: it is
+ * reachable only from the `bb.host` graph (`host.ts`), where the builder
+ * inlines the SDK from the plugin's own install. It must stay out of the
+ * server graph — there bb reloads the entry through jiti, where SDK subpaths
+ * resolve into the one-file runtime shim and die (bbpa-cry, guarded by
+ * `server-entry-graph.test.ts`).
  *
  * Two deliberate divergences from pi's resolver, both because bb pins prime's
  * agent dir (`buildPrimeCreateCommand.config.agentDir`):
@@ -43,22 +37,6 @@ import { primeAgentDir, primeProjectAgentDir } from "./session-params.js";
  * frontmatter name differs from its directory name is listed (and invoked)
  * under the directory name — prime itself only warns about that mismatch.
  */
-
-/**
- * The declaration fragment: prime's fixed skill roots plus the host-resolved
- * rest. There are no command roots — prime's prompt templates
- * (`~/.prime/agent/prompts`) are a separate surface this ticket does not own.
- */
-export const PRIME_NATIVE_ROOTS_DECLARATION: Pick<
-  PluginProviderDeclaration,
-  "experimental_nativeSkillRoots" | "experimental_resolvesNativeRoots"
-> = {
-  experimental_nativeSkillRoots: {
-    user: [".prime/agent/skills", ".agents/skills"],
-    project: [".prime/agent/skills", { path: ".agents/skills", ancestors: true }],
-  },
-  experimental_resolvesNativeRoots: true,
-};
 
 export interface ResolvePrimeNativeRootsArgs {
   /** The host user's home directory. */
