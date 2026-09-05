@@ -23,6 +23,7 @@ import {
   buildPrimeCreateCommand,
   type PrimeDynamicToolsConfig,
 } from "./session-params.js";
+import { primePromptText } from "./skill-mentions.js";
 import { asWireCommand } from "./daemon/transport.js";
 import type { SessionRecord } from "./session-table.js";
 
@@ -58,6 +59,8 @@ export interface StartSessionArgs {
   enabledExtensions?: readonly string[] | undefined;
   /** Dynamic-tools channel fragment for the create (bbpa-ggf.13), when any. */
   dynamicTools?: PrimeDynamicToolsConfig | undefined;
+  /** bb's configured skill roots for the create (bbpa-ggf.8), when any. */
+  skillRoots?: readonly string[] | undefined;
 }
 
 export interface PrimeSessionOptions {
@@ -135,6 +138,7 @@ export class PrimeSession {
       reasoningLevel: args.reasoningLevel,
       enabledExtensions: args.enabledExtensions,
       dynamicTools: args.dynamicTools,
+      skillRoots: args.skillRoots,
     });
     const created = readCommandData(
       await this.request(asWireCommand(create)),
@@ -293,15 +297,9 @@ export class PrimeSession {
     this.emit({ threadId: this.record.threadId, deltas });
   }
 
-  /** bb prompt text: the text parts joined; skill/command mentions are bbpa-ggf.8. */
+  /** bb prompt text: skill mentions in prime's command form, parts joined. */
   static promptText(input: readonly PromptInput[]): string {
-    const parts: string[] = [];
-    for (const part of input) {
-      if (part.type === "text" && part.text.trim() !== "") {
-        parts.push(part.text);
-      }
-    }
-    return parts.join("\n");
+    return primePromptText(input);
   }
 
   /** The bb thread title as the bridge can see it: the first prompt text. */

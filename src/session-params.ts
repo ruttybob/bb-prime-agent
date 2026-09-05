@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import type { ReasoningLevel } from "@get-bb/plugin-sdk/provider-bridge";
 import { BB_TOOLS_CHANNEL_FLAG } from "./dynamic-tools/protocol.js";
 
@@ -20,11 +20,13 @@ import { BB_TOOLS_CHANNEL_FLAG } from "./dynamic-tools/protocol.js";
  *   a diff that touches it shows up as a one-file change.
  *
  * What deliberately does NOT ride `create`: model/thinking *changes* after the
- * session exists (bbpa-ggf.6 owns `set_model`/`set_thinking_level`), and skill
- * roots (bbpa-ggf.8 owns native roots; prime's own skill discovery stays on via
- * `noSkills: false`). `create` is also sent exactly once per session, which is
- * what makes the picker's selection a new-sessions-only knob: a resume attaches
- * to the resident worker without re-sending any of this.
+ * session exists (bbpa-ggf.6 owns `set_model`/`set_thinking_level`). Prime's own
+ * skill discovery stays on (`noSkills: false`) and bb's own skill catalog joins
+ * it through `config.skills` (bbpa-ggf.8) — additive, never a replacement, so
+ * the two catalogs cannot mask each other. `create` is also sent exactly once
+ * per session, which is what makes the picker's selection a new-sessions-only
+ * knob: a resume attaches to the resident worker without re-sending any of
+ * this.
  */
 
 /** Sessions bb owns are namespaced in prime's own catalog with this prefix. */
@@ -34,9 +36,24 @@ export const BB_SESSION_NAME_PREFIX = "[bb] ";
  * prime's per-session agent dir, pinned to prime's own default
  * (`~/.prime/agent`, `dist/config.js` `CONFIG_DIR_NAME`) so a bb session never
  * inherits an agent dir from the bb environment it runs in.
+ *
+ * Everything that reads prime's config on bb's behalf — the extension picker,
+ * the native-roots resolver — goes through this one definition (or its project
+ * sibling below), so the skill and extension lists bb shows can never disagree
+ * with the config dir the session itself reads.
  */
-export function primeAgentDir(): string {
-  return join(homedir(), ".prime", "agent");
+export function primeAgentDir(homeDir: string = homedir()): string {
+  return join(homeDir, ".prime", "agent");
+}
+
+/**
+ * prime's per-project agent dir under a workspace (`dist/config.js`
+ * `CONFIG_DIR_NAME` resolved against the session cwd): the project settings
+ * file and the project skills root both live here. Unlike the user dir this
+ * one is *not* pinned — it follows the thread's environment by definition.
+ */
+export function primeProjectAgentDir(cwd: string): string {
+  return join(cwd, ".prime", "agent");
 }
 
 /**
@@ -162,6 +179,15 @@ export interface PrimeCreateCommandArgs {
    * Present only when the thread declares bb dynamic tools.
    */
   dynamicTools?: PrimeDynamicToolsConfig | undefined;
+  /**
+   * bb's configured skill roots (`skills/configure`, bbpa-ggf.8): the staged
+   * directories of *bb's own* skills, handed over before the first thread
+   * command. Forwarded as prime's explicit `skills` list — the daemon's
+   * `--skill <path>` form, additive with prime's own discovery — so a bb skill
+   * picked from the "/" menu resolves in the session like a native one.
+   * Present only when bb configured any roots before the session was created.
+   */
+  skillRoots?: readonly string[] | undefined;
 }
 
 /**
@@ -195,11 +221,45 @@ export interface PrimeCreateCommand {
     extensions?: string[];
     /** Per-session values for extension-declared flags (the channel socket). */
     extensionFlagValues?: Record<string, string>;
+    /**
+     * Explicit skill paths (`--skill`, bb's configured roots): loaded even
+     * with `noSkills: false` below, additively — prime's own skills stay
+     * discovered, bb's join them. Absolute paths only.
+     */
+    skills?: string[];
   };
 }
 
 function dedupePreservingOrder(paths: readonly string[]): string[] {
   return [...new Set(paths)];
+}
+
+/**
+ * How many bb skill roots one session loads. Defence, not policy — prime caps
+ * nothing here — but a pathological catalog should not be able to hand the
+ * worker an unbounded `--skill` list.
+ */
+export const MAX_SESSION_SKILL_ROOTS = 32;
+
+/**
+ * The `create.config.skills` value for a session: bb's configured skill root
+ * paths, absolute only, deduplicated, capped. Empty when nothing was
+ * configured (the field is then absent, not an empty list).
+ */
+export function sessionSkillRoots(
+  roots: readonly string[] | undefined,
+): string[] | undefined {
+  const paths: string[] = [];
+  for (const root of roots ?? []) {
+    if (!isAbsolute(root) || paths.includes(root)) {
+      continue;
+    }
+    paths.push(root);
+    if (paths.length >= MAX_SESSION_SKILL_ROOTS) {
+      break;
+    }
+  }
+  return paths.length === 0 ? undefined : paths;
 }
 
 /**
@@ -213,6 +273,7 @@ export function buildPrimeCreateCommand(
   args: PrimeCreateCommandArgs,
 ): PrimeCreateCommand {
   const thinking = primeThinkingLevel(args.reasoningLevel);
+  const skills = sessionSkillRoots(args.skillRoots);
   return {
     type: "create",
     name: primeSessionName({ threadId: args.threadId, title: args.title }),
@@ -224,6 +285,7 @@ export function buildPrimeCreateCommand(
       noSkills: false,
       ...(args.model === undefined ? {} : { model: args.model }),
       ...(thinking === undefined ? {} : { thinking }),
+      ...(skills === undefined ? {} : { skills }),
       ...extensionConfigFields(args),
     },
   };

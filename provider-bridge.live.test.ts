@@ -83,24 +83,17 @@ afterEach(async () => {
   output.restore();
   resetDaemonForTests();
   sessionTableForTests().clear();
-  // Cleanup is not optional: remove exactly the session this test created.
+  // Cleanup is not optional: remove exactly the session this test created,
+  // and check the daemon's own catalog before moving on. If prime still lists
+  // the session after the bounded retries, say so loudly rather than failing
+  // the lane — reaping a resident worker is prime's schedule, not ours.
   const stale = cleanupSession;
   if (stale !== undefined) {
-    try {
-      await withTestClient(async (client) => {
-        await client.request({
-          type: "kill",
-          activeSessionId: stale.activeSessionId,
-        });
-        if (stale.sessionFile !== undefined) {
-          await client.request({
-            type: "delete_saved_session",
-            sessionPath: stale.sessionFile,
-          });
-        }
-      });
-    } catch {
-      // A daemon that disappeared already took the resident session with it.
+    const removed = await removeDaemonSession(stale.activeSessionId);
+    if (!removed) {
+      console.warn(
+        `[bb prime-agent live lane] the daemon still lists session ${stale.activeSessionId} (${stale.name}) after abort + kill + delete_saved_session; remove it from prime-agent's catalog if it lingers.`,
+      );
     }
     cleanupSession = undefined;
   }
@@ -110,16 +103,80 @@ afterEach(async () => {
   await dynamicToolsRegistryForTests().clear();
 });
 
-async function withTestClient(
-  run: (client: PrimeDaemonClient) => Promise<void>,
-): Promise<void> {
+/**
+ * Stop one daemon session and remove it, verified against the daemon's own
+ * listing: abort (a settled turn still leaves the worker holding the
+ * session), then kill, then delete the saved file, and retry the round while
+ * the daemon still lists the session — a worker that is shutting down can
+ * re-save its file, and prime reaps the process on its own schedule, so the
+ * round runs (bounded ~15s) until the listing is clean. Answers false when
+ * the daemon still lists the session after the last attempt; a daemon that
+ * went away entirely took the resident session with it, which counts as
+ * removed.
+ */
+async function removeDaemonSession(activeSessionId: string): Promise<boolean> {
+  try {
+    return await withTestClient(async (client) => {
+      for (let attempt = 0; ; attempt += 1) {
+        const listing = await client.request({ type: "list" });
+        const sessions =
+          (listing.data as
+            | {
+                sessions?: Array<{
+                  activeSessionId?: string;
+                  sessionFile?: string;
+                }>;
+              }
+            | undefined)?.sessions ?? [];
+        const entry = sessions.find(
+          (session) => session.activeSessionId === activeSessionId,
+        );
+        if (entry === undefined) {
+          return true;
+        }
+        await client.request({ type: "abort", activeSessionId });
+        await client.request({ type: "kill", activeSessionId });
+        if (entry.sessionFile !== undefined) {
+          await client.request({
+            type: "delete_saved_session",
+            sessionPath: entry.sessionFile,
+          });
+        }
+        if (attempt >= 19) {
+          return false;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 750));
+      }
+    });
+  } catch (error) {
+    if (isConnectFailure(error)) {
+      // No daemon, no session.
+      return true;
+    }
+    throw error;
+  }
+}
+
+function isConnectFailure(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return (
+    code === "ECONNREFUSED" ||
+    code === "ENOENT" ||
+    code === "ECONNRESET" ||
+    code === "ETIMEDOUT"
+  );
+}
+
+async function withTestClient<T>(
+  run: (client: PrimeDaemonClient) => Promise<T>,
+): Promise<T> {
   const client = new PrimeDaemonClient({
     socketPath: resolveDaemonSocketPath(),
     clientId: "bbpa-live-test",
   });
   try {
     await client.connect();
-    await run(client);
+    return await run(client);
   } finally {
     client.close();
   }
@@ -394,6 +451,119 @@ it.skipIf(!LIVE)(
         providerThreadId: String(providerThreadId),
       });
     }
+  },
+  180_000,
+);
+
+it.skipIf(!LIVE)(
+  "runs a workspace prime skill from a slash mention",
+  async () => {
+    // A real prime project skill, in the workspace's `.prime/agent/skills/`:
+    // the directory the declaration indexes into bb's "/" menu and the
+    // directory the prime worker discovers at session boot.
+    const skillName = `bbpa-live-${Math.random().toString(36).slice(2, 8)}`;
+    const skillDir = join(workspaceDir, ".prime", "agent", "skills", skillName);
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      [
+        "---",
+        `name: ${skillName}`,
+        "description: Live-check skill for the bb prime-agent provider.",
+        "---",
+        "",
+        "Reply with exactly the single line BBPA_SKILL_OK and nothing else.",
+        "",
+      ].join("\n"),
+    );
+
+    const threadId = `thr_live_${skillName}`;
+    sendRequest("s", "thread/start", {
+      threadId,
+      cwd: workspaceDir,
+      instructionMode: "append",
+      options: FULL_OPTIONS,
+      input: [
+        {
+          type: "text",
+          text: `/${skillName}`,
+          mentions: [
+            {
+              start: 0,
+              end: skillName.length + 1,
+              resource: {
+                kind: "command",
+                trigger: "/",
+                name: skillName,
+                source: "skill",
+                origin: "project",
+                label: skillName,
+                argumentHint: null,
+              },
+            },
+          ],
+        },
+      ],
+    });
+    await waitFor("the thread/start response", () =>
+      responses().some((reply) => reply.id === "s"),
+    );
+    const startReply = responses().find((reply) => reply.id === "s")!;
+    expect(startReply.error).toBeUndefined();
+    const providerThreadId = String(startReply.result?.providerThreadId);
+
+    const record = sessionTableForTests().byThread(threadId);
+    cleanupSession = {
+      activeSessionId: record!.activeSessionId!,
+      sessionFile: record?.sessionFile,
+      name: threadId,
+    };
+
+    // The worker discovered the skill and lists it as a skill-sourced command
+    // — the daemon command listing the "/" menu mirrors.
+    await withTestClient(async (client) => {
+      const listing = await client.request({
+        type: "get_commands",
+        activeSessionId: record!.activeSessionId!,
+      });
+      expect(listing.success, `get_commands failed: ${listing.error}`).toBe(true);
+      const entries =
+        (listing.data as { commands?: Array<{ name?: string; source?: string }> })
+          .commands ?? [];
+      expect(
+        entries.some(
+          (entry) =>
+            entry.name === `skill:${skillName}` && entry.source === "skill",
+        ),
+      ).toBe(true);
+    });
+
+    // The slash mention reached prime as `/skill:<name>` and prime ran it:
+    // the reply is the skill's own instruction, not an echo of the mention.
+    await waitFor("the skill turn to settle", () =>
+      deltas(threadId).some(
+        (delta) => delta.kind === "turn.boundary" && delta.status === "completed",
+      ),
+    );
+    const streamed = deltas(threadId)
+      .filter((delta) => delta.kind === "item.textDelta")
+      .map((delta) => String(delta.text))
+      .join("");
+    expect(streamed).toContain("BBPA_SKILL_OK");
+    expect(providerThreadId).toMatch(/^prime_/);
+
+    // Release through the bridge (the supported detach path) before the
+    // afterEach removes the daemon session.
+    sendRequest("r", "thread/stop", {
+      threadId,
+      providerThreadId,
+      intent: "release",
+      activeTurnId: "turn-live-skill",
+    });
+    await waitFor("the release response", () =>
+      responses().some((reply) => reply.id === "r"),
+    );
+    expect(sessionTableForTests().byThread(threadId)).toBeUndefined();
   },
   180_000,
 );

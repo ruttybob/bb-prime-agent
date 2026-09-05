@@ -16,7 +16,9 @@ describe("the host artifact", () => {
 
   it("exports a host RPC entry beside the bridge", () => {
     expect(hostEntry.experimental_apiVersion).toBe(1);
-    expect(Object.keys(hostEntry.contract)).toEqual([]);
+    // The native-roots contract (bbpa-ggf.8): bb calls `resolveNativeRoots`
+    // when it lists prime's skills for the "/" menu.
+    expect(Object.keys(hostEntry.contract)).toEqual(["resolveNativeRoots"]);
   });
 
   it("ignores non-JSON lines and answers unknown methods with METHOD_NOT_FOUND", () => {
