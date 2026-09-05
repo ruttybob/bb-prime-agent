@@ -61,11 +61,11 @@ prime-agent появляется в bb как первоклассный про�
 
 ## Open questions
 
-- Спайк: как параметры `create` daemon-протокола передают per-session настройки (аналог `-ne`, скиллы, расширения) — на уровне сессии или только settings.json.
-- Спайк: канал dynamic tools bb → prime (кандидат — MCP-мост через `replace_acp_mcp_servers`).
-- Спайк: наличие `cancel_rlm_child` в 0.7.3 (в master есть; если нет — чем останавливать субагента).
-- Форма пикера расширений в настройках провайдера (какие данные показывает, как мапится на повторные `-e`).
-- Черновик именования провайдера: id `prime-agent`, displayName `Prime Agent` — подтвердить при спеке.
+- Спайк: как параметры `create` daemon-протокола передают per-session настройки (аналог `-ne`, скиллы, расширения) — на уровне сессии или только settings.json. **Ответлено (спайк bbpa-ggf.1)**: всё per-session через `create.config` (`extensions`, `noExtensions`, `skills`/`noSkills`, cwd, модель+thinking, system prompt); `permissionModes` в 0.7.3 не существует — доверие декларируется только bb-стороной. См. `docs/spikes/0001-prime-daemon-protocol.md`.
+- Спайк: канал dynamic tools bb → prime (кандидат — MCP-мост через `replace_acp_mcp_servers`). **Ответлено**: кандидат в 0.7.3 не существует, MCP — не канал инструментов; выбран companion-extension через явный `create.config.extensions` при `noExtensions: true` (ADR-0003), живое доказательство в спайке.
+- Спайк: наличие `cancel_rlm_child` в 0.7.3 (в master есть; если нет — чем останавливать субагента). **Ответлено**: есть (minProtocol 7, без capability-gate); stop субагента v1 = cancel, без удаления из ledger.
+- Форма пикера расширений в настройках провайдера (какие данные показывает, как мапится на повторные `-e`). Осталась — дизайн-вопрос тикета bbpa-ggf.12; данные (список пользовательских расширений) отдаются `get_resource_snapshot`.
+- Черновик именования провайдера: id `prime-agent`, displayName `Prime Agent` — подтвердить при спеке. Осталось — подтверждается тикетом bbpa-ggf.2 (скелет плагина).
 
 ## Sources
 
