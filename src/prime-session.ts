@@ -196,6 +196,10 @@ export class PrimeSession {
       answer.snapshot?.summary?.sessionFile ?? this.record.sessionFile;
     this.record.sessionName =
       answer.snapshot?.summary?.sessionName ?? this.record.sessionName;
+    // The roster of live subagents as the daemon sees it right now: the panel's
+    // seed and, for an adopted session, the only record of children spawned
+    // while no bridge was attached.
+    this.record.snapshotChildren = answer.snapshot?.children ?? [];
     // The snapshot is the boundary: everything at or before its cursor is
     // already in it, so only strictly newer events stream.
     this.boundary = answer.lastEventCursor ?? answer.snapshot?.lastEventCursor;
@@ -454,9 +458,19 @@ export class PrimeSession {
 
   /**
    * Timeline deltas for a session adopted from another bridge process, built
-   * from the attach snapshot this lane just took.
+   * from the attach snapshot this lane just took: the transcript, then the
+   * subagents the roster still holds (live ones stay open, finished ones
+   * settle immediately).
    */
   snapshotDeltas(): void {
-    this.pushDeltas(this.translator.snapshotDeltas(this.record.snapshotMessages ?? []));
+    this.pushDeltas(
+      this.translator.snapshotDeltas(this.record.snapshotMessages ?? []),
+    );
+    this.pushDeltas(
+      this.translator.childrenDeltas(
+        this.record.snapshotChildren ?? [],
+        this.record.threadId,
+      ),
+    );
   }
 }

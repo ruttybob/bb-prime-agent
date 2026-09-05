@@ -29,6 +29,14 @@ import {
   usageShapeSchema,
   type AgentMessage,
 } from "./daemon/wire.js";
+import {
+  childActivityLabel,
+  childDelegationShape,
+  childResultDetail,
+  isChildLive,
+  parsePrimeChildren,
+  type PrimeChild,
+} from "./subagents/children.js";
 
 /**
  * prime-agent daemon session events → bb `ThreadDelta`s.
@@ -48,9 +56,10 @@ import {
  *   bb timeline meaning and is dropped by name; anything genuinely unknown is
  *   surfaced as `unhandled` rather than swallowed.
  *
- * The translator is stateless per thread apart from three bookkeeping maps
- * (streamed-tool shapes, still-open text streams, cumulative usage), which
- * `resetThread` clears at every provider id-space boundary.
+ * The translator is stateless per thread apart from four bookkeeping maps
+ * (streamed-tool shapes, still-open text streams, still-open delegation items,
+ * cumulative usage), which `resetThread` clears at every provider id-space
+ * boundary.
  */
 
 const ASSISTANT_STREAM_KEY = "assistant";
@@ -212,6 +221,8 @@ export interface TranslationContext {
 interface ThreadState {
   toolCalls: Map<string, ToolCallContext>;
   openTextStreams: Set<string>;
+  /** Child ids whose delegation item is open on the timeline. */
+  openDelegations: Set<string>;
   usage: ThreadEventTokenUsageBreakdown;
   /** Set between `compaction_start` and `compaction_end`; prime's reason decides the settlement. */
   compaction: { manual: boolean } | undefined;
@@ -221,6 +232,15 @@ export interface PrimeDeltaTranslator {
   translate(event: unknown, context: TranslationContext): ThreadDelta[];
   /** Deltas that rebuild a session's timeline from an attach snapshot. */
   snapshotDeltas(messages: readonly unknown[]): ThreadDelta[];
+  /**
+   * Deltas that put a session's snapshot children on the timeline: one
+   * delegation item per child, open-and-settled for finished ones, open-and-
+   * live for the ones still going. An adopted session's only record of
+   * subagents spawned outside bb is this roster, so unreadable entries are
+   * skipped rather than invented. `threadId` is the thread the snapshot
+   * belongs to — live child updates for it then find their item already open.
+   */
+  childrenDeltas(children: readonly unknown[], threadId: string): ThreadDelta[];
   /**
    * Deltas that settle the running turn after a soft stop (`abort`): open text
    * streams closed, the turn boundary `interrupted`. Prime's own `agent_end`
@@ -241,6 +261,7 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
     const created: ThreadState = {
       toolCalls: new Map(),
       openTextStreams: new Set(),
+      openDelegations: new Set(),
       usage: ZERO_TOKEN_USAGE,
       compaction: undefined,
     };
@@ -336,6 +357,61 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
         ),
       );
     }
+    return deltas;
+  }
+
+  /**
+   * One child's timeline deltas. Live children open once (tracked per thread,
+   * so prime's repeated updates become progress, not duplicate opens) and a
+   * terminal status settles the item exactly once. A child that settles
+   * without this bridge having seen it running — a snapshot's finished
+   * subagent, or an update racing the attach — is opened on the way past: bb
+   * has no row for it otherwise.
+   *
+   * The open carries `attach: "currentOrLast"` because a background child
+   * outlives the turn that spawned it: when prime's updates arrive after the
+   * boundary, the item still lands on the turn that has the child's history
+   * instead of being dropped for having no open turn.
+   */
+  function childDeltas(child: PrimeChild, threadId: string): ThreadDelta[] {
+    const key: DeltaItemKey = { providerItemId: child.id, channel: "delegation" };
+    const shape = childDelegationShape(child);
+    const state = stateFor(threadId);
+    const deltas: ThreadDelta[] = [];
+    if (!state.openDelegations.has(child.id)) {
+      state.openDelegations.add(child.id);
+      deltas.push({
+        kind: "item.open",
+        key,
+        item: shape,
+        attach: "currentOrLast",
+      });
+    }
+    if (isChildLive(child)) {
+      const progress =
+        child.recap?.trim() || childActivityLabel(child) || "subagent is running";
+      deltas.push({
+        kind: "item.progress",
+        key,
+        message: progress,
+        snapshot: shape,
+      });
+      return deltas;
+    }
+    state.openDelegations.delete(child.id);
+    const resultText = childResultDetail(child);
+    deltas.push({
+      kind: "item.close",
+      key,
+      item: shape,
+      status:
+        child.status === "done"
+          ? "completed"
+          : child.status === "cancelled"
+            ? "interrupted"
+            : "failed",
+      ...(resultText === undefined ? {} : { resultText }),
+    });
     return deltas;
   }
 
@@ -642,45 +718,7 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
         if (!parsed.success) {
           return unhandled(event, context);
         }
-        const child = parsed.data.child;
-        const status = child.status;
-        const key: DeltaItemKey = { providerItemId: child.id, channel: "delegation" };
-        if (status === "queued" || status === "running") {
-          return [
-            {
-              kind: "item.open",
-              key,
-              item: {
-                type: "delegation",
-                childRef: child.activeSessionId ?? child.id,
-                label: child.label ?? "subagent",
-                background: true,
-              },
-            },
-            {
-              kind: "item.progress",
-              key,
-              ...(child.recap === undefined
-                ? {}
-                : { message: child.recap }),
-            },
-          ];
-        }
-        return [
-          {
-            kind: "item.close",
-            key,
-            item: {
-              type: "delegation",
-              childRef: child.activeSessionId ?? child.id,
-              label: child.label ?? "subagent",
-              background: true,
-            },
-            status:
-              status === "done" ? "completed" : status === "cancelled" ? "interrupted" : "failed",
-            ...(child.recap === undefined ? {} : { resultText: child.recap }),
-          },
-        ];
+        return childDeltas(parsed.data.child, context.threadId);
       }
 
       default:
@@ -803,6 +841,11 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
   return {
     translate,
     snapshotDeltas,
+    childrenDeltas(children, threadId) {
+      return parsePrimeChildren(children).flatMap((child) =>
+        childDeltas(child, threadId),
+      );
+    },
     interruptDeltas(threadId) {
       const deltas = closeOpenStreams({ threadId, cwd: undefined });
       deltas.push({ kind: "turn.boundary", status: "interrupted" });

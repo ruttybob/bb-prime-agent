@@ -16,7 +16,10 @@ describe("the host artifact", () => {
 
   it("exports a host RPC entry beside the bridge", () => {
     expect(hostEntry.experimental_apiVersion).toBe(1);
-    expect(Object.keys(hostEntry.contract)).toEqual([]);
+    // The Subagents panel's per-machine backend (bbpa-ggf.9): the one method
+    // the plugin server may ask this machine's daemon client for.
+    expect(Object.keys(hostEntry.contract)).toEqual(["subagents.roster"]);
+    expect(hostEntry.experimental_signals).toBeDefined();
   });
 
   it("ignores non-JSON lines and answers unknown methods with METHOD_NOT_FOUND", () => {

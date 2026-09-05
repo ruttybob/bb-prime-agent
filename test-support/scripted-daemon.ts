@@ -30,6 +30,8 @@ export interface ScriptedDaemonHandle {
   enqueueCreate(args?: Partial<ScriptedSession>): void;
   enqueueAttach(args?: {
     messages?: readonly unknown[];
+    /** The session's live subagents, as `snapshot.children` carries them. */
+    children?: readonly unknown[];
     lastEventSequence?: number;
     lastEventCursor?: { generation: string; sequence: number };
   }): void;
@@ -130,7 +132,7 @@ export function createScriptedDaemon(
         pushes: [],
       });
     },
-    enqueueAttach({ messages, lastEventSequence, lastEventCursor } = {}) {
+    enqueueAttach({ messages, children, lastEventSequence, lastEventCursor } = {}) {
       // The reported cursor is the daemon's clock at snapshot time: events the
       // bridge never saw (out-of-band work on a resident session) move it past
       // anything this bridge has counted, and later prompts number from there.
@@ -145,6 +147,7 @@ export function createScriptedDaemon(
           snapshot: {
             activeSessionId: session.activeSessionId,
             messages: messages ?? [],
+            ...(children === undefined ? {} : { children }),
             lastEventSequence: lastEventSequence ?? sequence,
             lastEventCursor: cursor,
           },

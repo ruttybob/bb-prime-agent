@@ -11,6 +11,13 @@ export const PRIME_PROVIDER_ID = "prime-agent";
 export const PRIME_DISPLAY_NAME = "Prime Agent";
 
 /**
+ * The provider thread id the bridge mints (`prime_<activeSessionId>`): the
+ * daemon-derived half names the resident session, which is how the Subagents
+ * panel gets from a bb thread to a roster.
+ */
+export const PRIME_PROVIDER_THREAD_PREFIX = "prime_";
+
+/**
  * Operator override for the daemon socket; declared in the provider's
  * `env.passthrough` so the daemon forwards it into the bridge process.
  */
@@ -33,3 +40,10 @@ export const PRIME_INSTALL_URL = "https://app.primeintellect.ai/prime-agent/inst
  */
 export const PRIME_NO_SANDBOX_NOTICE =
   "prime-agent runs without a sandbox: model-generated code executes with your user permissions, and bb adds no confirmation gates on top.";
+
+/**
+ * The realtime channel the plugin server republishes host roster changes on
+ * (bbpa-ggf.9). Plain data on purpose, so the frontend can subscribe without
+ * bundling the subagents contracts' zod trees.
+ */
+export const SUBAGENTS_REALTIME_CHANNEL = "subagents";

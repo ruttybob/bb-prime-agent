@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { primeChildSchema } from "../subagents/children.js";
 
 /**
  * Typed views of the daemon wire facts this bridge actually consumes.
@@ -66,6 +67,8 @@ export const daemonSessionSnapshotSchema = z
     activeSessionId: z.string(),
     summary: daemonSessionSummarySchema.optional(),
     messages: z.array(z.unknown()).default([]),
+    /** The session's live RLM children (the Subagents panel roster, bbpa-ggf.9). */
+    children: z.array(z.unknown()).optional(),
     lastEventSequence: z.number().optional(),
     lastEventCursor: daemonEventCursorSchema.optional(),
   })
@@ -215,16 +218,7 @@ export const autoRetryEndEventSchema = z
 export const rlmChildUpdateEventSchema = z
   .object({
     type: z.literal("rlm_child_update"),
-    child: z
-      .object({
-        id: z.string(),
-        label: z.string().optional(),
-        status: z.string().optional(),
-        activeSessionId: z.string().optional(),
-        recap: z.string().optional(),
-        error: z.string().optional(),
-      })
-      .passthrough(),
+    child: primeChildSchema,
   })
   .passthrough();
 
