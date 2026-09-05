@@ -9,8 +9,9 @@ import type { PrimeSession } from "./prime-session.js";
  * from it, so it is stable across bridge processes), `sessionFile` is the
  * durable artifact bb's thread points at, and `session` is the live lane that
  * streams prime's events into the thread. The table stays process-local by
- * design — a bridge process rediscovers its sessions on `thread/resume`
- * (bbpa-ggf.4 owns the cross-process file-based discovery).
+ * design — a bridge process rediscovers a thread's session on `thread/resume`
+ * (bbpa-ggf.4): the persisted `prime_<activeSessionId>` names the resident
+ * session, and no record needs to outlive the process that made it.
  */
 export interface SessionRecord {
   threadId: string;

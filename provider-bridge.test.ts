@@ -6,6 +6,7 @@ import {
 import { BRIDGE_JSON_RPC_ERRORS } from "@get-bb/plugin-sdk/provider-bridge";
 import {
   currentConfiguredSkillRoots,
+  experimental_providerBridge,
   handleLine,
   resetDaemonForTests,
   sessionTableForTests,
@@ -92,6 +93,23 @@ async function waitForResponse(id: string, timeoutMs = 2_000): Promise<Response>
     }
     if (Date.now() > deadline) {
       throw new Error(`no response with id ${id} within ${timeoutMs}ms`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/**
+ * `onClose` releases its sessions fire-and-forget (the runtime is already
+ * gone); wait until the soft-stop chain has reached the daemon.
+ */
+async function flushedTeardown(timeoutMs = 2_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (daemon.commands.some((command) => command.type === "detach")) {
+      return;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`teardown never reached the daemon within ${timeoutMs}ms`);
     }
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
@@ -535,6 +553,104 @@ describe("the snapshot and live event boundary", () => {
     });
   });
 
+  it("a reopened thread shows the work that continued in the daemon after bb closed", async () => {
+    // bb starts the thread, then closes before prompting it: the bridge process
+    // goes away with an empty timeline for the thread.
+    const providerThreadId = await startThread("t1", "thr_1");
+    resetDaemonForTests();
+    sessionTableForTests().clear();
+
+    // While bb is gone the resident session keeps working for an out-of-band
+    // client: two full exchanges land in the transcript, including bb's own
+    // first prompt, which bb itself never saw answered.
+    daemon.enqueueAttach({
+      messages: [
+        { role: "user", content: "summarise the tree" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "the oak is tallest" }],
+          stopReason: "stop",
+        },
+        { role: "user", content: "now count the birds" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "three birds" }],
+          stopReason: "stop",
+        },
+      ],
+      lastEventSequence: 12,
+      lastEventCursor: { generation: "gen-0", sequence: 12 },
+    });
+    // Reopening: a NEW bridge process (empty table) attaches to the same
+    // resident session by its daemon-derived provider thread id.
+    sendRequest("t2", "thread/resume", {
+      threadId: "thr_1",
+      providerThreadId,
+      cwd,
+      instructionMode: "append",
+      options: FULL_OPTIONS,
+    });
+    expect(await waitForResponse("t2")).toMatchObject({
+      result: { providerThreadId, sessionRestorable: true },
+    });
+    expect(notifications("thread/identity").at(-1)?.params).toMatchObject({
+      threadId: "thr_1",
+      providerThreadId,
+    });
+
+    // The whole history — including the out-of-band exchange — comes from the
+    // snapshot, in order, exactly once. (The first `session.reset` is the
+    // original process's construction, the second the reopen's boundary.)
+    const threadDeltas = deltas("thr_1");
+    expect(threadDeltas.map((delta) => delta.kind)).toEqual([
+      "session.reset",
+      "session.reset",
+      "input.provider",
+      "item.open",
+      "input.provider",
+      "item.open",
+    ]);
+    expect(threadDeltas[4]).toMatchObject({
+      kind: "input.provider",
+      text: "now count the birds",
+    });
+    expect(threadDeltas[5]).toMatchObject({
+      item: { type: "agentMessage", text: "three birds" },
+    });
+
+    // The snapshot is the boundary: what the daemon already counted stays
+    // history, and what comes next streams into the reopened thread.
+    collected = [];
+    daemon.push({
+      type: "session_event",
+      activeSessionId: "sess_1",
+      event: { type: "agent_start" },
+      meta: { sequence: 12, cursor: { generation: "gen-0", sequence: 12 } },
+    });
+    expect(deltas("thr_1")).toEqual([]);
+    daemon.enqueuePrompt({ events: textTurnEvents({ text: "three" }) });
+    sendRequest("t3", "turn/start", {
+      threadId: "thr_1",
+      providerThreadId,
+      input: [{ type: "text", text: "and again", mentions: [] }],
+      clientRequestId: CLIENT_REQUEST_ID,
+      options: FULL_OPTIONS,
+    });
+    await waitForResponse("t3");
+    const afterReopen = deltas("thr_1").map((delta) => delta.kind);
+    expect(afterReopen).toEqual([
+      "input.accepted",
+      "turn.open",
+      "item.textDelta",
+      "item.textClose",
+      "usage",
+      "turn.boundary",
+    ]);
+    expect(deltas("thr_1").find((delta) => delta.kind === "item.textClose")).toMatchObject({
+      text: "three",
+    });
+  });
+
   it("does not replay snapshot content for a session this process already knows", async () => {
     const providerThreadId = await startThread("t1", "thr_1");
     daemon.enqueueAttach({
@@ -675,21 +791,189 @@ describe("stop, release and discard", () => {
     expect(sessionTableForTests().byThread("thr_1")).toBeUndefined();
   });
 
-  it("discard drops the record; the daemon session file is left for bbpa-ggf.4", async () => {
+  it("release during a running turn soft-stops it and keeps the resident session", async () => {
     const providerThreadId = await startThread("t1", "thr_1");
+    daemon.enqueuePrompt({ events: [{ type: "agent_start" }] });
+    sendRequest("t2", "turn/start", {
+      threadId: "thr_1",
+      providerThreadId,
+      input: [{ type: "text", text: "count to 40", mentions: [] }],
+      clientRequestId: CLIENT_REQUEST_ID,
+      options: FULL_OPTIONS,
+    });
+    await waitForResponse("t2");
+
     daemon.enqueueOk("abort");
     daemon.enqueueOk("detach");
+    sendRequest("t3", "thread/stop", {
+      threadId: "thr_1",
+      providerThreadId,
+      intent: "release",
+      activeTurnId: null,
+    });
+    const reply = await waitForResponse("t3");
+    expect(reply.result).toEqual({ ok: true });
+    // Release is the soft path end to end: the open turn is aborted so prime
+    // stops streaming, and neither the daemon state nor the session file is
+    // touched — discard is the only path that removes them.
+    expect(daemon.commands.map((command) => command.type)).toEqual([
+      "create",
+      "attach",
+      "prompt",
+      "abort",
+      "detach",
+    ]);
+    expect(daemon.commands).not.toContainEqual(expect.objectContaining({ type: "kill" }));
+    expect(daemon.commands).not.toContainEqual(
+      expect.objectContaining({ type: "delete_saved_session" }),
+    );
+    expect(sessionTableForTests().byThread("thr_1")).toBeUndefined();
+  });
+
+  it("discard removes the session for good: abort, kill, then the record's own sessionFile", async () => {
+    const providerThreadId = await startThread("t1", "thr_1");
+    daemon.enqueueOk("detach");
+    daemon.enqueueOk("kill");
+    daemon.enqueueOk("delete_saved_session");
     sendRequest("t2", "thread/discard", {
       threadId: "thr_1",
       providerThreadId,
     });
     const reply = await waitForResponse("t2");
     expect(reply.result).toEqual({ ok: true });
-    expect(daemon.commands).not.toContainEqual(expect.objectContaining({ type: "kill" }));
-    expect(daemon.commands).not.toContainEqual(
-      expect.objectContaining({ type: "delete_saved_session" }),
-    );
+    // The session this thread's record names — and nothing else — is addressed.
+    expect(daemon.commands.map((command) => command.type)).toEqual([
+      "create",
+      "attach",
+      "detach",
+      "kill",
+      "delete_saved_session",
+    ]);
+    expect(daemon.commands.find((command) => command.type === "kill")).toMatchObject({
+      activeSessionId: "sess_1",
+    });
+    expect(
+      daemon.commands.find((command) => command.type === "delete_saved_session"),
+    ).toMatchObject({ sessionPath: "/tmp/prime/sessions/sess_1.jsonl" });
     expect(sessionTableForTests().byThread("thr_1")).toBeUndefined();
+  });
+
+  it("discard soft-stops an open turn before removing the session", async () => {
+    const providerThreadId = await startThread("t1", "thr_1");
+    daemon.enqueuePrompt({ events: [{ type: "agent_start" }] });
+    sendRequest("t2", "turn/start", {
+      threadId: "thr_1",
+      providerThreadId,
+      input: [{ type: "text", text: "count to 40", mentions: [] }],
+      clientRequestId: CLIENT_REQUEST_ID,
+      options: FULL_OPTIONS,
+    });
+    await waitForResponse("t2");
+
+    daemon.enqueueOk("abort");
+    daemon.enqueueOk("detach");
+    daemon.enqueueOk("kill");
+    daemon.enqueueOk("delete_saved_session");
+    sendRequest("t3", "thread/discard", {
+      threadId: "thr_1",
+      providerThreadId,
+    });
+    const reply = await waitForResponse("t3");
+    expect(reply.result).toEqual({ ok: true });
+    const types = daemon.commands.map((command) => command.type);
+    // Soft stop (abort) first: prime stops streaming and the transcript is
+    // closed on disk before the daemon state and the file are removed.
+    expect(types.indexOf("abort")).toBeGreaterThan(-1);
+    expect(types.indexOf("abort")).toBeLessThan(types.indexOf("kill"));
+    expect(types.indexOf("kill")).toBeLessThan(types.indexOf("delete_saved_session"));
+  });
+
+  it("discard skips the kill when the daemon already closed the session", async () => {
+    const providerThreadId = await startThread("t1", "thr_1");
+    daemon.push({
+      type: "session_closed",
+      activeSessionId: "sess_1",
+      reason: "killed",
+    });
+    daemon.enqueueOk("delete_saved_session");
+    sendRequest("t2", "thread/discard", {
+      threadId: "thr_1",
+      providerThreadId,
+    });
+    const reply = await waitForResponse("t2");
+    expect(reply.result).toEqual({ ok: true });
+    // Nothing live to stop or kill: the transcript file is all that is left.
+    expect(daemon.commands.map((command) => command.type)).toEqual([
+      "create",
+      "attach",
+      "detach",
+      "delete_saved_session",
+    ]);
+    expect(sessionTableForTests().byThread("thr_1")).toBeUndefined();
+  });
+
+  it("discard of a session whose create never answered cleans up nothing on the daemon", async () => {
+    sendRequest("t1", "thread/start", {
+      threadId: "thr_1",
+      cwd,
+      instructionMode: "append",
+      options: FULL_OPTIONS,
+    });
+    // No `create` block: the construction fails and drops the record.
+    await waitForResponse("t1");
+    expect(sessionTableForTests().byThread("thr_1")).toBeUndefined();
+    // A late discard for the same thread finds no daemon identity to address.
+    sendRequest("t2", "thread/discard", {
+      threadId: "thr_1",
+      providerThreadId: "prime_sess_1",
+    });
+    const reply = await waitForResponse("t2");
+    expect(reply.result).toEqual({ ok: true });
+    // The only daemon traffic is the failed create from the start above.
+    expect(daemon.commands.map((command) => command.type)).toEqual(["create"]);
+  });
+
+  it("a failed discard surfaces a legible error and keeps the record so a retry converges", async () => {
+    const providerThreadId = await startThread("t1", "thr_1");
+    daemon.enqueueOk("detach");
+    daemon.enqueueOk("kill");
+    daemon.enqueueFail("delete_saved_session", "Cannot delete the currently active session");
+    sendRequest("t2", "thread/discard", {
+      threadId: "thr_1",
+      providerThreadId,
+    });
+    const reply = await waitForResponse("t2");
+    expect(reply.error?.code).toBe(BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR);
+    expect(reply.error?.message).toContain("could not discard the prime-agent session");
+    expect(reply.error?.message).toContain("delete_saved_session failed:");
+    // bb still owns the thread: the record stays so a retry can finish.
+    expect(sessionTableForTests().byThread("thr_1")).toBeDefined();
+
+    // The retry: the daemon state is already closed, so the kill is not
+    // repeated — only the remaining file removal runs, and the discard lands.
+    daemon.enqueueOk("delete_saved_session");
+    sendRequest("t3", "thread/discard", {
+      threadId: "thr_1",
+      providerThreadId,
+    });
+    expect((await waitForResponse("t3")).result).toEqual({ ok: true });
+    expect(daemon.commands.filter((command) => command.type === "kill")).toHaveLength(1);
+    expect(
+      daemon.commands.filter((command) => command.type === "delete_saved_session"),
+    ).toHaveLength(2);
+    expect(sessionTableForTests().byThread("thr_1")).toBeUndefined();
+  });
+
+  it("discard of a thread the bridge holds no record for answers ok without touching the daemon", async () => {
+    sendRequest("t1", "thread/discard", {
+      threadId: "thr_unknown",
+      providerThreadId: "prime_sess_other",
+    });
+    const reply = await waitForResponse("t1");
+    expect(reply.result).toEqual({ ok: true });
+    // Only the session identity recorded on this bridge's own records is ever
+    // addressed — an unknown provider thread id names nothing to clean.
+    expect(daemon.commands).toEqual([]);
   });
 });
 
@@ -787,5 +1071,60 @@ describe("methods that need work the later tickets own", () => {
         canInstall: false,
       },
     });
+  });
+});
+
+describe("process teardown (closing bb)", () => {
+  /**
+   * The sessions are daemon-resident on purpose: the daemon outlives this
+   * bridge process, so closing bb must let go of the sessions — never remove
+   * them. A released thread comes back through `thread/resume`.
+   */
+  it("closing bb releases the sessions and keeps them resident: no kill on close", async () => {
+    await startThread("t1", "thr_1");
+    daemon.enqueueOk("detach");
+    experimental_providerBridge.onClose?.();
+    await flushedTeardown();
+    expect(daemon.commands.map((command) => command.type)).toEqual([
+      "create",
+      "attach",
+      "detach",
+    ]);
+    expect(daemon.commands).not.toContainEqual(expect.objectContaining({ type: "kill" }));
+    expect(daemon.commands).not.toContainEqual(
+      expect.objectContaining({ type: "delete_saved_session" }),
+    );
+    expect(sessionTableForTests().all()).toEqual([]);
+  });
+
+  it("closing bb mid-turn soft-stops the turn and still keeps the session", async () => {
+    const providerThreadId = await startThread("t1", "thr_1");
+    daemon.enqueuePrompt({ events: [{ type: "agent_start" }] });
+    sendRequest("t2", "turn/start", {
+      threadId: "thr_1",
+      providerThreadId,
+      input: [{ type: "text", text: "count to 40", mentions: [] }],
+      clientRequestId: CLIENT_REQUEST_ID,
+      options: FULL_OPTIONS,
+    });
+    await waitForResponse("t2");
+
+    daemon.enqueueOk("abort");
+    daemon.enqueueOk("detach");
+    experimental_providerBridge.onClose?.();
+    await flushedTeardown();
+    // Even a running turn only gets the soft stop: the daemon session and its
+    // file survive the close, and the turn can continue for another client.
+    expect(daemon.commands.map((command) => command.type)).toEqual([
+      "create",
+      "attach",
+      "prompt",
+      "abort",
+      "detach",
+    ]);
+    expect(daemon.commands).not.toContainEqual(expect.objectContaining({ type: "kill" }));
+    expect(daemon.commands).not.toContainEqual(
+      expect.objectContaining({ type: "delete_saved_session" }),
+    );
   });
 });
