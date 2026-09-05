@@ -14,14 +14,24 @@ import {
 import {
   daemonAttachResultSchema,
   daemonCreateResultSchema,
+  primeModelSchema,
   sessionClosedSchema,
   sessionEventEnvelopeSchema,
+  thinkingLevelChangedEventSchema,
   type DaemonEventCursor,
+  type PrimeConnectionState,
+  type PrimeModel,
   type SessionEventEnvelope,
 } from "./daemon/wire.js";
 import {
+  PRIME_THINKING_LADDER,
   buildPrimeCreateCommand,
+  canonicalPrimeModelId,
+  primeThinkingLevel,
+  splitPrimeModelId,
+  supportedPrimeThinkingLevels,
   type PrimeDynamicToolsConfig,
+  type PrimeThinkingLevel,
 } from "./session-params.js";
 import { asWireCommand } from "./daemon/transport.js";
 import type { SessionRecord } from "./session-table.js";
@@ -58,12 +68,41 @@ export interface StartSessionArgs {
   dynamicTools?: PrimeDynamicToolsConfig | undefined;
 }
 
+/**
+ * The session facts the lane tracks about prime's side of the wire: the model
+ * and thinking level the session is actually on (so a turn's `options` are
+ * reconciled against reality, not against what bb last asked for), the levels
+ * that model accepts (so an unsupported level is refused instead of prime's
+ * silent clamp), and the compaction flags. prime reports all of it on every
+ * attach snapshot's `state`; after that the lane keeps it current.
+ */
+export interface PrimeSessionState {
+  /** Canonical `provider/modelId`, as bb spells models. */
+  model: string | undefined;
+  /** prime's own spelling of the current model, when known. */
+  primeModel: PrimeModel | undefined;
+  thinkingLevel: PrimeThinkingLevel | undefined;
+  availableThinkingLevels: readonly PrimeThinkingLevel[];
+  isCompacting: boolean;
+  autoCompactionEnabled: boolean | undefined;
+}
+
+/** Why the lane published a state snapshot off the timeline (`provider/raw`). */
+export type PrimeSessionStateSource = "attach" | "turn-options" | "daemon-event";
+
 export interface PrimeSessionOptions {
   record: SessionRecord;
   emit: (deltas: { threadId: string; deltas: readonly ThreadDelta[] }) => void;
   subscribePush: (listener: (message: DaemonPushMessage) => void) => () => void;
   request: (command: { type: string } & Record<string, unknown>, args?: { timeoutMs?: number }) => Promise<DaemonCommandResult>;
   ensureConnected: () => Promise<DaemonHello>;
+  /**
+   * Off-timeline state mirror (`provider/raw {method: "prime.session_state"}`),
+   * published whenever the lane learns or changes model/thinking/compaction
+   * facts. bb's delta grammar has no row for these; the raw mirror is the
+   * honest carrier (and what the live lane asserts against).
+   */
+  onState?: (state: PrimeSessionState, source: PrimeSessionStateSource) => void;
 }
 
 function readCommandData<T>(
@@ -85,10 +124,15 @@ function readCommandData<T>(
   return parsed.data;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export class PrimeSession {
   private readonly record: SessionRecord;
   private readonly emit: PrimeSessionOptions["emit"];
   private readonly request: PrimeSessionOptions["request"];
+  private readonly onState: PrimeSessionOptions["onState"];
   private readonly translator: PrimeDeltaTranslator;
   private readonly unsubscribe: () => void;
 
@@ -102,11 +146,29 @@ export class PrimeSession {
   private openTurn:
     | { clientRequestId?: ClientTurnRequestId; settledLocally: boolean }
     | undefined;
+  /** prime's side of the session: model, thinking ladder, compaction flags. */
+  private state: PrimeSessionState = {
+    model: undefined,
+    primeModel: undefined,
+    thinkingLevel: undefined,
+    availableThinkingLevels: [],
+    isCompacting: false,
+    autoCompactionEnabled: undefined,
+  };
+  /**
+   * Set when prime reports a manual compaction under way, cleared when it
+   * reports the end. prime answers a refused compaction with an error *and*
+   * with `compaction_*` events when it did run (e.g. "nothing to compact"),
+   * and the difference decides whether the bridge has to settle the turn
+   * itself (`compactManually`).
+   */
+  private compactionStarted = false;
 
   constructor(options: PrimeSessionOptions) {
     this.record = options.record;
     this.emit = options.emit;
     this.request = options.request;
+    this.onState = options.onState;
     this.translator = createPrimeDeltaTranslator();
     this.unsubscribe = options.subscribePush((message) => this.handlePush(message));
   }
@@ -117,6 +179,11 @@ export class PrimeSession {
 
   get hasOpenTurn(): boolean {
     return this.openTurn !== undefined && !this.openTurn.settledLocally;
+  }
+
+  /** The session facts as the lane currently believes them (tests, mirrors). */
+  currentState(): PrimeSessionState {
+    return { ...this.state };
   }
 
   /**
@@ -149,6 +216,16 @@ export class PrimeSession {
     this.record.activeSessionId = created.activeSessionId;
     this.record.sessionFile = created.sessionFile;
     this.record.sessionName = created.sessionName;
+    // The create funnel is the session's initial model/thinking state; attach
+    // (right below) replaces it with prime's own report, which is the truth
+    // the next turn's options are reconciled against.
+    this.state = {
+      ...this.state,
+      model: args.model,
+      primeModel: undefined,
+      thinkingLevel: primeThinkingLevel(args.reasoningLevel),
+      availableThinkingLevels: [],
+    };
     await this.attach();
     // The provider thread id is daemon-derived, so a resumed thread points at
     // the same session no matter which bridge process created it. The bridge
@@ -191,6 +268,13 @@ export class PrimeSession {
       answer.snapshot?.summary?.sessionFile ?? this.record.sessionFile;
     this.record.sessionName =
       answer.snapshot?.summary?.sessionName ?? this.record.sessionName;
+    // The snapshot's `state` is prime's own report of what the session runs:
+    // the model, the thinking ladder that model accepts, and the compaction
+    // flags. Everything the model/compaction work reconciles against.
+    if (answer.snapshot?.state !== undefined) {
+      this.adoptState(answer.snapshot.state);
+      this.publishState("attach");
+    }
     // The snapshot is the boundary: everything at or before its cursor is
     // already in it, so only strictly newer events stream.
     this.boundary = answer.lastEventCursor ?? answer.snapshot?.lastEventCursor;
@@ -204,6 +288,163 @@ export class PrimeSession {
       if (!this.isStale(push)) {
         this.deliver(push);
       }
+    }
+  }
+
+  /** Take over the session facts prime just reported about itself. */
+  private adoptState(state: PrimeConnectionState): void {
+    const ladder = (state.availableThinkingLevels ?? []).filter((level): level is PrimeThinkingLevel =>
+      (PRIME_THINKING_LADDER as readonly string[]).includes(level),
+    );
+    this.state = {
+      model:
+        state.model !== undefined ? canonicalPrimeModelId(state.model) : this.state.model,
+      primeModel: state.model,
+      thinkingLevel:
+        (state.thinkingLevel ?? undefined) === undefined
+          ? this.state.thinkingLevel
+          : ((state.thinkingLevel ?? undefined) as PrimeThinkingLevel | undefined),
+      availableThinkingLevels: ladder,
+      isCompacting: state.isCompacting ?? false,
+      autoCompactionEnabled: state.autoCompactionEnabled,
+    };
+  }
+
+  /** Publish the session facts off the timeline (`provider/raw`, no deltas). */
+  private publishState(source: PrimeSessionStateSource): void {
+    this.onState?.({ ...this.state }, source);
+  }
+
+  /**
+   * Reconcile a turn's execution options onto the running session: prime
+   * switches model and thinking level in place (`set_model`/`set_thinking_level`
+   * on the same resident session — no rebuild, no id-space boundary), so a
+   * thread's model applies from its next turn on. A no-op change sends nothing.
+   *
+   * Throws honestly when bb asks for a thinking level the (target) model does
+   * not support: prime would clamp silently and write the clamped level into
+   * the user's global settings, which is not ours to cause.
+   */
+  async applyTurnOptions(args: {
+    model?: string | undefined;
+    reasoningLevel?: ReasoningLevel | undefined;
+  }): Promise<void> {
+    if (this.record.activeSessionId === undefined) {
+      // The turn path checks this first; nothing to reconcile against.
+      return;
+    }
+    const target = args.model === undefined ? undefined : splitPrimeModelId(args.model);
+    if (target !== undefined && this.state.model !== args.model) {
+      const model = await this.setModel(target);
+      // A model switch re-clamps the level on prime's side; keep the level only
+      // if the new ladder still has it, "unknown" otherwise.
+      const kept = this.state.thinkingLevel;
+      this.state = {
+        ...this.state,
+        model: canonicalPrimeModelId(model),
+        primeModel: model,
+        availableThinkingLevels: supportedPrimeThinkingLevels(model),
+        thinkingLevel: supportedPrimeThinkingLevels(model).includes(kept ?? "off")
+          ? kept
+          : undefined,
+      };
+    }
+    const level = primeThinkingLevel(args.reasoningLevel);
+    if (level === undefined) {
+      // bb levels prime has no word for (ultracode/ultra) stay untranslated.
+      return;
+    }
+    if (this.state.thinkingLevel === level) {
+      // The session already runs it (a level prime clamped into place is
+      // exactly this case) — send nothing, whatever the reported ladder says.
+      return;
+    }
+    const ladder = this.state.availableThinkingLevels;
+    if (ladder.length > 0 && !ladder.includes(level)) {
+      throw new Error(
+        `prime-agent model ${this.state.model ?? "(unknown)"} does not offer thinking level "${level}"${
+          ladder.length > 0 ? ` (it offers: ${ladder.join(", ")})` : ""
+        }; pick one of the model's supported levels`,
+      );
+    }
+    await this.request(
+      asWireCommand({
+        type: "set_thinking_level",
+        activeSessionId: this.record.activeSessionId,
+        level,
+      }),
+    );
+    this.state = { ...this.state, thinkingLevel: level };
+    this.publishState("turn-options");
+  }
+
+  /** `set_model`, answered with the model prime switched to. */
+  private async setModel(target: {
+    provider: string;
+    modelId: string;
+  }): Promise<PrimeModel> {
+    const result = readCommandData(
+      await this.request(
+        asWireCommand({
+          type: "set_model",
+          activeSessionId: this.record.activeSessionId!,
+          provider: target.provider,
+          modelId: target.modelId,
+        }),
+      ),
+      "set_model",
+      (data) => {
+        // prime answers with the model object itself (older wires may wrap it).
+        const candidate =
+          isRecord(data) && isRecord(data.model) ? data.model : data;
+        const parsed = primeModelSchema.safeParse(candidate);
+        return parsed.success
+          ? { success: true as const, data: parsed.data }
+          : { success: false as const, issues: "no model in the answer" };
+      },
+    );
+    return result;
+  }
+
+  /**
+   * Manual compaction (bb's standalone builtin `/compact` prompt): prime
+   * compacts the resident session in place and streams `compaction_start`/
+   * `compaction_end` events, which the translator turns into the timeline —
+   * a manual compaction opens its own turn and settles it, so this method
+   * only has to settle the turn itself when prime never started compacting
+   * (a refusal that streamed no events, e.g. the session is gone).
+   */
+  async compactManually(): Promise<void> {
+    if (this.record.activeSessionId === undefined) {
+      throw new Error("cannot compact before the session is created");
+    }
+    this.compactionStarted = false;
+    let refused: string | undefined;
+    try {
+      const result = await this.request(
+        asWireCommand({ type: "compact", activeSessionId: this.record.activeSessionId }),
+      );
+      if (!result.success) {
+        refused = result.error ?? "the daemon refused the compaction";
+      }
+    } catch (error) {
+      refused = error instanceof Error ? error.message : String(error);
+    }
+    if (refused !== undefined && !this.compactionStarted) {
+      // Prime never streamed a compaction: nothing else will settle this turn.
+      this.pushDeltas([
+        {
+          kind: "provider.error",
+          message: "prime-agent could not compact the context",
+          detail: refused,
+        },
+        {
+          kind: "turn.boundary",
+          status: "failed",
+          error: { message: refused },
+          claimIfIdle: true,
+        },
+      ]);
     }
   }
 
@@ -261,6 +502,7 @@ export class PrimeSession {
   }
 
   private deliver(push: SessionEventEnvelope): void {
+    this.trackSessionFacts(push.event);
     const sequence = push.meta?.sequence;
     if (typeof sequence === "number" && this.lastSequence >= 0 && sequence <= this.lastSequence) {
       return;
@@ -288,6 +530,42 @@ export class PrimeSession {
       return;
     }
     this.emit({ threadId: this.record.threadId, deltas });
+  }
+
+  /**
+   * Track the session facts prime announces in its event stream: the thinking
+   * level (moves on `set_thinking_level` and whenever prime re-clamps after a
+   * model switch) and the compaction flags. None of these has a bb timeline
+   * row — the compaction *events* do, and the translator renders them — so the
+   * lane only keeps them current and mirrors them off the timeline.
+   */
+  private trackSessionFacts(event: unknown): void {
+    if (typeof event !== "object" || event === null) {
+      return;
+    }
+    const type = (event as Record<string, unknown>).type;
+    if (type === "thinking_level_changed") {
+      const parsed = thinkingLevelChangedEventSchema.safeParse(event);
+      if (parsed.success && typeof parsed.data.level === "string") {
+        this.state = {
+          ...this.state,
+          thinkingLevel: parsed.data.level as PrimeThinkingLevel,
+        };
+        this.publishState("daemon-event");
+      }
+      return;
+    }
+    if (type === "compaction_start") {
+      this.compactionStarted = true;
+      this.state = { ...this.state, isCompacting: true };
+      this.publishState("daemon-event");
+      return;
+    }
+    if (type === "compaction_end") {
+      this.compactionStarted = false;
+      this.state = { ...this.state, isCompacting: false };
+      this.publishState("daemon-event");
+    }
   }
 
   /** bb prompt text: the text parts joined; skill/command mentions are bbpa-ggf.8. */

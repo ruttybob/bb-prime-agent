@@ -544,18 +544,34 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
         const manual = stateFor(context.threadId).compaction?.manual ?? true;
         stateFor(context.threadId).compaction = undefined;
         const aborted = parsed.data.aborted === true;
+        const errorMessage = parsed.data.errorMessage;
+        // prime skips benignly ("nothing to compact yet"): a warning-severity
+        // end is not a compaction, so it must not claim one.
+        const skipped =
+          !aborted && errorMessage !== undefined && parsed.data.errorSeverity === "warning";
         const failed =
           !aborted &&
-          typeof parsed.data.errorMessage === "string" &&
+          errorMessage !== undefined &&
           parsed.data.errorSeverity !== "warning";
+        if (skipped) {
+          const warning: ThreadDelta = {
+            kind: "provider.warning",
+            category: "compaction-skipped",
+            summary: "Context compaction skipped",
+            details: errorMessage,
+            vouchedTurn: true,
+          };
+          // The compaction item opened for this closes with the turn (nothing
+          // was compacted, so there is no compaction row to settle); a manual
+          // compaction still owes bb its turn boundary.
+          return manual ? [warning, { kind: "turn.boundary", status: "completed" }] : [warning];
+        }
         const close: ThreadDelta = {
           kind: "item.close",
           key: { channel: "compaction" },
           item: { type: "compaction" },
           status: aborted ? "interrupted" : failed ? "failed" : "completed",
-          ...(parsed.data.errorMessage === undefined
-            ? {}
-            : { resultText: parsed.data.errorMessage }),
+          ...(errorMessage === undefined ? {} : { resultText: errorMessage }),
         };
         if (!manual) {
           const automatic: ThreadDelta[] = [close];
@@ -563,7 +579,7 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
             automatic.push({
               kind: "provider.error",
               message: "prime-agent failed to compact the context",
-              detail: parsed.data.errorMessage,
+              detail: errorMessage,
             });
           } else if (!aborted) {
             automatic.push({ kind: "context.compacted" });
@@ -577,9 +593,7 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
         manualDeltas.push({
           kind: "turn.boundary",
           status: aborted ? "interrupted" : failed ? "failed" : "completed",
-          ...(parsed.data.errorMessage === undefined
-            ? {}
-            : { error: { message: parsed.data.errorMessage } }),
+          ...(errorMessage === undefined ? {} : { error: { message: errorMessage } }),
           claimIfIdle: true,
         });
         return manualDeltas;

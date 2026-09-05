@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ReasoningLevel } from "@get-bb/plugin-sdk/provider-bridge";
+import type { PrimeModel } from "./daemon/wire.js";
 import { BB_TOOLS_CHANNEL_FLAG } from "./dynamic-tools/protocol.js";
 
 /**
@@ -72,6 +73,67 @@ export function primeThinkingLevel(
     case undefined:
       return undefined;
   }
+}
+
+/** The ladder prime's models speak, in prime's own order. */
+export const PRIME_THINKING_LADDER: readonly PrimeThinkingLevel[] = [
+  "off",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+/**
+ * The levels a model accepts, exactly as prime computes them
+ * (`getSupportedThinkingLevels`, pi-ai `dist/models.js`): a non-reasoning
+ * model takes "off" only, a level marked `null` in the model's
+ * `thinkingLevelMap` is dropped, and `xhigh`/`max` additionally need an
+ * explicit entry. This is the authority for refusing an unsupported level
+ * instead of letting prime clamp it silently — prime's clamp also writes the
+ * clamped level into the user's global settings.
+ */
+export function supportedPrimeThinkingLevels(
+  model: Pick<PrimeModel, "reasoning" | "thinkingLevelMap">,
+): PrimeThinkingLevel[] {
+  if (model.reasoning !== true) {
+    return ["off"];
+  }
+  return PRIME_THINKING_LADDER.filter((level) => {
+    const mapped = model.thinkingLevelMap?.[level];
+    if (mapped === null) {
+      return false;
+    }
+    if (level === "xhigh" || level === "max") {
+      return mapped !== undefined;
+    }
+    return true;
+  });
+}
+
+/** bb's model id for a prime model: `provider/modelId`. */
+export function canonicalPrimeModelId(model: PrimeModel): string {
+  return `${model.provider}/${model.id}`;
+}
+
+/**
+ * Split a bb model id back into prime's `set_model`/`create.config` fields.
+ * The split is at the first `/`: model ids may themselves contain slashes
+ * (openrouter's `openrouter/openai/gpt-…`), providers never do.
+ */
+export function splitPrimeModelId(
+  model: string,
+): { provider: string; modelId: string } | undefined {
+  const slash = model.indexOf("/");
+  if (slash <= 0 || slash === model.length - 1) {
+    return undefined;
+  }
+  return {
+    provider: model.slice(0, slash),
+    modelId: model.slice(slash + 1),
+  };
 }
 
 /**
@@ -180,6 +242,9 @@ export function buildPrimeCreateCommand(
   args: PrimeCreateCommandArgs,
 ): PrimeCreateCommand {
   const thinking = primeThinkingLevel(args.reasoningLevel);
+  // bb carries models as `provider/modelId` (the shape `model/list` answers
+  // with); prime wants the two parts separately in `create.config`.
+  const model = args.model === undefined ? undefined : splitPrimeModelId(args.model);
   return {
     type: "create",
     name: primeSessionName({ threadId: args.threadId, title: args.title }),
@@ -189,7 +254,7 @@ export function buildPrimeCreateCommand(
       agentDir: primeAgentDir(),
       noExtensions: true,
       noSkills: false,
-      ...(args.model === undefined ? {} : { model: args.model }),
+      ...(model === undefined ? {} : { provider: model.provider, model: model.modelId }),
       ...(thinking === undefined ? {} : { thinking }),
       ...extensionConfigFields(args),
     },

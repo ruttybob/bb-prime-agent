@@ -734,7 +734,8 @@ describe("session bookkeeping", () => {
 describe("methods that need work the later tickets own", () => {
   it("answers with a legible not-yet error, never silence", async () => {
     const notYet: Array<[string, unknown]> = [
-      ["model/list", {}],
+      // model/list is wired now: it answers from the daemon catalog
+      // (provider-bridge.models.test.ts).
       ["provider/installation/status", { providerId: "prime-agent" }],
       ["provider/installation/run", { providerId: "prime-agent", action: "install" }],
       [

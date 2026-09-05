@@ -45,9 +45,10 @@ export function primeProviderDeclaration(): PluginProviderDeclaration {
       // prime can fork a session from a message (`fork` + fork points), but
       // the wiring is bbpa-ggf.3; the handshake narrows this to "none" today.
       fork: "none",
-      // prime compacts on its own schedule (`set_auto_compaction`); manual
-      // compaction lands with the resident-session work.
-      supportsManualCompaction: false,
+      // Manual compaction is the standalone builtin `/compact` prompt, which
+      // the bridge maps onto prime's `compact` command (bbpa-ggf.6); prime
+      // also compacts on its own schedule (threshold/overflow).
+      supportsManualCompaction: true,
       supportsThreadArchive: false,
       supportsThreadRename: false,
       // full-only, with the no-sandbox notice (see the module docs).

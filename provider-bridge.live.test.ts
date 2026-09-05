@@ -88,15 +88,34 @@ afterEach(async () => {
   if (stale !== undefined) {
     try {
       await withTestClient(async (client) => {
-        await client.request({
-          type: "kill",
-          activeSessionId: stale.activeSessionId,
-        });
-        if (stale.sessionFile !== undefined) {
+        // A killed resident session is flushed asynchronously, so one
+        // kill+delete round can leave it right back in the list; converge.
+        for (let attempt = 0; attempt < 5; attempt += 1) {
+          const listing = await client.request({ type: "list" });
+          const sessions =
+            (listing.data as {
+              sessions?: Array<{
+                activeSessionId: string;
+                sessionFile?: string;
+              }>;
+            }).sessions ?? [];
+          const mine = sessions.find(
+            (session) => session.activeSessionId === stale.activeSessionId,
+          );
+          if (mine === undefined) {
+            return;
+          }
           await client.request({
-            type: "delete_saved_session",
-            sessionPath: stale.sessionFile,
+            type: "kill",
+            activeSessionId: stale.activeSessionId,
           });
+          if (mine.sessionFile !== undefined) {
+            await client.request({
+              type: "delete_saved_session",
+              sessionPath: mine.sessionFile,
+            });
+          }
+          await new Promise((resolve) => setTimeout(resolve, 300));
         }
       });
     } catch {
@@ -394,6 +413,256 @@ it.skipIf(!LIVE)(
         providerThreadId: String(providerThreadId),
       });
     }
+  },
+  180_000,
+);
+
+/**
+ * The live model/thinking/compaction surface (bbpa-ggf.6): the catalog answered
+ * from the machine's prime, a thinking-level switch applied to the running
+ * session, and a manual `/compact` mapped onto prime's compaction. Owns one
+ * "[bb] " session, named with a nonce, and removes exactly that one.
+ */
+it.skipIf(!LIVE)(
+  "lists the machine's models and switches thinking level live",
+  async () => {
+    const nonce = Math.random().toString(36).slice(2, 8);
+    const threadId = `thr_live_models_${nonce}`;
+
+    // --- model/list: prime's own catalog, translated. ---
+    sendRequest("ml", "model/list", { cwd: workspaceDir });
+    await waitFor("the model/list response", () =>
+      responses().some((reply) => reply.id === "ml"),
+    );
+    const catalog = responses().find((reply) => reply.id === "ml")!;
+    expect(catalog.error).toBeUndefined();
+    const models = (catalog.result?.models ?? []) as Array<{
+      id: string;
+      model: string;
+      displayName: string;
+      isDefault: boolean;
+      supportedReasoningEfforts: Array<{ reasoningEffort: string }>;
+    }>;
+    expect(models.length).toBeGreaterThan(0);
+    // bb's shape: provider/modelId ids, exactly one default, every model
+    // carries the efforts its thinking ladder supports.
+    for (const model of models) {
+      expect(model.id).toMatch(/^[^/]+\/.+/);
+      expect(model.model).toBe(model.id);
+      expect(model.displayName.length).toBeGreaterThan(0);
+      expect(model.supportedReasoningEfforts.length).toBeGreaterThan(0);
+    }
+    expect(models.filter((model) => model.isDefault)).toHaveLength(1);
+    // The throwaway catalog lane is gone: no "[bb] model catalog" session.
+    await withTestClient(async (client) => {
+      const listing = await client.request({ type: "list" });
+      const sessions =
+        (listing.data as { sessions?: Array<{ sessionName?: string }> }).sessions ?? [];
+      expect(
+        sessions.filter((session) =>
+          String(session.sessionName ?? "").includes("model catalog"),
+        ),
+      ).toEqual([]);
+    });
+
+    // --- A thread of our own. ---
+    sendRequest("s", "thread/start", {
+      threadId,
+      cwd: workspaceDir,
+      instructionMode: "append",
+      options: FULL_OPTIONS,
+    });
+    await waitFor("the thread/start response", () =>
+      responses().some((reply) => reply.id === "s"),
+    );
+    const startReply = responses().find((reply) => reply.id === "s")!;
+    expect(startReply.error).toBeUndefined();
+    const providerThreadId = String(startReply.result?.providerThreadId);
+    const record = sessionTableForTests().byThread(threadId)!;
+    cleanupSession = {
+      activeSessionId: record.activeSessionId!,
+      sessionFile: record.sessionFile,
+      name: record.sessionName ?? threadId,
+    };
+
+    // A second, passive daemon connection watches the session events prime
+    // pushes, so the switch is observed on the wire, not through the bridge.
+    const raw = new PrimeDaemonClient({
+      socketPath: resolveDaemonSocketPath(),
+      clientId: "bbpa-live-models",
+    });
+    const sessionEvents: Array<Record<string, unknown>> = [];
+    raw.onPush = (message) => {
+      if (
+        message.type === "session_event" &&
+        (message as { activeSessionId?: string }).activeSessionId ===
+          record.activeSessionId
+      ) {
+        sessionEvents.push(
+          (message as unknown as { event: Record<string, unknown> }).event,
+        );
+      }
+    };
+    await raw.connect();
+    try {
+      // The level bb asks for must be one the session's model actually offers
+      // and it must differ from what the session already runs, so this really
+      // is a switch. Ask prime what it offers before asking bb to move; the
+      // passive client attaches so prime routes the session's events to it.
+      await raw.request({ type: "attach", activeSessionId: record.activeSessionId! });
+      const state = await raw.request({
+        type: "get_connection_state",
+        activeSessionId: record.activeSessionId!,
+      });
+      const data = state.data as
+        | {
+            thinkingLevel?: string;
+            availableThinkingLevels?: string[];
+          }
+        | undefined;
+      const ladder = (data?.availableThinkingLevels ?? []).filter(
+        (candidate): candidate is "low" | "medium" | "high" | "xhigh" | "max" =>
+          candidate === "low" ||
+          candidate === "medium" ||
+          candidate === "high" ||
+          candidate === "xhigh" ||
+          candidate === "max",
+      );
+      const current = data?.thinkingLevel;
+      const level =
+        [...ladder].reverse().find((candidate) => candidate !== current) ??
+        current ??
+        "high";
+      const switched = level !== current;
+
+      sendRequest("t", "turn/start", {
+        threadId,
+        providerThreadId,
+        input: [
+          {
+            type: "text",
+            text: "Reply with exactly: ok. Use no tools.",
+            mentions: [],
+          },
+        ],
+        clientRequestId: "creq_bbseteffab",
+        options: { ...FULL_OPTIONS, reasoningLevel: level },
+      });
+      await waitFor("the switch turn to settle", () => {
+        // Fail fast when the bridge refused the switch instead of waiting out.
+        const reply = responses().find((response) => response.id === "t");
+        if (reply?.error !== undefined) {
+          throw new Error(`turn/start failed: ${JSON.stringify(reply.error)}`);
+        }
+        return deltas(threadId).some((delta) => delta.kind === "turn.boundary");
+      });
+      expect(
+        responses().find((response) => response.id === "t")?.error,
+      ).toBeUndefined();
+      if (!switched) {
+        // A model with a single-level ladder: nothing to switch, nothing to
+        // observe — the no-op is the correct answer.
+        return;
+      }
+      // prime announced the new level on the wire...
+      await waitFor("the thinking_level_changed event", () =>
+        sessionEvents.some(
+          (event) =>
+            event.type === "thinking_level_changed" && event.level === level,
+        ),
+      );
+      // ...and the bridge mirrored the session facts off the timeline.
+      const sessionStates = messages()
+        .filter(
+          (message): message is { method: string; params: Record<string, unknown> } =>
+            typeof message === "object" &&
+            message !== null &&
+            (message as Record<string, unknown>).method === "provider/raw",
+        )
+        .map((message) => message.params as Record<string, unknown>)
+        .filter((params) => params.method === "prime.session_state")
+        .map((params) => params.params as Record<string, unknown>);
+      expect(sessionStates.at(-1)).toMatchObject({
+        threadId,
+        thinkingLevel: level,
+        autoCompactionEnabled: expect.any(Boolean),
+      });
+    } finally {
+      raw.close();
+    }
+
+    // --- Manual compaction: the standalone builtin /compact prompt. ---
+    const boundariesBefore = deltas(threadId).filter(
+      (delta) => delta.kind === "turn.boundary",
+    ).length;
+    sendRequest("c", "turn/start", {
+      threadId,
+      providerThreadId,
+      input: [
+        {
+          type: "text",
+          text: "/compact",
+          mentions: [
+            {
+              start: 0,
+              end: 8,
+              resource: {
+                kind: "command",
+                trigger: "/",
+                name: "compact",
+                source: "command",
+                origin: "builtin",
+                label: "Compact",
+                argumentHint: null,
+              },
+            },
+          ],
+        },
+      ],
+      clientRequestId: "creq_bbcmpctabc",
+      options: FULL_OPTIONS,
+    });
+    await waitFor("the compaction turn to settle", () => {
+      const reply = responses().find((response) => response.id === "c");
+      if (reply?.error !== undefined) {
+        throw new Error(`compaction failed: ${JSON.stringify(reply.error)}`);
+      }
+      return (
+        deltas(threadId).filter((delta) => delta.kind === "turn.boundary")
+          .length > boundariesBefore
+      );
+    });
+    expect(responses().find((response) => response.id === "c")?.error).toBeUndefined();
+    const compactionKinds = deltas(threadId)
+      .slice(
+        deltas(threadId)
+          .map((delta) => delta.kind)
+          .lastIndexOf("input.accepted"),
+      )
+      .map((delta) => delta.kind);
+    // A fresh thread has nothing to compact: prime skips it benignly, and the
+    // timeline says skipped — never that it compacted.
+    if (compactionKinds.includes("provider.warning")) {
+      expect(compactionKinds).not.toContain("context.compacted");
+      expect(
+        deltas(threadId).find((delta) => delta.kind === "provider.warning"),
+      ).toMatchObject({ category: "compaction-skipped" });
+    } else {
+      expect(compactionKinds).toContain("item.open");
+      expect(compactionKinds).toContain("context.compacted");
+    }
+    expect(compactionKinds.at(-1)).toBe("turn.boundary");
+
+    // Release: the bridge lets go, then cleanup removes the session.
+    sendRequest("r", "thread/stop", {
+      threadId,
+      providerThreadId,
+      intent: "release",
+      activeTurnId: null,
+    });
+    await waitFor("the release response", () =>
+      responses().some((reply) => reply.id === "r"),
+    );
   },
   180_000,
 );

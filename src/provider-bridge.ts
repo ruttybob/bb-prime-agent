@@ -8,6 +8,7 @@ import {
   createBridgeIo,
   createPendingToolCallTracker,
   experimental_defineProviderBridge,
+  isStandaloneBuiltinCompactCommand,
   initializeParamsSchema,
   modelListParamsSchema,
   providerMaintenanceParamsSchema,
@@ -44,6 +45,7 @@ import {
   onDaemonPush,
   resetDaemonConnectionForTests,
 } from "./daemon/connection.js";
+import { primeAvailableModels } from "./model-catalog.js";
 import { resolveDaemonSocketPath } from "./daemon/socket.js";
 import { PrimeSession } from "./prime-session.js";
 import {
@@ -237,6 +239,23 @@ function laneFor(record: SessionRecord): PrimeSession {
     subscribePush: onDaemonPush,
     request: (command, args) => daemonRequest(command, args),
     ensureConnected: ensureDaemonConnection,
+    // bb's delta grammar has no row for model/thinking/compaction *state*; the
+    // lane mirrors it off the timeline so it stays observable (tests, debug).
+    onState: (state, source) => {
+      notify(BRIDGE_NOTIFICATION_METHODS.providerRaw, {
+        method: "prime.session_state",
+        params: {
+          threadId: record.threadId,
+          providerThreadId: record.providerThreadId,
+          source,
+          model: state.model,
+          thinkingLevel: state.thinkingLevel,
+          availableThinkingLevels: [...state.availableThinkingLevels],
+          isCompacting: state.isCompacting,
+          autoCompactionEnabled: state.autoCompactionEnabled,
+        },
+      });
+    },
   });
   record.session = session;
   return session;
@@ -281,6 +300,8 @@ async function runTurn(args: {
   record: SessionRecord;
   input: readonly PromptInput[];
   clientRequestId: ClientTurnRequestId | undefined;
+  model?: string | undefined;
+  reasoningLevel?: ReasoningLevel | undefined;
 }): Promise<void> {
   const { record } = args;
   record.turns += 1;
@@ -289,10 +310,53 @@ async function runTurn(args: {
       { kind: "input.accepted", clientRequestId: args.clientRequestId },
     ]);
   }
-  await sessionFor(record).turn({
+  const session = sessionFor(record);
+  // Per-thread settings ride every turn: prime switches model and thinking
+  // level in place, so they apply from this turn on (a no-op sends nothing).
+  await session.applyTurnOptions({
+    model: args.model,
+    reasoningLevel: args.reasoningLevel,
+  });
+  await session.turn({
     clientRequestId: args.clientRequestId,
     input: args.input,
   });
+}
+
+/**
+ * bb has no compaction request method: manual compaction is the standalone
+ * builtin `/compact` prompt travelling the normal turn pipeline (protocol doc
+ * §Capabilities). The bridge maps it onto prime's `compact` command instead of
+ * prompting, and prime's own compaction events stream the timeline — a manual
+ * compaction opens and settles its own turn.
+ */
+async function runManualCompaction(args: {
+  record: SessionRecord;
+  clientRequestId: ClientTurnRequestId | undefined;
+}): Promise<void> {
+  args.record.turns += 1;
+  if (args.clientRequestId !== undefined) {
+    emitDeltas(args.record.threadId, [
+      { kind: "input.accepted", clientRequestId: args.clientRequestId },
+    ]);
+  }
+  await sessionFor(args.record).compactManually();
+}
+
+/** The turn pipeline: a `/compact` prompt compacts, everything else prompts. */
+function runTurnOrCompaction(args: {
+  record: SessionRecord;
+  input: readonly PromptInput[];
+  clientRequestId: ClientTurnRequestId | undefined;
+  model?: string | undefined;
+  reasoningLevel?: ReasoningLevel | undefined;
+}): Promise<void> {
+  return isStandaloneBuiltinCompactCommand(args.input)
+    ? runManualCompaction({
+        record: args.record,
+        clientRequestId: args.clientRequestId,
+      })
+    : runTurn(args);
 }
 
 type RequestHandler = (id: JsonRpcId, params: unknown) => void | Promise<void>;
@@ -343,8 +407,20 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.modelList, parsed.error.issues);
       return;
     }
-    throw new Error(
-      "prime-agent model catalog is not wired yet: it is translated from the daemon's get_model_catalog with the models ticket (bbpa-ggf.6)",
+    // prime's own catalog, no curated list on our side. A daemon that cannot
+    // answer (no `model_catalog` capability, no signed-in provider) is an
+    // honest error for the picker, never a crash.
+    return primeAvailableModels({ cwd: parsed.data.cwd }).then(
+      (answer) => {
+        io.sendResult(id, answer);
+      },
+      (error: unknown) => {
+        io.sendError(
+          id,
+          BRIDGE_JSON_RPC_ERRORS.BRIDGE_ERROR,
+          error instanceof Error ? error.message : String(error),
+        );
+      },
     );
   },
 
@@ -611,11 +687,14 @@ const handlers: Record<string, RequestHandler> = {
       );
       return;
     }
-    return runTurn({
+    const settled = runTurnOrCompaction({
       record,
       input: parsed.data.input,
       clientRequestId: parsed.data.clientRequestId,
-    }).then(() => {
+      model: parsed.data.options.model,
+      reasoningLevel: parsed.data.options.reasoningLevel,
+    });
+    return settled.then(() => {
       io.sendResult(id, {});
     });
   },

@@ -32,11 +32,25 @@ export interface ScriptedDaemonHandle {
     messages?: readonly unknown[];
     lastEventSequence?: number;
     lastEventCursor?: { generation: string; sequence: number };
+    /** prime's own report of the session (`AgentConnectionState`), read loosely. */
+    state?: Record<string, unknown>;
   }): void;
   /** Answer the next `prompt` with prime's early admission, then stream events. */
   enqueuePrompt(args: { events: readonly unknown[] }): void;
   /** Answer a command with `{success:true}` and no data. */
   enqueueOk(commandType: string): void;
+  /** Answer a command with `{success:true}` and the given data payload. */
+  enqueueData(commandType: string, data: unknown): void;
+  /**
+   * Enqueue an arbitrary block: a `{success:true, data}` or `{success:false,
+   * error}` answer, plus session events pushed with it (compaction, abort, …).
+   */
+  enqueue(args: {
+    commandType: string;
+    data?: unknown;
+    error?: string;
+    events?: readonly unknown[];
+  }): void;
   /** Answer a command with a daemon-side failure. */
   enqueueFail(commandType: string, error: string): void;
   /** Push a message to the bridge directly (out-of-band daemon chatter). */
@@ -130,7 +144,7 @@ export function createScriptedDaemon(
         pushes: [],
       });
     },
-    enqueueAttach({ messages, lastEventSequence, lastEventCursor } = {}) {
+    enqueueAttach({ messages, lastEventSequence, lastEventCursor, state } = {}) {
       const cursor = lastEventCursor ?? { generation, sequence };
       blocks.push({
         commandType: "attach",
@@ -138,6 +152,7 @@ export function createScriptedDaemon(
           activeSessionId: session.activeSessionId,
           snapshot: {
             activeSessionId: session.activeSessionId,
+            ...(state === undefined ? {} : { state }),
             messages: messages ?? [],
             lastEventSequence: lastEventSequence ?? sequence,
             lastEventCursor: cursor,
@@ -168,6 +183,27 @@ export function createScriptedDaemon(
     },
     enqueueOk(commandType) {
       blocks.push({ commandType, answer: ok(commandType), pushes: [] });
+    },
+    enqueueData(commandType, data) {
+      blocks.push({ commandType, answer: ok(commandType, data), pushes: [] });
+    },
+    enqueue({ commandType, data, error, events = [] }) {
+      blocks.push({
+        commandType,
+        answer:
+          error !== undefined
+            ? { command: commandType, success: false, error }
+            : ok(commandType, data),
+        pushes: events.map((event) => {
+          sequence += 1;
+          return {
+            type: "session_event",
+            activeSessionId: session.activeSessionId,
+            event,
+            meta: { sequence, cursor: { generation, sequence } },
+          } satisfies DaemonPushMessage;
+        }),
+      });
     },
     enqueueFail(commandType, error) {
       blocks.push({
