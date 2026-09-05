@@ -130,6 +130,16 @@ refuses while the child is resident-and-running. Children appear in
   skills/commands: `get_resource_snapshot`, `get_commands`.
 - Multi-client badge: `SessionSummary.attachedClients` via `get_state`/`list` — **no push
   event for attach/detach of others** (`daemon-session-list.d.ts:40`; `daemon-mode.js:2148`).
+- **Command idempotency journal** (`command-recovery-journal.js`, `daemon-supervisor.js:1008`):
+  when an envelope carries a **clientId**, every *mutating* command is journaled under
+  `(clientId, envelope id)` and a repeat gets the recorded response **replayed instead of
+  executed** (an interrupted one answers `command_result_uncertain`). Found live: a test
+  client that reused a fixed clientId and `bb-N` ids had its `prompt` answered with an
+  earlier run's recorded `delete_saved_session` response. Consequences: the bridge must
+  keep sending **no clientId** (every command executes; the journal never applies), and
+  test/ops clients must mint a fresh clientId per connection or cleanup commands silently
+  no-op across runs. Session events go only to **attached** clients — an out-of-band
+  prompter must `attach` first to see them.
 - Socket/autostart: default `os.tmpdir()/prime-agent-<uid>/daemon.sock` (mode 0600;
   `daemon-socket.js:28-32`); `ensureInteractiveDaemonRunning` probes hello, spawns
   `--mode daemon` when absent, treats a `stale` daemon as replace-only-if-idle

@@ -100,6 +100,8 @@ export class PrimeSession {
   private lastSequence = -1;
   private attached = false;
   private closed = false;
+  /** The daemon told us it closed this session (prime quit it, eviction, …). */
+  private daemonClosed = false;
   /** The turn this lane is driving, while prime streams it. */
   private openTurn:
     | { clientRequestId?: ClientTurnRequestId; settledLocally: boolean }
@@ -235,6 +237,7 @@ export class PrimeSession {
     if (closed.success && closed.data.activeSessionId === this.record.activeSessionId) {
       // The daemon closed the session (prime quit it, update restart, …). The
       // session file survives on disk; the lane stops streaming.
+      this.daemonClosed = true;
       this.closed = true;
       return;
     }
@@ -386,6 +389,67 @@ export class PrimeSession {
     this.translator.resetThread(this.record.threadId);
     this.unsubscribe();
     this.closed = true;
+  }
+
+  /**
+   * Discard: soft-stop anything running, then remove the session for good —
+   * `kill` closes the daemon's state (reason "killed") and `delete_saved_session`
+   * trashes the transcript file. Only the session identity this lane holds is
+   * ever addressed: the `activeSessionId` and `sessionFile` on this record.
+   *
+   * A failed step throws one legible error naming it — the caller decides
+   * whether to surface it, since a half-removed session (daemon state closed
+   * but the file still on disk, say) is the user's to know about. Both steps
+   * are one-way: a session the daemon already closed (a `session_closed` push,
+   * or this lane's own successful kill) is not killed again, and deleting a
+   * file that is already gone succeeds on the daemon — so a retried discard
+   * converges instead of failing twice.
+   */
+  async destroy(): Promise<void> {
+    await this.release();
+    const failures: string[] = [];
+    if (!this.daemonClosed && this.record.activeSessionId !== undefined) {
+      try {
+        const killed = await this.request(
+          asWireCommand({
+            type: "kill",
+            activeSessionId: this.record.activeSessionId,
+          }),
+        );
+        if (!killed.success) {
+          throw new Error(killed.error ?? "unknown daemon error");
+        }
+        // The push listener is gone (release), so the daemon's own
+        // `session_closed` push cannot mark this: record the fact here.
+        this.daemonClosed = true;
+      } catch (error) {
+        failures.push(
+          `kill failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    if (this.record.sessionFile !== undefined) {
+      try {
+        const deleted = await this.request(
+          asWireCommand({
+            type: "delete_saved_session",
+            sessionPath: this.record.sessionFile,
+          }),
+        );
+        if (!deleted.success) {
+          throw new Error(deleted.error ?? "unknown daemon error");
+        }
+      } catch (error) {
+        failures.push(
+          `delete_saved_session failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
+    if (failures.length > 0) {
+      throw new Error(
+        `could not discard the prime-agent session for thread ${this.record.threadId} (${failures.join("; ")}); the session or its transcript may remain`,
+      );
+    }
   }
 
   /**

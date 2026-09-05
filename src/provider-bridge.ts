@@ -61,9 +61,12 @@ import {
  * (`src/session-params.ts` is the only place those params are built),
  * `turn/start` prompts it and streams prime's session events into the bb
  * timeline as deltas (`src/delta-translation.ts`), and `thread/stop` soft-stops
- * (`abort`) so the session file survives. Discard still leaves the daemon
- * session in place — deleting it (`kill` + `delete_saved_session`) is
- * bbpa-ggf.4, together with cross-process session discovery.
+ * (`abort`) so the session file survives. Sessions are daemon-owned: closing bb
+ * (or releasing a thread) leaves the session running in the
+ * daemon, and a reopen (`thread/resume` by the daemon-derived provider thread
+ * id) attaches to it and rebuilds the timeline from the attach snapshot
+ * (bbpa-ggf.4). Discard is the one destructive path: soft stop, then `kill` +
+ * `delete_saved_session` for exactly the session the thread's record names.
  */
 type JsonRpcId = string | number;
 
@@ -323,9 +326,13 @@ const handlers: Record<string, RequestHandler> = {
       capabilities: {
         // The assembler speaks v3 only; a narrower range is refused at spawn.
         grammarVersions: [THREAD_DELTA_GRAMMAR_V3, THREAD_DELTA_GRAMMAR_V3],
-        // Sessions are daemon-resident, but restoring a provider thread across
-        // bridge processes (saved-session discovery) is bbpa-ggf.4.
-        sessionRestore: false,
+        // A bb thread survives its bridge process: the provider thread id is
+        // daemon-derived (`prime_<activeSessionId>`), so a reopened thread
+        // attaches to the same resident session and rebuilds its timeline from
+        // the attach snapshot. Restore needs the daemon holding the session —
+        // when the daemon itself is gone, resume answers a legible error
+        // (recovery across a daemon restart is bbpa-ggf.11).
+        sessionRestore: true,
         threadArchive: false,
         threadRename: false,
         threadGoalClear: false,
@@ -474,8 +481,9 @@ const handlers: Record<string, RequestHandler> = {
           announceSession(record);
           // bb persists this thread's timeline, so the snapshot is not replayed
           // as content — except when the session was adopted from a previous
-          // bridge process, where the snapshot is the only source the bridge
-          // ever sees. bbpa-ggf.4 revisits this with saved-session discovery.
+          // bridge process (a reopened thread, or work that continued in the
+          // daemon after bb closed), where the snapshot is the only source of
+          // that history the bridge ever sees.
           if (adopted) {
             session.snapshotDeltas();
           }
@@ -553,16 +561,20 @@ const handlers: Record<string, RequestHandler> = {
     }
     return (async () => {
       const record = sessions.byThread(parsed.data.threadId);
-      if (record?.session !== undefined) {
-        await record.session.release();
-      }
+      // The bb tools channel never outlives a discard attempt: bb is tearing
+      // the thread down, and a resume re-arms the channel if the discard fails.
       await stopDynamicTools(record);
+      if (record?.session !== undefined) {
+        // Stop + cleanup: soft-stop the open turn, then `kill` +
+        // `delete_saved_session` for exactly the session id and file this
+        // thread's record names — never a session this bridge did not mint.
+        await record.session.destroy();
+      }
+      // A record without a session has no daemon identity to clean up (its
+      // `create` never answered), so there is nothing to address.
       if (record !== undefined) {
         sessions.drop(record.threadId);
       }
-      // The daemon session file is deliberately left in place until bbpa-ggf.4
-      // wires the daemon cleanup (`kill` + `delete_saved_session`); it stays a
-      // "[bb] "-prefixed session the user can still see from prime itself.
       io.sendResult(id, { ok: true });
     })();
   },

@@ -113,9 +113,13 @@ afterEach(async () => {
 async function withTestClient(
   run: (client: PrimeDaemonClient) => Promise<void>,
 ): Promise<void> {
+  // A fresh clientId per connection: the daemon journals mutating commands by
+  // (clientId, envelope id) and *replays the recorded response* on a repeat,
+  // so a fixed id would silently turn this run's kill/prompt into a previous
+  // run's recorded answer (see the spike's wire facts).
   const client = new PrimeDaemonClient({
     socketPath: resolveDaemonSocketPath(),
-    clientId: "bbpa-live-test",
+    clientId: `bbpa-live-test-${Math.random().toString(36).slice(2, 10)}`,
   });
   try {
     await client.connect();
@@ -179,6 +183,24 @@ async function waitFor(
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
+    if (Date.now() > deadline) {
+      throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+/** Same poll, for predicates that themselves talk to the daemon. */
+async function waitForAsync(
+  label: string,
+  predicate: () => Promise<boolean>,
+  timeoutMs = 90_000,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await predicate()) {
+      return;
+    }
     if (Date.now() > deadline) {
       throw new Error(`timed out after ${timeoutMs}ms waiting for ${label}`);
     }
@@ -397,6 +419,192 @@ it.skipIf(!LIVE)(
   },
   180_000,
 );
+
+/**
+ * The persistence lane, live: release keeps the session, work continues in the
+ * daemon, reopen rebuilds the timeline from the attach snapshot, and discard
+ * removes the session for good.
+ *
+ * Like the turn lane above, it creates exactly one session of its own ("[bb] "
+ * prefix + nonce), never touches a session it did not create, and cleans up via
+ * `kill` + `delete_saved_session` in `afterEach` — a successful discard beats
+ * it to it, and the failed kill on an already-removed session is swallowed.
+ */
+it.skipIf(!LIVE)(
+  "reopens a released thread from the daemon snapshot and discards it for good",
+  async () => {
+    const nonce = Math.random().toString(36).slice(2, 8);
+    const threadId = `thr_live_${nonce}`;
+    const prompt = "Reply with the single word: ok";
+
+    // --- thread/start: the resident session is created and answers once. ---
+    sendRequest("s", "thread/start", {
+      threadId,
+      cwd: workspaceDir,
+      instructionMode: "append",
+      options: FULL_OPTIONS,
+      input: [{ type: "text", text: prompt, mentions: [] }],
+    });
+    await waitFor("the thread/start response", () =>
+      responses().some((reply) => reply.id === "s"),
+    );
+    const startReply = responses().find((reply) => reply.id === "s")!;
+    expect(startReply.error).toBeUndefined();
+    const providerThreadId = String(startReply.result?.providerThreadId);
+    expect(providerThreadId).toMatch(/^prime_/);
+    await waitFor("the first turn to settle", () =>
+      deltas(threadId).some(
+        (delta) => delta.kind === "turn.boundary" && delta.status === "completed",
+      ),
+    );
+
+    const record = sessionTableForTests().byThread(threadId);
+    const activeSessionId = record!.activeSessionId!;
+    const sessionFile = record!.sessionFile!;
+    const name = record!.sessionName!;
+    expect(name).toBe(primeSessionName({ threadId, title: prompt }));
+    expect(existsSync(sessionFile)).toBe(true);
+    // Every path below is covered by this cleanup if the test fails midway.
+    cleanupSession = { activeSessionId, sessionFile, name };
+
+    // --- release: bb lets go; the daemon session and its file stay. ---
+    sendRequest("r", "thread/stop", {
+      threadId,
+      providerThreadId,
+      intent: "release",
+      activeTurnId: null,
+    });
+    await waitFor("the release response", () =>
+      responses().some((reply) => reply.id === "r"),
+    );
+    expect(sessionTableForTests().byThread(threadId)).toBeUndefined();
+    expect(existsSync(sessionFile)).toBe(true);
+    await withTestClient(async (client) => {
+      const listing = await client.request({ type: "list" });
+      const sessions =
+        (listing.data as { sessions?: Array<{ sessionName?: string }> }).sessions ?? [];
+      expect(sessions.filter((session) => session.sessionName === name)).toHaveLength(1);
+    });
+
+    // --- bb is closed; the resident session keeps working out of band. ---
+    await withTestClient(async (client) => {
+      let settled = false;
+      client.onPush = (message) => {
+        const candidate = message as {
+          type?: string;
+          activeSessionId?: string;
+          event?: { type?: string };
+        };
+        if (
+          candidate.type === "session_event" &&
+          candidate.activeSessionId === activeSessionId &&
+          candidate.event?.type === "agent_end"
+        ) {
+          settled = true;
+        }
+      };
+      // The daemon pushes session events to attached clients only, so this
+      // out-of-band client attaches before prompting — exactly what another
+      // prime window would do.
+      const attached = await client.request({ type: "attach", activeSessionId });
+      expect(attached.success, `attach failed: ${attached.error}`).toBe(true);
+      const prompted = await client.request({
+        type: "prompt",
+        activeSessionId,
+        message: "Reply with the single word: done",
+      });
+      expect(prompted.success, `out-of-band prompt failed: ${prompted.error}`).toBe(true);
+      await waitFor("the out-of-band turn to settle", () => settled, 120_000);
+    });
+
+    // --- reopen: the timeline comes from the attach snapshot, exactly once. ---
+    sendRequest("p", "thread/resume", {
+      threadId,
+      providerThreadId,
+      cwd: workspaceDir,
+      instructionMode: "append",
+      options: FULL_OPTIONS,
+    });
+    await waitFor("the resume response", () =>
+      responses().some((reply) => reply.id === "p"),
+    );
+    expect(responses().find((reply) => reply.id === "p")?.error).toBeUndefined();
+    expect(responses().find((reply) => reply.id === "p")?.result).toMatchObject({
+      providerThreadId,
+      sessionRestorable: true,
+    });
+    await waitFor("the snapshot timeline to arrive", () =>
+      deltas(threadId).some(
+        (delta) =>
+          delta.kind === "input.provider" && String(delta.text).includes("done"),
+      ),
+    );
+    const kinds = deltas(threadId).map((delta) => delta.kind);
+    // Both constructions announced their id-space boundary.
+    expect(kinds.filter((kind) => kind === "session.reset")).toHaveLength(2);
+    const snapshotInputs = deltas(threadId)
+      .filter((delta) => delta.kind === "input.provider")
+      .map((delta) => String(delta.text));
+    // Both exchanges — bb's own and the out-of-band one — came from the
+    // snapshot, each exactly once.
+    expect(snapshotInputs).toHaveLength(2);
+    expect(snapshotInputs[0]).toContain("ok");
+    expect(snapshotInputs[1]).toContain("done");
+    expect(
+      deltas(threadId).some(
+        (delta) =>
+          delta.kind === "item.open" &&
+          JSON.stringify(delta.item ?? {}).includes("done"),
+      ),
+    ).toBe(true);
+
+    // --- discard: stop + cleanup; nothing is left behind. ---
+    sendRequest("d", "thread/discard", { threadId, providerThreadId });
+    await waitFor("the discard response", () =>
+      responses().some((reply) => reply.id === "d"),
+    );
+    expect(responses().find((reply) => reply.id === "d")?.result).toEqual({ ok: true });
+    expect(sessionTableForTests().byThread(threadId)).toBeUndefined();
+    await waitForAsync("the discarded session to leave the daemon", async () => {
+      try {
+        await withTestClient(async (client) => {
+          const listing = await client.request({ type: "list" });
+          const sessions =
+            (listing.data as { sessions?: Array<{ sessionName?: string }> }).sessions ?? [];
+          const saved = await client.request({
+            type: "list_saved_sessions",
+            cwd: workspaceDir,
+            scope: "current",
+          });
+          const savedSessions =
+            (saved.data as { sessions?: Array<{ path?: string }> }).sessions ?? [];
+          if (sessions.some((session) => session.sessionName === name)) {
+            throw new StillThere("still listed as a live session");
+          }
+          if (savedSessions.some((session) => session.path === sessionFile)) {
+            throw new StillThere("still listed as a saved session");
+          }
+          if (existsSync(sessionFile)) {
+            throw new StillThere("the transcript file is still on disk");
+          }
+        });
+      } catch (error) {
+        if (error instanceof StillThere) {
+          return false;
+        }
+        throw error;
+      }
+      return true;
+    });
+    // The discard removed the session itself; the afterEach net has nothing
+    // left to clean.
+    cleanupSession = undefined;
+  },
+  240_000,
+);
+
+/** Marker for the discard poll: the session is (still) there. */
+class StillThere extends Error {}
 
 /**
  * Assemble a recording cell from this run: the two runtime lanes this harness

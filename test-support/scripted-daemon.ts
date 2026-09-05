@@ -131,6 +131,12 @@ export function createScriptedDaemon(
       });
     },
     enqueueAttach({ messages, lastEventSequence, lastEventCursor } = {}) {
+      // The reported cursor is the daemon's clock at snapshot time: events the
+      // bridge never saw (out-of-band work on a resident session) move it past
+      // anything this bridge has counted, and later prompts number from there.
+      if (lastEventSequence !== undefined) {
+        sequence = lastEventSequence;
+      }
       const cursor = lastEventCursor ?? { generation, sequence };
       blocks.push({
         commandType: "attach",
