@@ -1,6 +1,10 @@
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import type { DynamicTool } from "@get-bb/plugin-sdk/provider-bridge";
+import { BB_TOOLS_EXTENSION_SOURCE } from "./embedded-extension-source.js";
 import {
   BB_TOOLS_CHANNEL_FLAG,
   isJsonObject,
@@ -151,10 +155,16 @@ export function toChannelTools(tools: readonly DynamicTool[]): BbChannelTool[] {
 /**
  * The companion extension artifact prime loads. The plugin ships it as
  * TypeScript source next to the bridge (`extension/bb-tools-extension.ts`);
- * prime transpiles extensions at load, so no build step is involved and the
- * installed plugin directory is self-contained. Resolved from whichever
- * layout this module runs in: `src/dynamic-tools/` (tests, `bb plugin dev`)
- * or the built `dist/` bundle the host daemon actually executes.
+ * prime transpiles extensions at load, so no build step is involved.
+ *
+ * Resolution order, by where this module runs:
+ * - `BB_TOOLS_EXTENSION_PATH` override (tests, exotic setups);
+ * - the sibling layouts — `src/dynamic-tools/` (tests, `bb plugin dev`) and
+ *   the built `dist/` bundle of a path-install;
+ * - the daemon's artifact cache: bb delivers the bb.host artifact as a single
+ *   digest-verified file (`~/.bb/plugin-host-artifacts/<plugin>/<digest>/host.mjs`),
+ *   which cannot carry a sibling, so the extension source travels embedded in
+ *   the bundle and is materialized to a scratch file here (bbpa-9ah).
  */
 export function companionExtensionPath(): string {
   const override = process.env.BB_TOOLS_EXTENSION_PATH;
@@ -171,9 +181,36 @@ export function companionExtensionPath(): string {
       return candidate;
     }
   }
-  throw new Error(
-    `the bb companion prime extension is missing (tried ${candidates.join(", ")}); reinstall the bb-plugin-prime-agent plugin`,
-  );
+  return materializedExtensionPath();
+}
+
+/** Scratch directory for the materialized companion extension. */
+const EMBEDDED_EXTENSION_SCRATCH_DIR = join(tmpdir(), "bb-plugin-prime-agent");
+
+/**
+ * Write the embedded extension source to a scratch file and return its path.
+ *
+ * The file is reused across sessions and rewritten when the embedded source
+ * changes (a plugin update materializes its own content). The write lands via
+ * a staged file and an atomic rename, so a concurrently booting session worker
+ * never reads a half-written extension.
+ */
+export function materializedExtensionPath(
+  scratchDir: string = EMBEDDED_EXTENSION_SCRATCH_DIR,
+): string {
+  const target = join(scratchDir, "bb-tools-extension.ts");
+  try {
+    if (existsSync(target) && readFileSync(target, "utf8") === BB_TOOLS_EXTENSION_SOURCE) {
+      return target;
+    }
+  } catch {
+    // Unreadable or half-written from an older layout: fall through and rewrite.
+  }
+  mkdirSync(scratchDir, { recursive: true });
+  const staged = join(scratchDir, `.staging-${process.pid}-${randomUUID()}.ts`);
+  writeFileSync(staged, BB_TOOLS_EXTENSION_SOURCE);
+  renameSync(staged, target);
+  return target;
 }
 
 /** The default channel directory, re-exported for callers minting paths. */
