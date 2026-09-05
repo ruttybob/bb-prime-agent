@@ -6,3 +6,6 @@ node_modules/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Claude/bb agent worktrees and session state
+.claude/

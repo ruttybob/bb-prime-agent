@@ -19,7 +19,10 @@ import {
   type DaemonEventCursor,
   type SessionEventEnvelope,
 } from "./daemon/wire.js";
-import { buildPrimeCreateCommand } from "./session-params.js";
+import {
+  buildPrimeCreateCommand,
+  type PrimeDynamicToolsConfig,
+} from "./session-params.js";
 import { asWireCommand } from "./daemon/transport.js";
 import type { SessionRecord } from "./session-table.js";
 
@@ -51,6 +54,8 @@ export interface StartSessionArgs {
   title?: string | undefined;
   model?: string | undefined;
   reasoningLevel?: ReasoningLevel | undefined;
+  /** Dynamic-tools channel fragment for the create (bbpa-ggf.13), when any. */
+  dynamicTools?: PrimeDynamicToolsConfig | undefined;
 }
 
 export interface PrimeSessionOptions {
@@ -126,6 +131,7 @@ export class PrimeSession {
       cwd: args.cwd,
       model: args.model,
       reasoningLevel: args.reasoningLevel,
+      dynamicTools: args.dynamicTools,
     });
     const created = readCommandData(
       await this.request(asWireCommand(create)),

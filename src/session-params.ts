@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ReasoningLevel } from "@get-bb/plugin-sdk/provider-bridge";
+import { BB_TOOLS_CHANNEL_FLAG } from "./dynamic-tools/protocol.js";
 
 /**
  * THE seam between bb and the prime-agent daemon session.
@@ -102,12 +103,21 @@ function truncate(text: string, max: number): string {
 
 /**
  * Extension/config fields contributed by the tickets that extend a bb session
- * on prime's side. Deliberately empty until then: an empty `extensions` list
- * plus `noExtensions: true` is exactly CLI `-e <none>` + `-ne`, so bb sessions
- * load no prime extension until one is injected here.
+ * on prime's side. bbpa-ggf.13's contribution: when the thread declares bb
+ * dynamic tools, the companion extension is loaded explicitly (`-e`) while
+ * discovery stays off (`-ne`, already unconditional above), and the extension
+ * learns its channel socket through a per-session flag value — the only
+ * per-session value channel prime offers (`create.config.extensionFlagValues`).
  */
-function extensionConfigFields(_args: PrimeCreateCommandArgs): Record<string, never> {
-  return {};
+function extensionConfigFields(args: PrimeCreateCommandArgs): Record<string, unknown> {
+  const dynamicTools = args.dynamicTools;
+  if (dynamicTools === undefined) {
+    return {};
+  }
+  return {
+    extensions: dynamicTools.extensions,
+    extensionFlagValues: dynamicTools.extensionFlagValues,
+  };
 }
 
 export interface PrimeCreateCommandArgs {
@@ -121,6 +131,23 @@ export interface PrimeCreateCommandArgs {
   model?: string | undefined;
   /** bb-selected reasoning level, mapped onto prime's thinking ladder. */
   reasoningLevel?: ReasoningLevel | undefined;
+  /**
+   * The dynamic-tools channel for this session (bbpa-ggf.13): loads the
+   * companion extension explicitly and points it at the bridge-side socket.
+   * Present only when the thread declares bb dynamic tools.
+   */
+  dynamicTools?: PrimeDynamicToolsConfig | undefined;
+}
+
+/**
+ * The `create.config` fragment the dynamic-tools registry contributes
+ * (bbpa-ggf.13): the companion extension loaded explicitly on top of the
+ * unconditional discovery-off, with its channel socket as a flag value.
+ */
+export interface PrimeDynamicToolsConfig {
+  noExtensions: true;
+  extensions: string[];
+  extensionFlagValues: Record<string, string>;
 }
 
 /** The `create` command payload, exactly as the daemon expects it. */
@@ -135,6 +162,10 @@ export interface PrimeCreateCommand {
     noSkills: false;
     model?: string;
     thinking?: PrimeThinkingLevel;
+    /** Explicit companion-extension load (`-e`), bbpa-ggf.13. */
+    extensions?: string[];
+    /** Per-session values for extension-declared flags (the channel socket). */
+    extensionFlagValues?: Record<string, string>;
   };
 }
 

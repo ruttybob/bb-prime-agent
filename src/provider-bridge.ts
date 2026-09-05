@@ -6,6 +6,7 @@ import {
   THREAD_DELTA_GRAMMAR_V3,
   THREAD_DELTA_NOTIFICATION_METHOD,
   createBridgeIo,
+  createPendingToolCallTracker,
   experimental_defineProviderBridge,
   initializeParamsSchema,
   modelListParamsSchema,
@@ -26,12 +27,17 @@ import {
   turnStartParamsSchema,
   turnSteerParamsSchema,
   type ClientTurnRequestId,
+  type BridgeJsonRpcResponse,
   type PromptInput,
   type ProviderBridgeContext,
   type ReasoningLevel,
   type ThreadDelta,
 } from "@get-bb/plugin-sdk/provider-bridge";
 import { primeProviderHealthCached } from "./health.js";
+import {
+  DynamicToolsRegistry,
+  type DynamicToolsSessionConfig,
+} from "./dynamic-tools/registry.js";
 import {
   daemonRequest,
   ensureDaemonConnection,
@@ -79,6 +85,24 @@ function emitDeltas(threadId: string, deltas: readonly ThreadDelta[]): void {
 /** Session records, one per bb thread; process-local by design (see module docs). */
 const sessions = new SessionTable();
 
+/**
+ * The bb dynamic-tools channel registry (ADR-0003, bbpa-ggf.13): one channel
+ * per thread that declares dynamic tools. Channels are keyed by the bb thread
+ * id — stable across the daemon-id adoption and across bridge processes, so a
+ * resumed session's extension reconnects to the same socket path.
+ */
+const dynamicTools = new DynamicToolsRegistry();
+
+/**
+ * Outbound `item/tool/call` correlation: dynamic-tool calls from the companion
+ * extension ride this tracker, which mints the JSON-RPC ids, writes the
+ * request lines through the bridge's own stdout, and settles on the runtime's
+ * responses (`handleLine` routes them below).
+ */
+const toolCalls = createPendingToolCallTracker({
+  sendToolCall: (request) => io.send(request),
+});
+
 /** Skill roots from `skills/configure`, consumed when sessions are created. */
 let configuredSkillRoots: readonly ConfiguredSkillRoot[] = [];
 
@@ -110,6 +134,60 @@ function announceSession(record: SessionRecord): void {
     providerThreadId: record.providerThreadId,
   });
   emitDeltas(record.threadId, [{ kind: "session.reset" }]);
+}
+
+/**
+ * Start this thread's dynamic-tools channel, if it declares bb tools. Called
+ * BEFORE the daemon `create` — the companion extension connects while the
+ * prime worker boots, so the channel must already be listening. Returns the
+ * `create.config` fragment that loads the extension, or `undefined` when the
+ * thread declares no dynamic tools.
+ */
+async function ensureDynamicToolsChannel(
+  record: SessionRecord,
+): Promise<DynamicToolsSessionConfig | undefined> {
+  if (record.dynamicTools.length === 0) {
+    return undefined;
+  }
+  await dynamicTools.start({
+    providerThreadId: record.threadId,
+    onToolCall: async (call) => {
+      try {
+        const result = await toolCalls.forwardToolCall({
+          // Read through the record at call time: the daemon-derived provider
+          // thread id replaces the provisional one right after `create`.
+          providerThreadId: record.providerThreadId,
+          threadId: record.threadId,
+          scope: record,
+          toolName: call.name,
+          arguments: call.args,
+        });
+        return { ok: true as const, ...result };
+      } catch (error) {
+        return {
+          ok: false as const,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    },
+  });
+  return dynamicTools.sessionConfig(record.threadId);
+}
+
+/** Publish the thread's bb tool set to its (now connected) companion extension. */
+async function publishDynamicTools(record: SessionRecord): Promise<void> {
+  if (record.dynamicTools.length === 0) {
+    return;
+  }
+  await dynamicTools.setTools(record.threadId, record.dynamicTools);
+}
+
+/** Stop a thread's dynamic-tools channel (record dropped: release or discard). */
+function stopDynamicTools(record: SessionRecord | undefined): Promise<void> {
+  if (record === undefined) {
+    return Promise.resolve();
+  }
+  return dynamicTools.stop(record.threadId);
 }
 
 /** The daemon session handle behind a provider thread id this bridge minted. */
@@ -159,6 +237,7 @@ async function startSession(args: {
       title: args.title,
       model: args.model,
       reasoningLevel: args.reasoningLevel,
+      dynamicTools: dynamicTools.sessionConfig(record.threadId),
     });
     sessions.adoptProviderThreadId(record, identity.providerThreadId);
   } catch (error) {
@@ -303,18 +382,27 @@ const handlers: Record<string, RequestHandler> = {
       cwd: parsed.data.cwd,
       dynamicTools: parsed.data.dynamicTools ?? [],
     });
-    return startSession({
-      record,
-      title: PrimeSession.titleFromInput(parsed.data.input),
-      model: parsed.data.options.model,
-      reasoningLevel: parsed.data.options.reasoningLevel,
-      input: parsed.data.input,
-    }).then(() => {
-      io.sendResult(id, {
-        providerThreadId: record.providerThreadId,
-        sessionRestorable: true,
+    // The channel listens before `create` so the companion extension finds it
+    // while the prime worker boots (bbpa-ggf.13).
+    return ensureDynamicToolsChannel(record)
+      .then(() =>
+        startSession({
+          record,
+          title: PrimeSession.titleFromInput(parsed.data.input),
+          model: parsed.data.options.model,
+          reasoningLevel: parsed.data.options.reasoningLevel,
+          input: parsed.data.input,
+        }),
+      )
+      .then(async () => {
+        await publishDynamicTools(record);
+      })
+      .then(() => {
+        io.sendResult(id, {
+          providerThreadId: record.providerThreadId,
+          sessionRestorable: true,
+        });
       });
-    });
   },
 
   [BRIDGE_REQUEST_METHODS.threadResume]: (id, params) => {
@@ -359,6 +447,12 @@ const handlers: Record<string, RequestHandler> = {
           await sessionFor(record).attach();
           announceSession(record);
         }
+        // The worker kept the companion extension from its create, but the
+        // channel socket this process mints is new — re-listen on the same
+        // path (thread-id keyed) and re-publish; the extension reconnects and
+        // the protocol re-syncs its tool set (bbpa-ggf.13).
+        await ensureDynamicToolsChannel(record);
+        await publishDynamicTools(record);
       } catch (error) {
         if (adopted) {
           sessions.drop(record.threadId);
@@ -407,6 +501,7 @@ const handlers: Record<string, RequestHandler> = {
       if (session !== undefined) {
         await session.release();
       }
+      await stopDynamicTools(record);
       if (record !== undefined) {
         sessions.drop(record.threadId);
       }
@@ -425,6 +520,7 @@ const handlers: Record<string, RequestHandler> = {
       if (record?.session !== undefined) {
         await record.session.release();
       }
+      await stopDynamicTools(record);
       if (record !== undefined) {
         sessions.drop(record.threadId);
       }
@@ -548,8 +644,9 @@ export function handleLine(line: string): void {
     params?: unknown;
   };
   if (typeof method !== "string") {
-    // A response (to an item/tool/call we sent) — none are pending, so this is
-    // a no-op kept for reply hygiene.
+    // A response to an `item/tool/call` we sent: settle the pending dynamic
+    // tool call. The tracker ignores ids it does not know (reply hygiene).
+    toolCalls.handleToolCallResponse(message as BridgeJsonRpcResponse);
     return;
   }
   if (typeof id !== "string" && typeof id !== "number") {
@@ -586,6 +683,11 @@ export function resetDaemonForTests(): void {
   resetDaemonConnectionForTests();
 }
 
+/** Test seam: the dynamic-tools channel registry (channel paths, liveness). */
+export function dynamicToolsRegistryForTests(): DynamicToolsRegistry {
+  return dynamicTools;
+}
+
 /** The socket path this bridge would dial (tests and the health probe use it). */
 export function daemonSocketPathForTests(): string {
   return resolveDaemonSocketPath();
@@ -602,6 +704,7 @@ export const experimental_providerBridge = experimental_defineProviderBridge({
       // on the way down is not an error the runtime can act on.
       record.session?.release().catch(() => {});
     }
+    dynamicTools.clear().catch(() => {});
     sessions.clear();
     bridgeContext = undefined;
     resetDaemonConnectionForTests();
