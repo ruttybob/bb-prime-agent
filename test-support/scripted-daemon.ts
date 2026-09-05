@@ -37,6 +37,12 @@ export interface ScriptedDaemonHandle {
   enqueuePrompt(args: { events: readonly unknown[] }): void;
   /** Answer a command with `{success:true}` and no data. */
   enqueueOk(commandType: string): void;
+  /**
+   * Answer an arbitrary command with `{success:true, data}` and stream session
+   * events with the answer — the `steer`/`follow_up` admissions and the queue
+   * reads the steering surface produces.
+   */
+  enqueueData(commandType: string, args?: { data?: unknown; events?: readonly unknown[] }): void;
   /** Answer a command with a daemon-side failure. */
   enqueueFail(commandType: string, error: string): void;
   /** Push a message to the bridge directly (out-of-band daemon chatter). */
@@ -106,6 +112,11 @@ export function createScriptedDaemon(
         const payload = command as Record<string, unknown>;
         const commandType = String(payload.type);
         commands.push(payload);
+        // The real daemon always answers a queue read; when a test does not
+        // script one, the lanes are simply empty.
+        if (commandType === "get_queue" && !blocks.some((candidate) => candidate.commandType === "get_queue")) {
+          return ok("get_queue", { steering: [], followUp: [] });
+        }
         const block = nextBlock(commandType);
         for (const message of block.pushes) {
           push(message);
@@ -168,6 +179,21 @@ export function createScriptedDaemon(
     },
     enqueueOk(commandType) {
       blocks.push({ commandType, answer: ok(commandType), pushes: [] });
+    },
+    enqueueData(commandType, { data, events } = {}) {
+      blocks.push({
+        commandType,
+        answer: ok(commandType, data),
+        pushes: (events ?? []).map((event) => {
+          sequence += 1;
+          return {
+            type: "session_event",
+            activeSessionId: session.activeSessionId,
+            event,
+            meta: { sequence, cursor: { generation, sequence } },
+          } satisfies DaemonPushMessage;
+        }),
+      });
     },
     enqueueFail(commandType, error) {
       blocks.push({

@@ -23,12 +23,14 @@ import {
   IGNORED_SESSION_EVENT_TYPES,
   messageUpdateEventSchema,
   rlmChildUpdateEventSchema,
+  sessionActionUpdateEventSchema,
   toolExecutionEndEventSchema,
   toolExecutionStartEventSchema,
   toolExecutionUpdateEventSchema,
   usageShapeSchema,
   type AgentMessage,
 } from "./daemon/wire.js";
+import { PRIME_QUEUE_EXTENSION_KIND, queueStatePayload } from "./queue-state.js";
 
 /**
  * prime-agent daemon session events → bb `ThreadDelta`s.
@@ -47,6 +49,9 @@ import {
  * - prime's own bash (`bash_*`), recap, heartbeat and connection chatter has no
  *   bb timeline meaning and is dropped by name; anything genuinely unknown is
  *   surfaced as `unhandled` rather than swallowed.
+ * - prime's queue announcement (`session_action_update`) becomes the thread's
+ *   queue state under the `prime-agent/queue` extension kind, so waiting
+ *   steering and follow-up messages are visible while they queue (bbpa-ggf.5).
  *
  * The translator is stateless per thread apart from three bookkeeping maps
  * (streamed-tool shapes, still-open text streams, cumulative usage), which
@@ -215,12 +220,22 @@ interface ThreadState {
   usage: ThreadEventTokenUsageBreakdown;
   /** Set between `compaction_start` and `compaction_end`; prime's reason decides the settlement. */
   compaction: { manual: boolean } | undefined;
+  /** Serialized queue payload last emitted, so an unchanged queue re-emits nothing. */
+  queuePayload: string | undefined;
 }
 
 export interface PrimeDeltaTranslator {
   translate(event: unknown, context: TranslationContext): ThreadDelta[];
   /** Deltas that rebuild a session's timeline from an attach snapshot. */
   snapshotDeltas(messages: readonly unknown[]): ThreadDelta[];
+  /**
+   * The queue-state delta for a lane snapshot read outside the event stream
+   * (`get_queue` at attach); deduped against the event-driven updates.
+   */
+  queueStateDeltas(
+    threadId: string,
+    queue: { steering: readonly string[]; followUps: readonly string[] },
+  ): ThreadDelta[];
   /**
    * Deltas that settle the running turn after a soft stop (`abort`): open text
    * streams closed, the turn boundary `interrupted`. Prime's own `agent_end`
@@ -243,6 +258,7 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
       openTextStreams: new Set(),
       usage: ZERO_TOKEN_USAGE,
       compaction: undefined,
+      queuePayload: undefined,
     };
     states.set(threadId, created);
     while (states.size > MAX_STATE_ENTRIES) {
@@ -337,6 +353,27 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
       );
     }
     return deltas;
+  }
+
+  /** The queue-state delta for a lane snapshot, or nothing when it repeats. */
+  function queueUpdateDeltas(
+    threadId: string,
+    queue: { steering: readonly string[]; followUps: readonly string[] },
+  ): ThreadDelta[] {
+    const payload = queueStatePayload(queue);
+    const state = stateFor(threadId);
+    const serialized = JSON.stringify(payload);
+    if (serialized === state.queuePayload) {
+      return [];
+    }
+    state.queuePayload = serialized;
+    return [
+      {
+        kind: "extension.state",
+        extensionKind: PRIME_QUEUE_EXTENSION_KIND,
+        payload,
+      },
+    ];
   }
 
   function translate(
@@ -637,6 +674,24 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
         ];
       }
 
+      case "session_action_update": {
+        // Prime announces its waiting-message lanes here (bbpa-ggf.5): the
+        // queue becomes visible in the thread as queue state while it waits,
+        // and clears (`null` payload) once both lanes are empty.
+        const parsed = sessionActionUpdateEventSchema.safeParse(event);
+        if (!parsed.success) {
+          return unhandled(event, context);
+        }
+        return queueUpdateDeltas(context.threadId, {
+          steering: parsed.data.actions.steering.filter(
+            (preview): preview is string => typeof preview === "string",
+          ),
+          followUps: parsed.data.actions.followUps.filter(
+            (preview): preview is string => typeof preview === "string",
+          ),
+        });
+      }
+
       case "rlm_child_update": {
         const parsed = rlmChildUpdateEventSchema.safeParse(event);
         if (!parsed.success) {
@@ -803,6 +858,9 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
   return {
     translate,
     snapshotDeltas,
+    queueStateDeltas(threadId, queue) {
+      return queueUpdateDeltas(threadId, queue);
+    },
     interruptDeltas(threadId) {
       const deltas = closeOpenStreams({ threadId, cwd: undefined });
       deltas.push({ kind: "turn.boundary", status: "interrupted" });

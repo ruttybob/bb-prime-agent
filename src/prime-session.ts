@@ -14,9 +14,11 @@ import {
 import {
   daemonAttachResultSchema,
   daemonCreateResultSchema,
+  daemonQueueResultSchema,
   sessionClosedSchema,
   sessionEventEnvelopeSchema,
   type DaemonEventCursor,
+  type DaemonQueueResult,
   type SessionEventEnvelope,
 } from "./daemon/wire.js";
 import {
@@ -205,6 +207,39 @@ export class PrimeSession {
         this.deliver(push);
       }
     }
+    // Work can already be waiting from before this attach — queued by another
+    // bb session or from prime's own TUI. `session_action_update` pushes only
+    // announce changes, so read the lanes once; visibility is best-effort and
+    // never blocks the attach (bbpa-ggf.5).
+    try {
+      const queue = readCommandData<DaemonQueueResult>(
+        await this.request(
+          asWireCommand({
+            type: "get_queue",
+            activeSessionId: this.record.activeSessionId,
+          }),
+        ),
+        "get_queue",
+        (data) => {
+          const parsed = daemonQueueResultSchema.safeParse(data);
+          return parsed.success
+            ? { success: true as const, data: parsed.data }
+            : { success: false as const, issues: "not a queue answer" };
+        },
+      );
+      const previews = (values: readonly unknown[]): string[] =>
+        values.filter((preview): preview is string => typeof preview === "string");
+      const steering = previews(queue.steering);
+      const followUps = previews(queue.followUp);
+      if (steering.length > 0 || followUps.length > 0) {
+        this.pushDeltas(
+          this.translator.queueStateDeltas(this.record.threadId, { steering, followUps }),
+        );
+      }
+    } catch {
+      // A daemon that will not answer get_queue still attaches; the next
+      // session_action_update surfaces the lanes instead.
+    }
   }
 
   /**
@@ -330,7 +365,42 @@ export class PrimeSession {
         type: "prompt",
         activeSessionId: this.record.activeSessionId,
         message: PrimeSession.promptText(args.input),
+        // Prime refuses a bare prompt while it is streaming ("Specify
+        // streamingBehavior …"), and a prompt that lands on a busy session
+        // must not take the session away from the running turn: the follow-up
+        // lane holds it and prime delivers it only after the agent finishes.
+        // On an idle session this is exactly prime's ordinary prompt — the
+        // daemon applies resumeIfIdle either way (bbpa-ggf.5).
+        streamingBehavior: "followUp",
       }),
+    );
+  }
+
+  /**
+   * Steer prime with a user message — the one primitive behind bb's steer,
+   * whatever the lane state. The message goes to prime's steering lane
+   * (`next_turn_boundary`): prime delivers it after the work in flight
+   * finishes and before whatever runs next, never interrupting anything. On
+   * an idle session the daemon's `resumeIfIdle` starts a fresh run with it,
+   * so a steer is never a silent no-op. (On the calibrated 0.7.3 daemon a
+   * steer of a streaming session is delivered when that run settles, and the
+   * steered answer streams as the follow-up run — a new bb turn.)
+   */
+  async steer(args: { input: readonly PromptInput[] }): Promise<void> {
+    if (this.record.activeSessionId === undefined) {
+      throw new Error("cannot steer before the session is created");
+    }
+    this.openTurn = { settledLocally: false };
+    await readCommandData(
+      await this.request(
+        asWireCommand({
+          type: "steer",
+          activeSessionId: this.record.activeSessionId,
+          message: PrimeSession.promptText(args.input),
+        }),
+      ),
+      "steer",
+      (data) => ({ success: true as const, data }),
     );
   }
 

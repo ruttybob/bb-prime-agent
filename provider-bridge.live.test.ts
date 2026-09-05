@@ -34,11 +34,11 @@ import {
  *
  * Gated behind `BBPA_LIVE_DAEMON=1` so the default suite stays hermetic — this
  * test creates a daemon session of its own (named with the "[bb] " prefix and a
- * nonce), asserts the streamed turn, the prime catalog entry, and the soft
- * stop, then removes exactly that one session (`kill` +
- * `delete_saved_session`). It never touches a session it did not create: the
- * `list` check filters to the test's own name, and cleanup addresses the
- * `activeSessionId` the create answered with.
+ * nonce), asserts the streamed turn, the prime catalog entry, the mid-turn
+ * steer (bbpa-ggf.5), and the soft stop, then removes exactly that one session
+ * (`kill` + `delete_saved_session`). It never touches a session it did not
+ * create: the `list` check filters to the test's own name, and cleanup
+ * addresses the `activeSessionId` the create answered with.
  *
  * With `BBPA_LIVE_RECORD_DIR=<dir>` the same run also writes a recording cell
  * (all four lanes plus a manifest) into that directory — the input for the
@@ -339,7 +339,7 @@ it.skipIf(!LIVE)(
       input: [
         {
           type: "text",
-          text: "Count slowly from 1 to 40, one number per line, with no other text.",
+          text: "Call the bash tool right now with the command `sleep 20`. Do not run any other tool first and do not explain. When the tool returns, reply with exactly this word and nothing else: DONE.",
           mentions: [],
         },
       ],
@@ -371,6 +371,95 @@ it.skipIf(!LIVE)(
       ),
     );
     expect(existsSync(sessionFile!)).toBe(true);
+
+    // --- Steering (bbpa-ggf.5): redirect a running turn. The steer is queued
+    // on prime's steering lane while the sleep tool round runs, delivered when
+    // the running work settles, and the model answers it — on the calibrated
+    // 0.7.3 daemon the steered answer streams as the follow-up run, which
+    // opens the next bb turn. What must hold: the steered text lands on the
+    // timeline, queue state surfaces, the answer streams after the steer, and
+    // steering never interrupts the work in flight. ---
+    sendRequest("u", "turn/start", {
+      threadId,
+      providerThreadId,
+      input: [
+        {
+          type: "text",
+          text: "Call the bash tool right now with the command `sleep 20`. Do not run any other tool first and do not explain. When the tool returns, reply with exactly this word and nothing else: DONE.",
+          mentions: [],
+        },
+      ],
+      clientRequestId: "creq_thrdbbturn",
+      options: FULL_OPTIONS,
+    });
+    await waitFor("the turn/start response", () =>
+      responses().some((reply) => reply.id === "u"),
+    );
+    await waitFor("the third turn to open", () =>
+      deltas(threadId).filter((delta) => delta.kind === "turn.open").length >= 3,
+    );
+
+    const steerText = "Reply with exactly this word and nothing else: STEERED";
+    sendRequest("st", "turn/steer", {
+      threadId,
+      providerThreadId,
+      expectedTurnId: "turn-live-3",
+      input: [{ type: "text", text: steerText, mentions: [] }],
+      clientRequestId: "creq_steerabcdx",
+      options: FULL_OPTIONS,
+    });
+    await waitFor("the steer response", () =>
+      responses().some((reply) => reply.id === "st"),
+    );
+    const steerReply = responses().find((reply) => reply.id === "st")!;
+    expect(steerReply.error).toBeUndefined();
+    expect(steerReply.result).toEqual({ threadId });
+    // The acceptance and the steered text are on the timeline.
+    expect(
+      deltas(threadId).some(
+        (delta) =>
+          delta.kind === "input.accepted" && delta.clientRequestId === "creq_steerabcdx",
+      ),
+    ).toBe(true);
+    expect(
+      deltas(threadId).some(
+        (delta) => delta.kind === "input.provider" && delta.text === steerText,
+      ),
+    ).toBe(true);
+    // Prime's waiting-lane announcement surfaces as queue state.
+    await waitFor("the queue state delta", () =>
+      deltas(threadId).some(
+        (delta) =>
+          delta.kind === "extension.state" &&
+          delta.extensionKind === "prime-agent/queue",
+      ),
+    );
+
+    const steerIndex = deltas(threadId).findIndex(
+      (delta) => delta.kind === "input.provider" && delta.text === steerText,
+    );
+    expect(steerIndex).toBeGreaterThanOrEqual(0);
+    const streamedText = (list: Array<Record<string, unknown>>): string =>
+      list
+        .filter((delta) => delta.kind === "item.textDelta")
+        .map((delta) => String(delta.text))
+        .join("");
+    await waitFor("the steered answer to stream", () =>
+      streamedText(deltas(threadId)).includes("STEERED"),
+    );
+    // The steered answer comes after the steer landed (the streamed text
+    // before it holds no STEERED — the word is not quoted back early), and
+    // steering never interrupts: nothing settled as interrupted on the way.
+    const allDeltas = deltas(threadId);
+    expect(streamedText(allDeltas.slice(0, steerIndex))).not.toContain("STEERED");
+    expect(
+      allDeltas
+        .slice(steerIndex)
+        .some(
+          (delta) =>
+            delta.kind === "turn.boundary" && delta.status === "interrupted",
+        ),
+    ).toBe(false);
 
     // Release: the bridge lets go, the daemon session file stays.
     sendRequest("r", "thread/stop", {
@@ -460,7 +549,7 @@ function writeCell(
         cliVersion: "bb-plugin-prime-agent 0.1.0",
         recordedAt: new Date().toISOString().slice(0, 10),
         description:
-          "One live prime-agent turn: the resident session is created in the bb workspace, the reply streams as text deltas with usage and a completed boundary; a second turn is soft-stopped (interrupt) and the session survives, then the bridge releases it.",
+          "One live prime-agent turn: the resident session is created in the bb workspace, the reply streams as text deltas with usage and a completed boundary; a second turn is steered mid-flight (the steer lands in the same turn, queue state surfaces) and then soft-stopped (interrupt), the session survives, then the bridge releases it.",
         note: `Recorded against the machine's installed prime-agent daemon (session ${facts.name}, ${facts.sessionFile}, cwd ${facts.cwd}); the provider lanes carry the daemon wire. Replayed with BB_PRIME_AGENT_DAEMON_REPLAY_CELL pointed at the cell, so no daemon is needed.`,
         bridgeRuns: 1,
         lines: {

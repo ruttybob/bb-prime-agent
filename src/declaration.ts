@@ -8,6 +8,10 @@ import {
   PRIME_PROVIDER_ID,
   PRIME_SIGN_IN_HINT,
 } from "./vocabulary.js";
+import {
+  PRIME_QUEUE_EXTENSION_KIND_NAME,
+  primeQueueStateSchema,
+} from "./queue-state.js";
 
 /**
  * The bb-side provider declaration.
@@ -65,5 +69,12 @@ export function primeProviderDeclaration(): PluginProviderDeclaration {
       { id: "max", label: "Max" },
     ],
     composerActions: [],
+    // The waiting-message lanes prime announces (`session_action_update`) are
+    // surfaced as `extension.state` under `prime-agent/queue` (bbpa-ggf.5).
+    // Without this declaration bb's server demotes the payloads to
+    // `provider/unhandled` at ingest.
+    extensionKinds: {
+      [PRIME_QUEUE_EXTENSION_KIND_NAME]: { state: primeQueueStateSchema },
+    },
   };
 }

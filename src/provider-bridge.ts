@@ -328,7 +328,10 @@ const handlers: Record<string, RequestHandler> = {
         fork: "none",
         // prime-agent has no approval gate; bb runs the policy it declares.
         approvalEnforcedBy: "runtime",
-        // bbpa-ggf.5 maps prime's steer/follow-up semantics onto turn/steer.
+        // Steers are queued, not injected: `turn/steer` rides prime's steering
+        // lane (delivered after the work in flight, never interrupting), and a
+        // prompt landing on a busy session rides the follow-up lane
+        // (bbpa-ggf.5).
         steerMode: "queue",
         // Accepted and stored (see skills/configure) so bb can hand the
         // catalog over before the first real session.
@@ -626,13 +629,41 @@ const handlers: Record<string, RequestHandler> = {
       invalidParams(id, BRIDGE_REQUEST_METHODS.turnSteer, parsed.error.issues);
       return;
     }
-    // Steering maps onto prime's `steer` with bbpa-ggf.5; until then a steer is
-    // refused rather than silently queued behind the running turn.
-    io.sendError(
-      id,
-      BRIDGE_JSON_RPC_ERRORS.NO_ACTIVE_TURN,
-      `No active turn to steer (expected ${parsed.data.expectedTurnId})`,
-    );
+    return (async () => {
+      // `expectedTurnId` stays diagnostic: this bridge mints no provider turn
+      // ids of its own, and staleness is the runtime's guard (it drops a steer
+      // whose turn is gone before the request ever lands here).
+      const record = sessions.byThread(parsed.data.threadId);
+      if (record === undefined) {
+        io.sendError(
+          id,
+          BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
+          `No session for thread ${parsed.data.threadId}; send thread/start or thread/resume first`,
+        );
+        return;
+      }
+      const text = PrimeSession.promptText(parsed.data.input);
+      if (text.trim() === "") {
+        io.sendError(
+          id,
+          BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
+          "Missing input text to steer with",
+        );
+        return;
+      }
+      // prime's `steer` admits the message either way (bbpa-ggf.5): it joins
+      // prime's steering lane — after the work in flight, before whatever
+      // runs next — and on an idle session the daemon's resumeIfIdle starts a
+      // fresh run. The steered text shows on the timeline as a provider input
+      // row; the turn in flight settles itself, and a resumed run opens the
+      // turn that answers the steer.
+      await sessionFor(record).steer({ input: parsed.data.input });
+      emitDeltas(record.threadId, [
+        { kind: "input.accepted", clientRequestId: parsed.data.clientRequestId },
+        { kind: "input.provider", text },
+      ]);
+      io.sendResult(id, { threadId: record.threadId });
+    })();
   },
 
   [BRIDGE_REQUEST_METHODS.skillsConfigure]: (id, params) => {
