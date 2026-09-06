@@ -56,6 +56,22 @@ describe("child thread service", () => {
     ]);
   });
 
+  it("flattens a prime task-text label into a one-line capped title", async () => {
+    const d = deps();
+    const service = createChildThreadService(d);
+    await service.onChildren("sess_parent", [
+      child({
+        activeSessionId: "sess_kid",
+        label: "You are the SPEC reviewer for a code change in the git repo at /x — run git diff, then report",
+      }),
+    ]);
+    // Prime labels unnamed children with their whole task text; the title is
+    // one line, capped, and points at the task rather than dumping it.
+    expect(d.spawned[0]?.title).toBe(
+      "You are the SPEC reviewer for a code change in the git repo at …",
+    );
+  });
+
   it("never spawns twice for the same child session", async () => {
     const d = deps();
     const service = createChildThreadService(d);

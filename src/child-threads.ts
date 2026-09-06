@@ -53,6 +53,21 @@ export function childThreadMarkerInput(childSessionId: string): PromptInput {
 }
 
 /**
+ * The spawned thread's title: the child's prime-side label, flattened to one
+ * line and capped. Prime labels unnamed children with their whole task text,
+ * so verbatim labels are often a full prompt — a title must stay a title.
+ */
+const CHILD_THREAD_TITLE_MAX_CHARS = 64;
+
+export function childThreadTitle(childLabel: string): string {
+  const oneLine = childLabel.replaceAll(/\s+/gu, " ").trim();
+  if (oneLine.length <= CHILD_THREAD_TITLE_MAX_CHARS) {
+    return oneLine;
+  }
+  return `${oneLine.slice(0, CHILD_THREAD_TITLE_MAX_CHARS - 1)}…`;
+}
+
+/**
  * The child session id a start request's input carries, or `undefined` when
  * the input is not exactly one marker part (ordinary prompts, extra parts,
  * multi-line smuggling).
@@ -149,9 +164,7 @@ export function createChildThreadService(deps: ChildThreadServiceDeps): {
       if (parentThreadId === undefined) {
         return false;
       }
-      // The spawned thread's title is the child's prime-side label,
-      // verbatim (ADR-0005 naming).
-      const title = child.label;
+      const title = childThreadTitle(child.label);
       // The claim set dies with the process; a server restart re-derives
       // "already threaded" from the parent's existing children by title.
       // Two live children sharing a label would then fold into one thread —
