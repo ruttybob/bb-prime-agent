@@ -1035,7 +1035,7 @@ export class PrimeSession {
     // anchor is taken back so the FIFO stays aligned with prime's runs.
     this.queueCheckpoint(primePromptText(args.input));
     try {
-      await this.request(
+      const answer = await this.request(
         asWireCommand({
           type: "prompt",
           activeSessionId: this.record.activeSessionId,
@@ -1050,6 +1050,14 @@ export class PrimeSession {
           streamingBehavior: "followUp",
         }),
       );
+      if (!answer.success) {
+        // A refused prompt admitted nothing: the caller must know (a silent
+        // "ok" would strand the user's message on a session prime declined),
+        // and the eviction recovery keys off exactly this refusal.
+        throw new Error(
+          `prime-agent refused "prompt": ${answer.error ?? "unknown daemon error"}`,
+        );
+      }
     } catch (error) {
       this.pendingCheckpoints.pop();
       throw error;
@@ -1279,7 +1287,7 @@ export class PrimeSession {
       throw new Error("cannot clear the goal before the session is created");
     }
     await this.awaitLive();
-    await this.request(
+    const answer = await this.request(
       asWireCommand({
         type: "prompt",
         activeSessionId: this.record.activeSessionId,
@@ -1287,5 +1295,10 @@ export class PrimeSession {
         streamingBehavior: "followUp",
       }),
     );
+    if (!answer.success) {
+      throw new Error(
+        `prime-agent refused "prompt": ${answer.error ?? "unknown daemon error"}`,
+      );
+    }
   }
 }

@@ -130,6 +130,14 @@ refuses while the child is resident-and-running. Children appear in
   skills/commands: `get_resource_snapshot`, `get_commands`.
 - Multi-client badge: `SessionSummary.attachedClients` via `get_state`/`list` — **no push
   event for attach/detach of others** (`daemon-session-list.d.ts:40`; `daemon-mode.js:2148`).
+- **Idle eviction** (observed in the daemon log 2026-09-06, bbpa-px7): the supervisor shuts
+  down a session worker after ~90 idle minutes ("Evicted idle worker … idleMinutes=90",
+  `session_closed` shape) — the transcript file survives, the `activeSessionId` stops
+  resolving and **every** session-scoped command refuses `Unknown active session: <id>`
+  (identical wording from supervisor and worker). Recovery wire facts (live-verified):
+  `create {sessionPath}` re-hosts the SAME transcript under a FRESH `activeSessionId`;
+  `list_saved_sessions {cwd}` lists saved sessions as `{path, id, cwd, name, state, …}`
+  (it refuses `paths[0] must be of type string` without a `cwd` — always send one).
 - **Command idempotency journal** (`command-recovery-journal.js`, `daemon-supervisor.js:1008`):
   when an envelope carries a **clientId**, every *mutating* command is journaled under
   `(clientId, envelope id)` and a repeat gets the recorded response **replayed instead of
