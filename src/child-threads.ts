@@ -17,7 +17,11 @@
 // import-type statement as a value import by its statement-head heuristic.
 import type { DynamicTool, PromptInput } from "@get-bb/plugin-sdk/provider-bridge";
 import { errorMessage } from "./error-message.js";
-import { isChildLive, type PrimeChild } from "./subagents/children.js";
+import {
+  childDisplayName,
+  isChildLive,
+  type PrimeChild,
+} from "./subagents/children.js";
 
 /**
  * The start fields the marker branch reads. Structural, not the bridge
@@ -50,21 +54,6 @@ export function childThreadMarkerInput(childSessionId: string): PromptInput {
     mentions: [],
     visibility: "agent-only",
   };
-}
-
-/**
- * The spawned thread's title: the child's prime-side label, flattened to one
- * line and capped. Prime labels unnamed children with their whole task text,
- * so verbatim labels are often a full prompt — a title must stay a title.
- */
-const CHILD_THREAD_TITLE_MAX_CHARS = 64;
-
-export function childThreadTitle(childLabel: string): string {
-  const oneLine = childLabel.replaceAll(/\s+/gu, " ").trim();
-  if (oneLine.length <= CHILD_THREAD_TITLE_MAX_CHARS) {
-    return oneLine;
-  }
-  return `${oneLine.slice(0, CHILD_THREAD_TITLE_MAX_CHARS - 1)}…`;
 }
 
 /**
@@ -164,7 +153,7 @@ export function createChildThreadService(deps: ChildThreadServiceDeps): {
       if (parentThreadId === undefined) {
         return false;
       }
-      const title = childThreadTitle(child.label);
+      const title = childDisplayName(child);
       // The claim set dies with the process; a server restart re-derives
       // "already threaded" from the parent's existing children by title.
       // Two live children sharing a label would then fold into one thread —

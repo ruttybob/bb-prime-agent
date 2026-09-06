@@ -72,6 +72,19 @@ describe("child thread service", () => {
     );
   });
 
+  it("prefers the child's prime session name over the task-text label", async () => {
+    const d = deps();
+    const service = createChildThreadService(d);
+    await service.onChildren("sess_parent", [
+      child({
+        activeSessionId: "sess_kid",
+        sessionName: "impl-7c4-1",
+        label: "You are an implementer agent for ticket bb-sys-prompt-7c4.1",
+      }),
+    ]);
+    expect(d.spawned[0]?.title).toBe("impl-7c4-1");
+  });
+
   it("never spawns twice for the same child session", async () => {
     const d = deps();
     const service = createChildThreadService(d);

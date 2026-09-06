@@ -110,9 +110,28 @@ export function isChildLive(child: PrimeChild): boolean {
 }
 
 /**
+ * The child's display name: the prime session name (`explorer`,
+ * `impl-7c4-1`), falling back to the label for children whose session name
+ * has not resolved yet. The label of an unnamed child is its whole task text,
+ * so the fallback is flattened to one line and capped — a row title must
+ * never be a prompt.
+ */
+export const CHILD_DISPLAY_NAME_MAX_CHARS = 64;
+
+export function childDisplayName(child: PrimeChild): string {
+  const oneLine = (child.sessionName ?? child.label)
+    .replaceAll(/\s+/gu, " ")
+    .trim();
+  if (oneLine.length <= CHILD_DISPLAY_NAME_MAX_CHARS) {
+    return oneLine;
+  }
+  return `${oneLine.slice(0, CHILD_DISPLAY_NAME_MAX_CHARS - 1)}…`;
+}
+
+/**
  * The delegation item shape for a child: keyed by the child id in the delta
  * (`channel: "delegation"`), referenced by the child's daemon session when it
- * has one, labelled as prime labels it.
+ * has one, labelled with the child's display name.
  */
 export function childDelegationShape(
   child: PrimeChild,
@@ -121,7 +140,7 @@ export function childDelegationShape(
   return {
     type: "delegation",
     childRef: child.activeSessionId ?? child.id,
-    label: child.label,
+    label: childDisplayName(child),
     background: true,
     ...(summary === undefined ? {} : { summary }),
   };
