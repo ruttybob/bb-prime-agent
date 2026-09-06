@@ -413,6 +413,39 @@ describe("model and thinking switches on the running session", () => {
   });
 });
 
+describe("the context window on the timeline (bbpa-b1m.9)", () => {
+  it("fills the usage row's window and meters the contextWindow row", async () => {
+    // The session reports GLM (contextWindow 1M) in its attach state; the
+    // meter reads the turn's own tokens (see the assertion below).
+    const providerThreadId = await startThread("s", "thr_window");
+    daemon.enqueuePrompt({ events: textTurnEvents({ text: "ok" }) });
+    sendRequest("t", "turn/start", {
+      threadId: "thr_window",
+      providerThreadId,
+      input: [{ type: "text", text: "hello", mentions: [] }],
+      clientRequestId: CLIENT_REQUEST_ID,
+      options: FULL_OPTIONS,
+    });
+    const reply = await waitForResponse("t");
+    expect(reply.error).toBeUndefined();
+
+    // `textTurnEvents` reports 9 tokens (7 in, 2 out) for the turn.
+    const threadDeltas = deltas("thr_window");
+    expect(threadDeltas.find((delta) => delta.kind === "usage")).toMatchObject({
+      total: { totalTokens: 9 },
+      last: { totalTokens: 9 },
+      modelContextWindow: 1_000_000,
+    });
+    expect(threadDeltas.find((delta) => delta.kind === "contextWindow")).toEqual({
+      kind: "contextWindow",
+      used: 9,
+      size: 1_000_000,
+      estimated: true,
+      attach: "currentOrLast",
+    });
+  });
+});
+
 describe("manual compaction", () => {
   // bb sends the standalone builtin `/compact` prompt as text with a builtin
   // command mention spanning it — the shape `provider/list`'s composer emits.

@@ -878,6 +878,10 @@ export class PrimeSession {
     const context: TranslationContext = {
       threadId: this.record.threadId,
       cwd: this.record.cwd,
+      // The active model's context window (bbpa-b1m.9): the lane owns the
+      // adopted session facts (attach snapshot, model switches); the
+      // translator only reads what this event's context carries.
+      modelContextWindow: this.state.primeModel?.contextWindow,
       // An interrupt settled the turn locally; prime's own `agent_end` still
       // carries the item closes but must not close the turn twice.
       suppressTurnBoundary: this.openTurn?.settledLocally === true,

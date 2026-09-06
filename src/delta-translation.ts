@@ -446,6 +446,15 @@ export interface TranslationContext {
   threadId: string;
   cwd: string | undefined;
   /**
+   * The context window (tokens) of the model the session currently runs, as
+   * the lane adopted it — prime's attach-snapshot `state.model.contextWindow`,
+   * kept current across bb-driven model switches (`PrimeSessionState
+   * .primeModel`). `undefined` when the model, or its window, is unknown: the
+   * usage row then reports `null` and no `contextWindow` row is rendered at
+   * all, rather than one inventing a size (bbpa-b1m.9).
+   */
+  modelContextWindow?: number | undefined;
+  /**
    * The bridge settled the turn itself (soft stop): prime's `agent_end` still
    * carries item closes, but its boundary must not close the turn twice.
    */
@@ -614,7 +623,37 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
     const state = stateFor(context.threadId);
     const total = addTokenUsage(state.usage, last);
     state.usage = total;
-    return [{ kind: "usage", total, last, modelContextWindow: null }];
+    const contextWindow =
+      typeof context.modelContextWindow === "number"
+        ? context.modelContextWindow
+        : null;
+    const deltas: ThreadDelta[] = [
+      { kind: "usage", total, last, modelContextWindow: contextWindow },
+    ];
+    // The dedicated context row (bbpa-b1m.9) only rides a known window — with
+    // no model window there is nothing to meter, so no row is invented.
+    if (contextWindow === null) {
+      return deltas;
+    }
+    return [
+      ...deltas,
+      {
+        kind: "contextWindow",
+        // The used figure is the turn's own usage, not the session's
+        // cumulative sum: prime's context meter builds on the last assistant
+        // message's tokens (`calculateContextTokens` over
+        // `getLastAssistantUsage` — input + output + cache, which is exactly
+        // `last` here), and only that describes how full the window is.
+        used: last.totalTokens,
+        size: contextWindow,
+        // Prime itself calls this an estimate (`estimateContextTokens`): the
+        // last assistant's usage plus a trailing character estimate, and
+        // `tokens: null` after a compaction boundary until the next response
+        // — `getContextUsage` in prime's agent-session.
+        estimated: true,
+        attach: "currentOrLast",
+      },
+    ];
   }
 
   function closeOpenStreams(context: TranslationContext): ThreadDelta[] {
