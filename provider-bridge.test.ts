@@ -140,6 +140,9 @@ describe("resident session construction", () => {
       "item.textDelta",
       "item.textClose",
       "usage",
+      // The turn-throughput row (bbpa-b1m.10) settles with the boundary.
+      "item.open",
+      "item.close",
       "turn.boundary",
     ]);
   });
@@ -198,6 +201,9 @@ describe("turn streaming", () => {
       "item.textDelta",
       "item.textClose",
       "usage",
+      // The turn-throughput row (bbpa-b1m.10) settles with the boundary.
+      "item.open",
+      "item.close",
       "turn.boundary",
     ]);
     const [first, second] = threadDeltas.filter(
@@ -554,6 +560,8 @@ describe("the snapshot and live event boundary", () => {
       "item.textDelta",
       "item.textClose",
       "usage",
+      "item.open",
+      "item.close",
       "turn.boundary",
     ]);
     expect(deltas("thr_1").find((delta) => delta.kind === "item.textClose")).toMatchObject({

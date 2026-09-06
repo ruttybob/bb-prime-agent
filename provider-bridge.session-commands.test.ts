@@ -149,6 +149,8 @@ describe("a session command inside a live turn", () => {
         title: "/goal ship bbpa-b1m",
       },
     });
+    // The close carries the same presentation the grammar requires on
+    // extension rows.
     expect(threadDeltas).toContainEqual({
       kind: "item.close",
       key: { channel: "session-command-1" },
@@ -161,6 +163,11 @@ describe("a session command inside a live turn", () => {
           text: "/goal ship bbpa-b1m",
           phase: "succeeded",
         },
+      },
+      presentation: {
+        label: { pending: "/goal", completed: "/goal" },
+        icon: { glyph: "terminal" },
+        title: "/goal ship bbpa-b1m",
       },
       status: "completed",
       resultText: "Goal set: ship bbpa-b1m",

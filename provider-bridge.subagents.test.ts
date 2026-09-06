@@ -115,7 +115,13 @@ describe("a live child stream, assembled", () => {
       "reading the transcript",
       "subagent is running",
     ]);
-    const closes = child.filter((delta) => delta.kind === "item.close");
+    // Scope the settle to the delegation row: the turn-throughput row
+    // (bbpa-b1m.10) closes in the same turn and is not this test's subject.
+    const closes = child.filter(
+      (delta) =>
+        delta.kind === "item.close" &&
+        JSON.stringify(delta.item).includes("scout"),
+    );
     expect(closes).toHaveLength(1);
     expect(closes[0]).toMatchObject({
       status: "completed",

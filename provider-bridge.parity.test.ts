@@ -62,6 +62,34 @@ const createAssembler: CreateParityAssembler = (providerId) => {
   return { assembleMessage: (message) => collector.assembleMessage(message) };
 };
 
+/**
+ * Turn-throughput rows time a wall-clock turn (bbpa-b1m.10): their
+ * durationMs, tps, and the headline built from them differ between the pin
+ * and every replay — a replayed turn runs in milliseconds, a live one in
+ * seconds. Parity therefore compares the rows' stable shape (presence, key,
+ * tokens, model, presentation shell) with the timed figures blanked, the way
+ * the SDK's own parity layer blanks timestamps.
+ */
+function blankTurnTiming<E>(events: readonly E[]): E[] {
+  return events.map((event) => {
+    const copy = structuredClone(event) as unknown as {
+      item?: {
+        kind?: string;
+        payload?: Record<string, unknown>;
+        presentation?: { title?: string };
+      };
+    } & E;
+    if (copy.item?.kind !== "prime-agent/turn-usage") {
+      return event;
+    }
+    copy.item.payload = { ...copy.item.payload, durationMs: 0, tps: 0 };
+    if (copy.item.presentation !== undefined) {
+      copy.item.presentation = { ...copy.item.presentation, title: "0 tok/s" };
+    }
+    return copy;
+  });
+}
+
 function launchFor(cell: RecordedCell) {
   const launch = resolveProviderBridgeLaunch({
     modulePath: BUILT_BRIDGE,
@@ -130,12 +158,12 @@ describe("the committed live recording", () => {
 
       const comparison = compareParity(
         {
-          events: recorded.events,
+          events: blankTurnTiming(recorded.events),
           rows: [],
           grammarViolations: recorded.grammarViolations,
         },
         {
-          events: run.events,
+          events: blankTurnTiming(run.events),
           rows: [],
           grammarViolations: run.grammarViolations,
         },

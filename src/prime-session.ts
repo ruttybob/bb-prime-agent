@@ -882,6 +882,10 @@ export class PrimeSession {
       // adopted session facts (attach snapshot, model switches); the
       // translator only reads what this event's context carries.
       modelContextWindow: this.state.primeModel?.contextWindow,
+      // Same discipline for the turn-throughput row (bbpa-b1m.10): the lane
+      // owns the clock and the model id; the translator only records stamps.
+      now: Date.now(),
+      model: this.state.model,
       // An interrupt settled the turn locally; prime's own `agent_end` still
       // carries the item closes but must not close the turn twice.
       suppressTurnBoundary: this.openTurn?.settledLocally === true,

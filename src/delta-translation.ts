@@ -99,6 +99,9 @@ const SESSION_COMMAND_TITLE_MAX_CHARS = 120;
 /** A result's legible tail caps here; command output can run much longer. */
 const SESSION_COMMAND_RESULT_MAX_CHARS = 2000;
 
+/** The timeline extension kind one turn-throughput row renders under. */
+const PRIME_TURN_USAGE_EXTENSION_KIND = `${PRIME_PLUGIN_ID}/turn-usage`;
+
 function thinkingStreamKey(contentIndex: number): string {
   return `thinking-${contentIndex}`;
 }
@@ -400,6 +403,12 @@ function sessionCommandResultDeltas(
       kind: "item.close",
       key: entry.key,
       item: sessionCommandItem(payload),
+      // The grammar requires extension closes to carry the presentation too.
+      presentation: sessionCommandPresentation({
+        name: payload.command,
+        args: payload.args,
+        text: payload.text,
+      }),
       status: failed ? "failed" : "completed",
       ...(resultText === undefined ? {} : { resultText }),
     },
@@ -421,18 +430,77 @@ function sessionCommandSettledPair(
   },
 ): ThreadDelta[] {
   const item = sessionCommandItem(payload);
+  const presentation = sessionCommandPresentation({
+    name: payload.command,
+    args: payload.args,
+    text: payload.text,
+  });
   return [
     sessionCommandOpenDelta(key, payload),
     {
       kind: "item.close",
       key,
       item,
+      presentation,
       status: result.status,
       ...(result.resultText === undefined
         ? {}
         : { resultText: result.resultText }),
     },
   ];
+}
+
+/* ----------------------- turn throughput (bbpa-b1m.10) ----------------------- */
+
+/** The payload one turn-throughput row carries. */
+type TurnUsagePayload = {
+  outputTokens: number;
+  durationMs: number;
+  tps: number;
+  model?: string;
+};
+
+/**
+ * The row headline ("38 tok/s"): at most one decimal under 100 tokens/s,
+ * an integer at 100 and above — the third digit carries no signal.
+ */
+function turnUsageTitle(tps: number): string {
+  const rounded = Math.round(tps * 10) / 10;
+  return `${rounded >= 100 ? Math.round(rounded) : rounded} tok/s`;
+}
+
+function turnUsagePresentation(tps: number): DeltaPresentation {
+  return {
+    label: { pending: "tokens", completed: "tokens" },
+    icon: { glyph: "gauge" },
+    title: turnUsageTitle(tps),
+  };
+}
+
+function turnUsageItem(payload: TurnUsagePayload): DeltaItemShape {
+  return {
+    type: "extension",
+    kind: PRIME_TURN_USAGE_EXTENSION_KIND,
+    payload,
+  };
+}
+
+/**
+ * The turn's generated output: output tokens summed over every assistant
+ * message of the run. A multi-round turn generates across rounds (tool-use
+ * rounds included) and prime hands them all over in the one `agent_end`, so
+ * the last message alone would undercount. `undefined` when no assistant
+ * message carried usage at all.
+ */
+function turnOutputTokens(messages: readonly AgentMessage[]): number | undefined {
+  let total: number | undefined;
+  for (const message of messages) {
+    if (!isAssistantMessage(message) || message.usage === undefined) {
+      continue;
+    }
+    total = (total ?? 0) + toNonNegativeNumber(message.usage.output);
+  }
+  return total;
 }
 
 /** Where a streamed turn sits, so an abort can settle it exactly once. */
@@ -454,6 +522,17 @@ export interface TranslationContext {
    * all, rather than one inventing a size (bbpa-b1m.9).
    */
   modelContextWindow?: number | undefined;
+  /**
+   * The canonical model id the session currently runs (`PrimeSessionState
+   * .model`), attributing the turn-throughput row (bbpa-b1m.10).
+   */
+  model?: string | undefined;
+  /**
+   * The lane's clock stamp for this event (ms epoch). The lane owns the
+   * clock; the translator only records stamps against the turn it is
+   * rendering, which keeps the timing seam injectable in tests (bbpa-b1m.10).
+   */
+  now?: number | undefined;
   /**
    * The bridge settled the turn itself (soft stop): prime's `agent_end` still
    * carries item closes, but its boundary must not close the turn twice.
@@ -482,6 +561,14 @@ interface ThreadState {
    */
   sessionCommandOrdinal: number;
   openSessionCommands: OpenSessionCommand[];
+  /**
+   * The running turn's throughput row (bbpa-b1m.10): the lane-stamped moment
+   * the turn's first push arrived. Undefined when the turn opened without a
+   * clock (no row can be timed) or after its row has settled.
+   */
+  turnUsage: { startedAt: number } | undefined;
+  /** Monotonic source of turn-throughput item keys, per thread. */
+  turnUsageOrdinal: number;
   usage: ThreadEventTokenUsageBreakdown;
   /** Set between `compaction_start` and `compaction_end`; prime's reason decides the settlement. */
   compaction: { manual: boolean } | undefined;
@@ -543,6 +630,8 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
       openDelegations: new Set(),
       sessionCommandOrdinal: 0,
       openSessionCommands: [],
+      turnUsage: undefined,
+      turnUsageOrdinal: 0,
       usage: ZERO_TOKEN_USAGE,
       compaction: undefined,
       queuePayload: undefined,
@@ -613,13 +702,9 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
   }
 
   function usageDeltas(
-    message: AgentMessage | undefined,
+    last: ThreadEventTokenUsageBreakdown,
     context: TranslationContext,
   ): ThreadDelta[] {
-    const last = toUsageBreakdown(message);
-    if (last === undefined) {
-      return [];
-    }
     const state = stateFor(context.threadId);
     const total = addTokenUsage(state.usage, last);
     state.usage = total;
@@ -809,6 +894,67 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
     });
   }
 
+  /**
+   * The turn-throughput row (bbpa-b1m.10), settled alongside the boundary.
+   * Prime reports usage once per run — every round's assistant messages ride
+   * the one `agent_end` — so the row lands here as an open+close pair in one
+   * breath, under the same per-thread-ordinal key discipline as
+   * session-command rows. No clock (snapshots, adopted history), or a turn
+   * whose last assistant carries no usage: no row.
+   */
+  function turnUsageDeltas(
+    lastUsage: ThreadEventTokenUsageBreakdown | undefined,
+    messages: readonly AgentMessage[],
+    context: TranslationContext,
+  ): ThreadDelta[] {
+    const turn = stateFor(context.threadId).turnUsage;
+    if (turn === undefined || typeof context.now !== "number") {
+      return [];
+    }
+    // The same gate as the usage row: a turn whose last assistant carries no
+    // usage produced nothing meterable.
+    if (lastUsage === undefined) {
+      return [];
+    }
+    const outputTokens = turnOutputTokens(messages) ?? lastUsage.outputTokens;
+    const durationMs = Math.max(0, context.now - turn.startedAt);
+    const tps = durationMs > 0 ? (outputTokens / durationMs) * 1000 : 0;
+    const payload: TurnUsagePayload = {
+      outputTokens,
+      durationMs,
+      tps,
+      ...(context.model === undefined ? {} : { model: context.model }),
+    };
+    const state = stateFor(context.threadId);
+    state.turnUsageOrdinal += 1;
+    const key: DeltaItemKey = { channel: `turn-usage-${state.turnUsageOrdinal}` };
+    const item = turnUsageItem(payload);
+    state.turnUsage = undefined; // settled — the turn's row is done
+    const presentation = turnUsagePresentation(tps);
+    return [
+      {
+        kind: "item.open",
+        key,
+        item,
+        attach: "currentOrLast",
+        presentation,
+      },
+      {
+        kind: "item.close",
+        key,
+        item,
+        // The grammar requires extension closes to carry the presentation
+        // too (the assembler validates both).
+        presentation,
+        // A locally settled turn (soft stop) still gets its row — prime's
+        // `agent_end` for the aborted run carries the usage — but the row
+        // must not claim a completed turn.
+        status:
+          context.suppressTurnBoundary === true ? "interrupted" : "completed",
+      },
+    ];
+  }
+
   function translate(
     event: unknown,
     context: TranslationContext,
@@ -826,6 +972,11 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
 
     switch (type) {
       case "agent_start":
+        // The throughput row's clock starts at the turn's first push
+        // (bbpa-b1m.10): the lane stamps every event; the translator only
+        // records the stamp. Without a clock no row can be timed this turn.
+        stateFor(context.threadId).turnUsage =
+          typeof context.now === "number" ? { startedAt: context.now } : undefined;
         return [{ kind: "turn.open" }];
 
       case "message_update": {
@@ -999,7 +1150,11 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
             willRetry: true,
           });
         }
-        deltas.push(...usageDeltas(lastAssistant, context));
+        const lastUsage = toUsageBreakdown(lastAssistant);
+        if (lastUsage !== undefined) {
+          deltas.push(...usageDeltas(lastUsage, context));
+        }
+        deltas.push(...turnUsageDeltas(lastUsage, parsed.data.messages, context));
         if (context.suppressTurnBoundary !== true) {
           deltas.push({
             kind: "turn.boundary",
@@ -1340,6 +1495,7 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
           text: open.ref.text,
           phase: "interrupted",
         }),
+        presentation: sessionCommandPresentation(open.ref),
         status: "interrupted",
       });
     }
