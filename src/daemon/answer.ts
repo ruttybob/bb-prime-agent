@@ -16,6 +16,21 @@ export type DaemonRequest = (
   args?: { timeoutMs?: number },
 ) => Promise<DaemonCommandResult>;
 
+/**
+ * The daemon's refusal for a session id it no longer hosts: the supervisor and
+ * every worker spell it identically (`resolveActiveSessionState`,
+ * `findWorker`), and it is the one refusal that means "the resident session is
+ * gone, the transcript file is not" — the daemon evicts idle sessions, and
+ * `create {sessionPath}` re-hosts the same transcript under a fresh id.
+ */
+const UNKNOWN_ACTIVE_SESSION = "Unknown active session";
+
+/** Whether a daemon refusal (raw or `readCommandData`-formatted) says gone. */
+export function isUnknownActiveSessionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes(UNKNOWN_ACTIVE_SESSION);
+}
+
 /** What an answer parser reports: the typed read, or why it could not read. */
 export type AnswerRead<T> =
   | { success: true; data: T }

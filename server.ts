@@ -8,10 +8,17 @@ import {
   type SubagentsTranscriptHostResult,
 } from "./src/subagents/contract.js";
 import {
+  primeHeartbeatsHostContract,
+  primeHeartbeatsHostSignals,
+  primeHeartbeatsRpcContract,
+  type HeartbeatsListHostResult,
+} from "./src/heartbeats/contract.js";
+import {
   discoverUserPrimeExtensions,
   userExtensionSettingsDescriptors,
 } from "./src/user-extensions.js";
 import {
+  HEARTBEATS_REALTIME_CHANNEL,
   PRIME_PROVIDER_THREAD_PREFIX,
   SUBAGENTS_REALTIME_CHANNEL,
 } from "./src/vocabulary.js";
@@ -41,27 +48,21 @@ export default function plugin(bb: BbPluginApi): void {
     primeProviderDeclaration({ userExtensions }),
   );
   const stopSubagents = registerSubagents(bb);
+  const stopHeartbeats = registerHeartbeats(bb);
   bb.onDispose(() => {
     registered.dispose();
     stopSubagents();
+    stopHeartbeats();
   });
 }
 
 /**
- * The Subagents panel's server half: thread id → prime session → roster, plus
- * the host-signal → realtime hop that makes transitions live. The control
- * actions (bbpa-ggf.10) take the same road — the panel's steer and stop are
- * relayed to the connected hosts, and one daemon (the one holding the session)
- * acts — with one difference: a control action that no host can perform is an
- * rpc error, never a quiet success.
+ * bb thread id → the prime session its identity named (small, sticky). Shared
+ * by every panel's server half: the bridge announces `thread/identity` at
+ * every session construction, so the latest row names the resident session —
+ * including after a resume.
  */
-function registerSubagents(bb: BbPluginApi): () => void {
-  const hostClient = bb.hosts.experimental_client({
-    contract: primeSubagentsHostContract,
-    experimental_signals: primeSubagentsHostSignals,
-  });
-
-  /** bb thread id → the prime session its identity named (small, sticky). */
+function createSessionResolver(bb: BbPluginApi) {
   const sessionByThread = new Map<string, string>();
 
   async function resolveActiveSessionId(
@@ -71,8 +72,6 @@ function registerSubagents(bb: BbPluginApi): () => void {
     if (cached !== undefined) {
       return cached;
     }
-    // The bridge announces `thread/identity` at every session construction, so
-    // the latest row names the resident session — including after a resume.
     const rows = await bb.sdk.threads.events.list({
       threadId,
       types: ["thread/identity"],
@@ -98,12 +97,16 @@ function registerSubagents(bb: BbPluginApi): () => void {
     return activeSessionId;
   }
 
-  /**
-   * Ask every connected host in turn; the first one whose daemon holds the
-   * session answers. A host without the session refuses (there is nothing to
-   * attach to, nothing to steer), which is why only a universal refusal is an
-   * answer — and why a control action lands on exactly one daemon.
-   */
+  return { resolveActiveSessionId };
+}
+
+/**
+ * The "ask every connected host in turn" fan-out both panels share: a read
+ * whose no host can answer is a state (`undefined` — the panel renders it),
+ * while callers decide which of their actions must instead refuse. A host
+ * listing that fails says so in the log and answers nothing.
+ */
+function createHostFanOut(bb: BbPluginApi, panel: string) {
   async function firstHostAnswer<Answer>(
     activeSessionId: string,
     what: string,
@@ -113,9 +116,7 @@ function registerSubagents(bb: BbPluginApi): () => void {
     try {
       hosts = await bb.sdk.hosts.list();
     } catch (error) {
-      bb.log.warn(
-        `Subagents panel: could not list hosts (${errorMessage(error)})`,
-      );
+      bb.log.warn(`${panel}: could not list hosts (${errorMessage(error)})`);
       return undefined;
     }
     for (const host of hosts) {
@@ -126,12 +127,37 @@ function registerSubagents(bb: BbPluginApi): () => void {
         return await ask(host.id);
       } catch (error) {
         bb.log.debug(
-          `Subagents panel: host ${host.id} could not ${what} ${activeSessionId} (${errorMessage(error)})`,
+          `${panel}: host ${host.id} could not ${what} ${activeSessionId} (${errorMessage(error)})`,
         );
       }
     }
     return undefined;
   }
+
+  function noHostHolds(activeSessionId: string): Error {
+    return new Error(
+      `No connected machine has prime-agent session ${activeSessionId}. Is prime-agent running on the machine this thread runs on?`,
+    );
+  }
+
+  return { firstHostAnswer, noHostHolds };
+}
+
+/**
+ * The Subagents panel's server half: thread id → prime session → roster, plus
+ * the host-signal → realtime hop that makes transitions live. The control
+ * actions (bbpa-ggf.10) take the same road — the panel's steer and stop are
+ * relayed to the connected hosts, and one daemon (the one holding the session)
+ * acts — with one difference: a control action that no host can perform is an
+ * rpc error, never a quiet success.
+ */
+function registerSubagents(bb: BbPluginApi): () => void {
+  const hostClient = bb.hosts.experimental_client({
+    contract: primeSubagentsHostContract,
+    experimental_signals: primeSubagentsHostSignals,
+  });
+  const { resolveActiveSessionId } = createSessionResolver(bb);
+  const { firstHostAnswer, noHostHolds } = createHostFanOut(bb, "Subagents panel");
 
   /** The thread's session, or a refusal the panel can show as-is. */
   async function requireActiveSessionId(
@@ -145,12 +171,6 @@ function registerSubagents(bb: BbPluginApi): () => void {
       );
     }
     return resolved;
-  }
-
-  function noHostHolds(activeSessionId: string): Error {
-    return new Error(
-      `No connected machine has prime-agent session ${activeSessionId}. Is prime-agent running on the machine this thread runs on?`,
-    );
   }
 
   bb.rpc.register(primeSubagentsRpcContract, {
@@ -269,6 +289,175 @@ function registerSubagents(bb: BbPluginApi): () => void {
     },
   );
   return unsubscribe;
+}
+
+/**
+ * The Heartbeats panel's server half (bbpa-b1m.3, schedules bbpa-b1m.4): the
+ * same road the Subagents panel paved — thread id in, the resolved prime
+ * session fanned out to the connected hosts, host pushes republished on one
+ * realtime channel. Reads answer a state the panel renders; actions throw
+ * when no host can perform them. prime's `heartbeats_changed` push is global
+ * (no session id — wire fact), so the republished payload is a bare
+ * timestamp and every open panel refetches its own session.
+ */
+function registerHeartbeats(bb: BbPluginApi): () => void {
+  const hostClient = bb.hosts.experimental_client({
+    contract: primeHeartbeatsHostContract,
+    experimental_signals: primeHeartbeatsHostSignals,
+  });
+  const { resolveActiveSessionId } = createSessionResolver(bb);
+  const { firstHostAnswer, noHostHolds } = createHostFanOut(bb, "Heartbeats panel");
+
+  async function requireActiveSessionId(
+    threadId: string,
+    activeSessionId: string | undefined,
+  ): Promise<string> {
+    const resolved = activeSessionId ?? (await resolveActiveSessionId(threadId));
+    if (resolved === undefined) {
+      throw new Error(
+        "This thread has no prime-agent session yet. Start it on prime-agent to manage its heartbeats.",
+      );
+    }
+    return resolved;
+  }
+
+  bb.rpc.register(primeHeartbeatsRpcContract, {
+    async list(input) {
+      const activeSessionId =
+        input.activeSessionId ?? (await resolveActiveSessionId(input.threadId));
+      if (activeSessionId === undefined) {
+        return {
+          state: "unknown_thread" as const,
+          activeSessionId: null,
+          heartbeats: [],
+          schedules: [],
+        };
+      }
+      const answer = await firstHostAnswer<HeartbeatsListHostResult>(
+        activeSessionId,
+        "read heartbeats for",
+        (hostId) =>
+          hostClient.call("heartbeats.list", { activeSessionId }, { hostId }),
+      );
+      if (answer === undefined) {
+        return {
+          state: "unavailable" as const,
+          activeSessionId,
+          heartbeats: [],
+          schedules: [],
+        };
+      }
+      return {
+        state: "ready" as const,
+        activeSessionId,
+        heartbeats: answer.heartbeats,
+        schedules: answer.schedules,
+      };
+    },
+
+    async set(input) {
+      const activeSessionId = await requireActiveSessionId(
+        input.threadId,
+        input.activeSessionId,
+      );
+      const answer = await firstHostAnswer(
+        activeSessionId,
+        "set a heartbeat in",
+        (hostId) =>
+          hostClient.call(
+            "heartbeats.set",
+            {
+              activeSessionId,
+              schedule: input.schedule,
+              prompt: input.prompt,
+              ...(input.deliveryMode === undefined
+                ? {}
+                : { deliveryMode: input.deliveryMode }),
+            },
+            { hostId },
+          ),
+      );
+      if (answer === undefined) {
+        throw noHostHolds(activeSessionId);
+      }
+      return { activeSessionId, heartbeat: answer.heartbeat };
+    },
+
+    async manage(input) {
+      const activeSessionId = await requireActiveSessionId(
+        input.threadId,
+        input.activeSessionId,
+      );
+      const answer = await firstHostAnswer(
+        activeSessionId,
+        `${input.action} a heartbeat in`,
+        (hostId) =>
+          hostClient.call(
+            "heartbeats.manage",
+            {
+              activeSessionId,
+              jobId: input.jobId,
+              action: input.action,
+            },
+            { hostId },
+          ),
+      );
+      if (answer === undefined) {
+        throw noHostHolds(activeSessionId);
+      }
+      return { activeSessionId };
+    },
+
+    async scheduleAdd(input) {
+      const activeSessionId = await requireActiveSessionId(
+        input.threadId,
+        input.activeSessionId,
+      );
+      const answer = await firstHostAnswer(
+        activeSessionId,
+        "add a schedule in",
+        (hostId) =>
+          hostClient.call(
+            "heartbeats.scheduleAdd",
+            {
+              activeSessionId,
+              schedule: input.schedule,
+              prompt: input.prompt,
+            },
+            { hostId },
+          ),
+      );
+      if (answer === undefined) {
+        throw noHostHolds(activeSessionId);
+      }
+      return { activeSessionId };
+    },
+
+    async scheduleCancel(input) {
+      const activeSessionId = await requireActiveSessionId(
+        input.threadId,
+        input.activeSessionId,
+      );
+      const answer = await firstHostAnswer(
+        activeSessionId,
+        "cancel a schedule in",
+        (hostId) =>
+          hostClient.call(
+            "heartbeats.scheduleCancel",
+            { activeSessionId, jobId: input.jobId },
+            { hostId },
+          ),
+      );
+      if (answer === undefined) {
+        throw noHostHolds(activeSessionId);
+      }
+      return { activeSessionId };
+    },
+  });
+
+  return hostClient.experimental_onSignal("heartbeats.changed", (event) => {
+    bb.realtime.publish(HEARTBEATS_REALTIME_CHANNEL, event.payload);
+  });
 }
 
 function errorMessage(error: unknown): string {

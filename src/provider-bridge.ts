@@ -49,11 +49,17 @@ import {
 import { primeAvailableModels } from "./model-catalog.js";
 import { resolveDaemonSocketPath } from "./daemon/socket.js";
 import { asWireCommand } from "./daemon/transport.js";
-import { daemonSessionSummarySchema } from "./daemon/wire.js";
+import { isUnknownActiveSessionError } from "./daemon/answer.js";
+import {
+  daemonSavedSessionsSchema,
+  daemonSessionSummarySchema,
+} from "./daemon/wire.js";
 import { primeSessionName } from "./session-params.js";
 import { primePromptText } from "./skill-mentions.js";
 import {
+  PRIME_PROVIDER_THREAD_PREFIX,
   primeActiveSessionIdFrom,
+  primeProviderThreadId,
   provisionalPrimeProviderThreadId,
 } from "./vocabulary.js";
 import { PrimeSession } from "./prime-session.js";
@@ -64,7 +70,10 @@ import {
   type ConfiguredSkillRoot,
   type SessionRecord,
 } from "./session-table.js";
-import { sessionSkillRoots } from "./session-params.js";
+import {
+  BB_SESSION_NAME_PREFIX,
+  sessionSkillRoots,
+} from "./session-params.js";
 
 /**
  * The prime-agent provider bridge.
@@ -260,6 +269,117 @@ function sessionFor(record: SessionRecord): PrimeSession {
 }
 
 /**
+ * The transcript file of a session the daemon no longer hosts, found in
+ * prime's saved-session catalog by the "[bb] " name that embeds the thread id
+ * (`primeSessionName` spells both forms). Only consulted when this process
+ * never learned the file — a fresh bridge process resuming a dead id; the
+ * catalog refuses without a `cwd` (wire fact), and any trouble answering is
+ * "not found" for recovery's purposes: the caller's error is the honest one.
+ */
+async function findSavedSessionFile(
+  record: SessionRecord,
+): Promise<string | undefined> {
+  try {
+    const result = await daemonRequest(
+      asWireCommand({ type: "list_saved_sessions", cwd: record.cwd }),
+    );
+    if (!result.success) {
+      return undefined;
+    }
+    const parsed = daemonSavedSessionsSchema.safeParse(result.data);
+    if (!parsed.success) {
+      return undefined;
+    }
+    const canonical = `${BB_SESSION_NAME_PREFIX}${record.threadId}`;
+    const suffixed = `(${record.threadId})`;
+    return parsed.data.sessions.find(
+      (entry) => entry.name === canonical || entry.name?.endsWith(suffixed),
+    )?.path;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Bring an evicted session back (bbpa-px7): prime's daemon unloads sessions
+ * after they sit idle (~90 minutes on the calibrated build), and the id a bb
+ * thread holds then stops resolving — every session-scoped command refuses
+ * with "Unknown active session". The transcript file survives, and `create
+ * {sessionPath}` re-hosts the SAME transcript under a fresh id, so the
+ * recovery reopens the thread instead of failing it:
+ *
+ * - the fresh lane loads the remembered file, or the saved-session catalog
+ *   names it when this process never learned one (a resume onto a dead id);
+ * - the record re-indexes under the new daemon-derived provider thread id,
+ *   and bb hears the new identity the same way a resume reports it;
+ * - the timeline stays bb-persisted: the `inline` flavor (a live bridge
+ *   process, an open thread) sends the identity row and a warning without the
+ *   `session.reset` rebuild, while the `resume` flavor leaves announcing to
+ *   the resume handler, whose snapshot replay needs the reset.
+ *
+ * The old lane is already inert (closed, not listening), so replacing
+ * `record.session` disposes nothing and leaks nothing.
+ */
+async function reopenEvictedSession(
+  record: SessionRecord,
+  flavor: "inline" | "resume",
+): Promise<PrimeSession> {
+  const sessionPath = record.sessionFile ?? (await findSavedSessionFile(record));
+  if (sessionPath === undefined) {
+    throw new Error(
+      `prime-agent no longer hosts this session (its daemon unloads sessions that sit idle) and the transcript file could not be found; start a new thread`,
+    );
+  }
+  // The channel listens before `create`, exactly as in thread/start (bbpa-ggf.13):
+  // the reopened session's companion extension reconnects to the same
+  // thread-keyed path while the worker boots.
+  await ensureDynamicToolsChannel(record);
+  const session = laneFor(record);
+  await session.start({
+    threadId: record.threadId,
+    cwd: record.cwd,
+    sessionPath,
+    dynamicTools: dynamicTools.sessionConfig(record.threadId),
+    skillRoots: configuredSkillRootPaths(),
+  });
+  sessions.adoptProviderThreadId(
+    record,
+    primeProviderThreadId(record.activeSessionId!),
+  );
+  await publishDynamicTools(record);
+  if (flavor === "inline") {
+    // bb re-binds the thread to the new resident session without a timeline
+    // rebuild: the history on the thread is already the same transcript's.
+    notify(BRIDGE_NOTIFICATION_METHODS.threadIdentity, {
+      threadId: record.threadId,
+      providerThreadId: record.providerThreadId,
+    });
+    emitDeltas(record.threadId, [
+      {
+        kind: "provider.warning",
+        category: "general",
+        summary:
+          "prime-agent had unloaded this session after it sat idle; the thread reopened from its transcript and continues on a fresh session",
+      },
+    ]);
+  }
+  return session;
+}
+
+/**
+ * Replace a lane the daemon emptied with a reopened one, when the thread's
+ * record already knows it is gone. Returns the lane to talk to — the same one
+ * when the session is still resident.
+ */
+async function residentSession(record: SessionRecord): Promise<PrimeSession> {
+  const session = sessionFor(record);
+  if (!session.sessionGone) {
+    return session;
+  }
+  return reopenEvictedSession(record, "inline");
+}
+
+/**
  * The transcript file a rename of an inactive session addresses. The record's
  * own file wins; a thread this process released (record dropped on `release`)
  * is still renamed honestly through the daemon-derived provider thread id —
@@ -389,17 +509,39 @@ async function runTurn(args: {
       { kind: "input.accepted", clientRequestId: args.clientRequestId },
     ]);
   }
-  const session = sessionFor(record);
-  // Per-thread settings ride every turn: prime switches model and thinking
-  // level in place, so they apply from this turn on (a no-op sends nothing).
-  await session.applyTurnOptions({
-    model: args.model,
-    reasoningLevel: args.reasoningLevel,
-  });
-  await session.turn({
-    clientRequestId: args.clientRequestId,
-    input: args.input,
-  });
+  // A session the daemon unloaded while the thread sat idle (bbpa-px7) is
+  // reopened from its transcript first, so the turn lands on a live session
+  // instead of refusing.
+  let session = await residentSession(record);
+  try {
+    // Per-thread settings ride every turn: prime switches model and thinking
+    // level in place, so they apply from this turn on (a no-op sends nothing).
+    await session.applyTurnOptions({
+      model: args.model,
+      reasoningLevel: args.reasoningLevel,
+    });
+    await session.turn({
+      clientRequestId: args.clientRequestId,
+      input: args.input,
+    });
+  } catch (error) {
+    if (!isUnknownActiveSessionError(error)) {
+      throw error;
+    }
+    // The eviction landed between the check and the prompt (the push was
+    // missed while the lane was between attaches): reopen and retry ONCE —
+    // "Unknown active session" means nothing was delivered, so the retry
+    // cannot double-post.
+    session = await reopenEvictedSession(record, "inline");
+    await session.applyTurnOptions({
+      model: args.model,
+      reasoningLevel: args.reasoningLevel,
+    });
+    await session.turn({
+      clientRequestId: args.clientRequestId,
+      input: args.input,
+    });
+  }
 }
 
 /**
@@ -492,7 +634,10 @@ const handlers: Record<string, RequestHandler> = {
           // (bbpa-ggf.7): the resident session is renamed in place, and a
           // released thread's saved transcript is renamed by file.
           threadRename: true,
-          threadGoalClear: false,
+          // bb may ask the thread's goal to be cleared (bbpa-b1m.2): the
+          // bridge maps the request onto prime's own `/goal clear` session
+          // command — prime exposes no goal RPC (probe wire fact).
+          threadGoalClear: true,
           // Checkpoint forks (bbpa-ggf.7): every settled prompt-carrying turn
           // mints a fork anchor on its boundary, and `thread/fork` branches the
           // source session's transcript at that anchor into a NEW session for
@@ -641,7 +786,20 @@ const handlers: Record<string, RequestHandler> = {
             }
             record.activeSessionId = activeSessionId;
             const session = laneFor(record);
-            await session.attach();
+            try {
+              await session.attach();
+            } catch (error) {
+              if (!isUnknownActiveSessionError(error)) {
+                throw error;
+              }
+              // The daemon dropped the session (idle eviction, prime-side
+              // close) while bb held the thread: reopen it from its transcript
+              // instead of failing the resume (bbpa-px7). The resume flavor
+              // lets THIS handler announce the new id-space boundary and
+              // replay the snapshot below.
+              await reopenEvictedSession(record, "resume");
+            }
+            const live = sessionFor(record);
             // Every session construction is an id-space boundary, and the snapshot
             // content — when it is replayed at all — belongs to the new space.
             announceSession(record);
@@ -651,10 +809,18 @@ const handlers: Record<string, RequestHandler> = {
             // daemon after bb closed), where the snapshot is the only source of
             // that history the bridge ever sees.
             if (adopted) {
-              session.snapshotDeltas();
+              live.snapshotDeltas();
             }
           } else {
-            await sessionFor(record).attach();
+            const session = sessionFor(record);
+            try {
+              await session.attach();
+            } catch (error) {
+              if (!isUnknownActiveSessionError(error)) {
+                throw error;
+              }
+              await reopenEvictedSession(record, "resume");
+            }
             announceSession(record);
           }
           // The worker kept the companion extension from its create, but the
@@ -682,7 +848,7 @@ const handlers: Record<string, RequestHandler> = {
     threadForkParamsSchema,
     (id, data) => {
       return (async () => {
-        const sourceActiveSessionId = primeActiveSessionIdFrom(
+        let sourceActiveSessionId = primeActiveSessionIdFrom(
           data.sourceProviderThreadId,
         );
         if (sourceActiveSessionId === undefined) {
@@ -692,6 +858,14 @@ const handlers: Record<string, RequestHandler> = {
             `cannot fork ${data.sourceProviderThreadId}: it is not a prime-agent session id this bridge created`,
           );
           return;
+        }
+        // A source the daemon unloaded (idle eviction, bbpa-px7) is brought
+        // back from its transcript first — forking reads the resident
+        // session's tree, so the source must be resident to fork from.
+        const sourceRecord = sessions.byProviderThread(data.sourceProviderThreadId);
+        if (sourceRecord?.session?.sessionGone) {
+          await reopenEvictedSession(sourceRecord, "inline");
+          sourceActiveSessionId = sourceRecord.activeSessionId!;
         }
         // The fork's NEW thread gets the full construction funnel: its own bb
         // thread id names its own "[bb] " session, and the channel listens
@@ -711,11 +885,27 @@ const handlers: Record<string, RequestHandler> = {
           // has to be bracketed. bb has already copied the inherited timeline
           // into the new thread itself, so the snapshot below arms the boundary
           // without being replayed as content.
-          const branched = await forkPrimeSession({
-            request: (command, requestArgs) => daemonRequest(command, requestArgs),
-            sourceActiveSessionId,
-            checkpointId: data.sourceProviderCheckpointId,
-          });
+          let branched: Awaited<ReturnType<typeof forkPrimeSession>>;
+          try {
+            branched = await forkPrimeSession({
+              request: (command, requestArgs) => daemonRequest(command, requestArgs),
+              sourceActiveSessionId,
+              checkpointId: data.sourceProviderCheckpointId,
+            });
+          } catch (error) {
+            if (
+              isUnknownActiveSessionError(error) &&
+              sourceRecord === undefined
+            ) {
+              // This process never knew the source thread, so there is no
+              // transcript to reopen from; the thread itself recovers on its
+              // next message.
+              throw new Error(
+                `prime-agent no longer hosts the source session (its daemon unloads sessions that sit idle); send a message in the source thread first — it reopens from its transcript — and then fork`,
+              );
+            }
+            throw error;
+          }
           await startSession({
             record,
             model: data.options.model,
@@ -886,10 +1076,29 @@ const handlers: Record<string, RequestHandler> = {
   [BRIDGE_REQUEST_METHODS.threadGoalClear]: withParsed(
     BRIDGE_REQUEST_METHODS.threadGoalClear,
     threadGoalClearParamsSchema,
-    () => {
-      throw new Error(
-        "prime-agent goal clearing is not wired yet: the handshake declares no threadGoalClear",
-      );
+    (id, data) => {
+      return (async () => {
+        const record = sessions.byThread(data.threadId);
+        if (record === undefined) {
+          throw new Error(`No session for thread ${data.threadId}; send thread/start or thread/resume first`);
+        }
+        // Answered when prime admits the command, not when it runs: the
+        // clearing itself lands as `/goal clear` always does — command rows
+        // and a `goal_update` on the timeline, queued behind work in flight.
+        const session = await residentSession(record);
+        try {
+          await session.clearGoal();
+        } catch (error) {
+          if (!isUnknownActiveSessionError(error)) {
+            throw error;
+          }
+          // The session was unloaded under us; reopen and clear once.
+          await reopenEvictedSession(record, "inline").then((fresh) =>
+            fresh.clearGoal(),
+          );
+        }
+        io.sendResult(id, { ok: true });
+      })();
     },
   ),
 
@@ -951,7 +1160,18 @@ const handlers: Record<string, RequestHandler> = {
         // daemon's resumeIfIdle starts a fresh run. The steered text shows on
         // the timeline as a provider input row; the turn in flight settles
         // itself, and a resumed run opens the turn that answers the steer.
-        await sessionFor(record).steer({ input: data.input });
+        const session = await residentSession(record);
+        try {
+          await session.steer({ input: data.input });
+        } catch (error) {
+          if (!isUnknownActiveSessionError(error)) {
+            throw error;
+          }
+          // The session was unloaded under us; reopen and deliver once.
+          await reopenEvictedSession(record, "inline").then((fresh) =>
+            fresh.steer({ input: data.input }),
+          );
+        }
         emitDeltas(record.threadId, [
           { kind: "input.accepted", clientRequestId: data.clientRequestId },
           { kind: "input.provider", text },

@@ -16,11 +16,17 @@ describe("the host artifact", () => {
 
   it("exports a host RPC entry beside the bridge", () => {
     expect(hostEntry.experimental_apiVersion).toBe(1);
-    // Both halves share the one host entry: the Subagents panel's
-    // per-machine backend — roster (bbpa-ggf.9) and its control actions
-    // (bbpa-ggf.10) — and the native-roots resolver bb calls when it lists
+    // The halves share the one host entry: the Subagents panel's per-machine
+    // backend — roster (bbpa-ggf.9) and its control actions (bbpa-ggf.10) —
+    // the Heartbeats panel's reads and actions (bbpa-b1m.3, schedules
+    // bbpa-b1m.4), and the native-roots resolver bb calls when it lists
     // prime's skills for the "/" menu (bbpa-ggf.8).
     expect(Object.keys(hostEntry.contract).sort()).toEqual([
+      "heartbeats.list",
+      "heartbeats.manage",
+      "heartbeats.scheduleAdd",
+      "heartbeats.scheduleCancel",
+      "heartbeats.set",
       "resolveNativeRoots",
       "subagents.roster",
       "subagents.steer",

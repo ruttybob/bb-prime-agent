@@ -51,8 +51,11 @@ function renderPanel(options: Parameters<typeof renderSlot>[2] = {}) {
 }
 
 describe("the Subagents panel", () => {
-  it("registers one thread panel action", () => {
-    expect(app.threadPanelActions).toHaveLength(1);
+  it("registers the subagents and heartbeats thread panel actions", () => {
+    expect(app.threadPanelActions.map((action) => action.id)).toEqual([
+      "subagents",
+      "heartbeats",
+    ]);
     expect(registration).toMatchObject({ id: "subagents", title: "Subagents" });
   });
 

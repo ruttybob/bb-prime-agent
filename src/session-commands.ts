@@ -20,6 +20,16 @@ import { join } from "node:path";
  * file's basename, and an invocation inserts the literal `/name …` text —
  * which rides the prompt passthrough into prime.
  *
+ * Deliberately listed ONLY commands prime's session itself runs —
+ * `execution: "session"` in its `BUILTIN_SLASH_COMMANDS` (bbpa-b1m.3
+ * correction of this catalog's first cut): `heartbeat`, `heartbeats` and
+ * `rlm-max-depth` are handled client-side by prime's TUI and have no session
+ * meaning. From bb they would reach the model as literal prompt text, so
+ * they have no menu entry here; heartbeats get a real surface instead (the
+ * Heartbeats panel over the daemon RPCs, which is what prime's TUI calls
+ * underneath), and rlm-max-depth stays a TUI command. bbpa-b1m.1 shipped
+ * those three entries believing the session parsed them — it never did.
+ *
  * Deliberately NO `compact`: bb ships a builtin `/compact` already, and that
  * passthrough is live (bbpa-ggf.6) — a second menu entry for the same name is
  * noise in the picker.
@@ -58,27 +68,9 @@ export const PRIME_SESSION_COMMANDS: readonly PrimeSessionCommand[] = [
     argumentHint: undefined,
   },
   {
-    name: "heartbeat",
-    description:
-      "Set or view a persistent heartbeat; delivery defaults to steer, use --follow-up to queue; supports pause, resume, stop, and clear",
-    argumentHint:
-      "[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]",
-  },
-  {
-    name: "heartbeats",
-    description: "View and manage all user and agent heartbeats",
-    argumentHint: undefined,
-  },
-  {
     name: "autonomous",
     description: "Set or view autonomous mode",
     argumentHint: "[status|on|off]",
-  },
-  {
-    name: "rlm-max-depth",
-    description:
-      "Set/view the per-chat persistent RLM max depth immediately; never interrupts or queues the running turn",
-    argumentHint: "[<int> [--global]]",
   },
 ];
 

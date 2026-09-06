@@ -946,10 +946,10 @@ describe("methods that need work the later tickets own", () => {
       ["provider/installation/status", { providerId: "prime-agent" }],
       ["provider/installation/run", { providerId: "prime-agent", action: "install" }],
       // thread/fork and thread/name/set are wired as of bbpa-ggf.7 (see
-      // provider-bridge.fork.test.ts / provider-bridge.rename.test.ts).
+      // provider-bridge.fork.test.ts / provider-bridge.rename.test.ts);
+      // thread/goal/clear as of bbpa-b1m.2 (provider-bridge.goal.test.ts).
       ["thread/archive", { threadId: "t", providerThreadId: "p" }],
       ["thread/unarchive", { threadId: "t", providerThreadId: "p" }],
-      ["thread/goal/clear", { threadId: "t", providerThreadId: "p" }],
     ];
     notYet.forEach(([method, params], index) => {
       sendRequest(`ny-${index}`, method, params);

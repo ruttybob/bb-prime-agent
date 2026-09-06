@@ -33,6 +33,13 @@ import {
   type AgentMessage,
 } from "./daemon/wire.js";
 import { PRIME_QUEUE_EXTENSION_KIND, queueStatePayload } from "./queue-state.js";
+import {
+  goalRowStatus,
+  goalStateHasContent,
+  goalStatusIsTerminal,
+  parsePrimeGoalState,
+  type PrimeGoalRowStatus,
+} from "./goal-state.js";
 import { PRIME_PLUGIN_ID } from "./vocabulary.js";
 import {
   childActivityLabel,
@@ -101,6 +108,100 @@ const SESSION_COMMAND_RESULT_MAX_CHARS = 2000;
 
 /** The timeline extension kind one turn-throughput row renders under. */
 const PRIME_TURN_USAGE_EXTENSION_KIND = `${PRIME_PLUGIN_ID}/turn-usage`;
+
+/**
+ * The timeline extension kind the thread's goal row renders under
+ * (bbpa-b1m.2): one open row per goal, updated in place by prime's
+ * accounting ticks, closed when the goal reaches a terminal state.
+ */
+const PRIME_GOAL_EXTENSION_KIND = `${PRIME_PLUGIN_ID}/goal`;
+
+/** A goal objective caps here; prime itself allows 4000 chars. */
+const GOAL_OBJECTIVE_MAX_CHARS = 400;
+
+/**
+ * prime's durable `/autonomous status` message (bbpa-b1m.6): every
+ * `/autonomous` command writes one `autonomous_status` custom message whose
+ * details carry the full runtime state — enabled, the used/limit triple, and
+ * the gate config. There is no autonomous RPC and no connection-state field
+ * (wire fact, probe 2026-09-06), so this message is the only wire-visible
+ * status surface — which makes it the row.
+ */
+const AUTONOMOUS_STATUS_CUSTOM_TYPE = "autonomous_status";
+
+/** The timeline extension kind one autonomous-status row renders under. */
+const PRIME_AUTONOMOUS_EXTENSION_KIND = `${PRIME_PLUGIN_ID}/autonomous`;
+
+/** The numbers one autonomous-status row carries, read loosely. */
+type PrimeAutonomousStatus = {
+  enabled: boolean;
+  continuationsUsed: number;
+  turnsUsed: number;
+  tokensUsed: number;
+  maxContinuations: number | null;
+  maxTurns: number | null;
+  maxTokens: number | null;
+};
+
+function parseAutonomousDetails(message: AgentMessage): PrimeAutonomousStatus | undefined {
+  const details = (message as Record<string, unknown>).details;
+  if (typeof details !== "object" || details === null) {
+    return undefined;
+  }
+  const record = details as Record<string, unknown>;
+  const limits =
+    typeof record.limits === "object" && record.limits !== null
+      ? (record.limits as Record<string, unknown>)
+      : {};
+  const int = (value: unknown): number | null =>
+    typeof value === "number" && Number.isFinite(value) ? value : null;
+  const enabled = record.enabled;
+  if (typeof enabled !== "boolean") {
+    return undefined;
+  }
+  return {
+    enabled,
+    continuationsUsed: int(record.continuationsUsed) ?? 0,
+    turnsUsed: int(record.turnsUsed) ?? 0,
+    tokensUsed: int(record.tokensUsed) ?? 0,
+    maxContinuations: int(limits.maxContinuations),
+    maxTurns: int(limits.maxTurns),
+    maxTokens: int(limits.maxTokens),
+  };
+}
+
+function autonomousItem(status: PrimeAutonomousStatus): DeltaItemShape {
+  return {
+    type: "extension",
+    kind: PRIME_AUTONOMOUS_EXTENSION_KIND,
+    payload: status,
+  };
+}
+
+function autonomousPresentation(status: PrimeAutonomousStatus): DeltaPresentation {
+  return {
+    label: { pending: "autonomous", completed: "autonomous" },
+    icon: { glyph: "Bot" },
+    title: capText(
+      status.enabled
+        ? `Autonomous on · ${status.continuationsUsed}/${status.maxContinuations ?? "?"} continuations · ${status.turnsUsed}/${status.maxTurns ?? "?"} turns`
+        : "Autonomous off",
+      SESSION_COMMAND_TITLE_MAX_CHARS,
+    ),
+  };
+}
+
+function autonomousResultText(status: PrimeAutonomousStatus): string {
+  if (!status.enabled) {
+    return "autonomous off";
+  }
+  const parts = [
+    `${status.continuationsUsed}/${status.maxContinuations ?? "?"} continuations`,
+    `${status.turnsUsed}/${status.maxTurns ?? "?"} turns`,
+    `${status.tokensUsed}/${status.maxTokens ?? "?"} tokens`,
+  ];
+  return `autonomous on · ${parts.join(" · ")}`;
+}
 
 function thinkingStreamKey(contentIndex: number): string {
   return `thinking-${contentIndex}`;
@@ -574,12 +675,31 @@ interface ThreadState {
   compaction: { manual: boolean } | undefined;
   /** Serialized queue payload last emitted, so an unchanged queue re-emits nothing. */
   queuePayload: string | undefined;
+  /**
+   * The goal row currently open for this thread (bbpa-b1m.2): its item key and
+   * the goal it belongs to, so accounting ticks progress the row in place and
+   * a replaced goal closes the row it superseded. Cleared in `resetThread`
+   * with the rest of the per-thread bookkeeping.
+   */
+  openGoal: {
+    key: DeltaItemKey;
+    goalId: string | undefined;
+    payload: PrimeGoalItemPayload;
+  } | undefined;
+  /** Monotonic source of autonomous-status item keys, per thread (bbpa-b1m.6). */
+  autonomousOrdinal: number;
 }
 
 export interface PrimeDeltaTranslator {
   translate(event: unknown, context: TranslationContext): ThreadDelta[];
   /** Deltas that rebuild a session's timeline from an attach snapshot. */
   snapshotDeltas(messages: readonly unknown[]): ThreadDelta[];
+  /**
+   * The deltas one goal state produces (bbpa-b1m.2): the lane's question for
+   * the attach snapshot's `state.goal` — the same answer a live `goal_update`
+   * event gets, so an adopted thread opens with the goal row already on it.
+   */
+  goalDeltas(goal: unknown, threadId: string): ThreadDelta[];
   /**
    * The queue-state delta for a lane snapshot read outside the event stream
    * (`get_queue` at attach); deduped against the event-driven updates.
@@ -635,6 +755,8 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
       usage: ZERO_TOKEN_USAGE,
       compaction: undefined,
       queuePayload: undefined,
+      openGoal: undefined,
+      autonomousOrdinal: 0,
     };
     states.set(threadId, created);
     while (states.size > MAX_STATE_ENTRIES) {
@@ -859,6 +981,39 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
     return [];
   }
 
+  /**
+   * The autonomous-status row (bbpa-b1m.6): an open+close pair in one
+   * breath, exactly like the throughput row — prime brackets the message
+   * with adjacent start/end events, and the row's two halves must not
+   * separate. Unparsable details degrade to a row with no numbers only when
+   * the content text is present; otherwise the message renders nothing.
+   */
+  function autonomousStatusDeltas(
+    message: AgentMessage | undefined,
+    context: TranslationContext,
+  ): ThreadDelta[] {
+    if (message === undefined || message.role !== "custom") {
+      return [];
+    }
+    if ((message as Record<string, unknown>).customType !== AUTONOMOUS_STATUS_CUSTOM_TYPE) {
+      return [];
+    }
+    const status = parseAutonomousDetails(message);
+    if (status === undefined) {
+      return [];
+    }
+    const state = stateFor(context.threadId);
+    const item = autonomousItem(status);
+    const presentation = autonomousPresentation(status);
+    state.autonomousOrdinal += 1;
+    return settledRowDeltas(
+      { channel: `autonomous-${state.autonomousOrdinal}` },
+      item,
+      presentation,
+      autonomousResultText(status),
+    );
+  }
+
   function openSessionCommand(
     message: AgentMessage,
     context: TranslationContext,
@@ -979,6 +1134,14 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
           typeof context.now === "number" ? { startedAt: context.now } : undefined;
         return [{ kind: "turn.open" }];
 
+      case "goal_update": {
+        // The thread goal's live voice (bbpa-b1m.2): full state on every
+        // mutation and on the accounting ticks between them. Malformed
+        // payloads render nothing (see goalStateDeltas).
+        const goal = (event as Record<string, unknown>).goal;
+        return goalStateDeltas(goal, context);
+      }
+
       case "message_update": {
         const parsed = messageUpdateEventSchema.safeParse(event);
         if (!parsed.success) {
@@ -1030,7 +1193,14 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
         if (!parsed.success) {
           return [];
         }
-        return sessionCommandDeltas(parsed.data.message, context);
+        const message = parsed.data.message;
+        // An autonomous-status message carries its whole row in one breath
+        // (bbpa-b1m.6); session commands render across the two events.
+        const autonomous = autonomousStatusDeltas(message, context);
+        if (autonomous.length > 0) {
+          return autonomous;
+        }
+        return sessionCommandDeltas(message, context);
       }
 
       case "message_end": {
@@ -1368,6 +1538,7 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
       commandOrdinal += 1;
       return { channel: `session-command-${commandOrdinal}` };
     };
+    let autonomousOrdinal = 0;
     for (const message of parsed) {
       if (message.role === "user") {
         const text = messageText(message);
@@ -1383,6 +1554,23 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
         // behavior: skipped.
         const customType = (message as Record<string, unknown>).customType;
         const ref = sessionCommandRef(message);
+        if (customType === AUTONOMOUS_STATUS_CUSTOM_TYPE) {
+          // An autonomous-status message is its own settled row (bbpa-b1m.6);
+          // the key ordinal is local to this pass, like the command rows'.
+          const status = parseAutonomousDetails(message);
+          if (status !== undefined) {
+            autonomousOrdinal += 1;
+            deltas.push(
+              ...settledRowDeltas(
+                { channel: `autonomous-${autonomousOrdinal}` },
+                autonomousItem(status),
+                autonomousPresentation(status),
+                autonomousResultText(status),
+              ),
+            );
+          }
+          continue;
+        }
         if (customType === SESSION_COMMAND_CUSTOM_TYPE && ref !== undefined) {
           const key = nextCommandKey();
           openCommands.push({ key, ref });
@@ -1502,9 +1690,168 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
     return deltas;
   }
 
+/**
+ * The deltas one goal state produces (bbpa-b1m.2): the first sight of a goal
+ * opens its row, an update to the same goal progresses it in place, a
+ * terminal state closes it, and a replaced goal closes the row it
+ * superseded. An unparsable state renders nothing — a prime that reshapes
+ * `GoalState` may cost a row, never a translator throw.
+ */
+function goalStateDeltas(
+  value: unknown,
+  context: TranslationContext,
+): ThreadDelta[] {
+  const goal = parsePrimeGoalState(value);
+  if (goal === undefined) {
+    return [];
+  }
+  if (!goalStateHasContent(goal)) {
+    // An idle state is prime's "no goal" — and the update a `/goal clear`
+    // (or a /goal pause-less teardown) announces with. It closes the open
+    // row; with no row open it is a non-event.
+    const state = stateFor(context.threadId);
+    if (state.openGoal === undefined) {
+      return [];
+    }
+    return closeGoalRow(
+      state,
+      { ...state.openGoal.payload, status: "cleared" },
+      "interrupted",
+    );
+  }
+  const status = goalRowStatus(goal.status);
+  const payload: PrimeGoalItemPayload = {
+    objective: typeof goal.objective === "string" ? goal.objective : "",
+    status,
+    tokenBudget: typeof goal.tokenBudget === "number" ? goal.tokenBudget : null,
+    tokensUsed: typeof goal.tokensUsed === "number" ? goal.tokensUsed : 0,
+    timeUsedSeconds: typeof goal.timeUsedSeconds === "number" ? goal.timeUsedSeconds : 0,
+  };
+  const state = stateFor(context.threadId);
+  const goalId = typeof goal.goalId === "string" && goal.goalId !== "" ? goal.goalId : undefined;
+
+  // Which open row does this state belong to? A state carrying the open
+  // row's goalId — or carrying none at all (prime omits goalId exactly when
+  // the state is not tied to a new goal) — is the same goal; only a state
+  // that names a DIFFERENT goal replaces the row, and it closes the stale
+  // one first, with the STALE goal's payload, so its final text stays what
+  // it was about. Either way the thread never shows two live goals.
+  const open = state.openGoal;
+  const sameGoal =
+    open !== undefined &&
+    (goalId === undefined || open.goalId === undefined || open.goalId === goalId);
+  let superseded: ThreadDelta[] = [];
+  if (open !== undefined && !sameGoal) {
+    superseded = closeGoalRow(
+      state,
+      { ...open.payload, status: "cleared" },
+      "interrupted",
+    );
+  }
+
+  const presentation = goalPresentation(payload);
+  const item = goalItem(payload);
+  if (open === undefined || !sameGoal) {
+    const key: DeltaItemKey = {
+      channel: goalId === undefined ? "goal" : `goal-${goalId}`,
+    };
+    if (goalStatusIsTerminal(status)) {
+      // A terminal state for a goal this thread has no row for (adopted
+      // history, or the open row was lost): an open+close pair still shows it.
+      return [
+        ...superseded,
+        ...settledRowDeltas(
+          { ...key, channel: key.channel },
+          item,
+          presentation,
+          goalResultText(payload),
+        ).map((delta) =>
+          delta.kind === "item.close"
+            ? { ...delta, status: closeStatusFor(status) }
+            : delta,
+        ),
+      ];
+    }
+    state.openGoal = { key, goalId, payload };
+    return [
+      ...superseded,
+      {
+        kind: "item.open",
+        key,
+        item,
+        attach: "currentOrLast",
+        presentation,
+      },
+    ];
+  }
+  const { key } = open;
+  if (goalStatusIsTerminal(status)) {
+    state.openGoal = undefined;
+    return [
+      {
+        kind: "item.close",
+        key,
+        item,
+        presentation,
+        status: closeStatusFor(status),
+        resultText: goalResultText(payload),
+      },
+    ];
+  }
+  // Non-terminal update: prime's accounting ticks (tokens/time move without
+  // a mutation) progress the open row in place.
+  return [
+    {
+      kind: "item.progress",
+      key,
+      message: goalProgressMessage(payload),
+    },
+  ];
+}
+
+/** The one-line progress a goal tick carries. */
+function goalProgressMessage(goal: PrimeGoalItemPayload): string {
+  const statusWord = goal.status === "active" ? "active" : goal.status.replace(/_/g, " ");
+  const parts = [statusWord];
+  if (goal.tokensUsed > 0) {
+    parts.push(formatGoalTokens(goal.tokensUsed));
+  }
+  if (goal.timeUsedSeconds > 0) {
+    parts.push(`${goal.timeUsedSeconds}s`);
+  }
+  return `goal ${parts.join(" · ")}`;
+}
+
+/** Close the goal row a replaced goal superseded. */
+function closeGoalRow(
+  state: ThreadState,
+  payload: PrimeGoalItemPayload,
+  status: "interrupted" | "completed" | "failed",
+): ThreadDelta[] {
+  const open = state.openGoal;
+  if (open === undefined) {
+    return [];
+  }
+  state.openGoal = undefined;
+  const item = goalItem(payload);
+  const presentation = goalPresentation(payload);
+  return [
+    {
+      kind: "item.close",
+      key: open.key,
+      item,
+      presentation,
+      status,
+    },
+  ];
+}
+
   return {
     translate,
     snapshotDeltas,
+    goalDeltas(goal, threadId) {
+      return goalStateDeltas(goal, { threadId, cwd: undefined });
+    },
     queueStateDeltas(threadId, queue) {
       return queueUpdateDeltas(threadId, queue);
     },
@@ -1538,6 +1885,90 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
       states.delete(threadId);
     },
   };
+}
+
+/** The payload one goal row carries: the state prime reported, respelled. */
+type PrimeGoalItemPayload = {
+  objective: string;
+  status: PrimeGoalRowStatus;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+};
+
+/** The goal row's item shape: one extension item under `prime-agent/goal`. */
+function goalItem(goal: PrimeGoalItemPayload): DeltaItemShape {
+  return {
+    type: "extension",
+    kind: PRIME_GOAL_EXTENSION_KIND,
+    payload: goal,
+  };
+}
+
+function goalPresentation(goal: PrimeGoalItemPayload): DeltaPresentation {
+  const statusWord = goal.status === "active" ? "active" : goal.status.replace(/_/g, " ");
+  const tokens = goal.tokensUsed > 0 ? ` · ${formatGoalTokens(goal.tokensUsed)}` : "";
+  return {
+    label: { pending: "Goal", completed: "Goal" },
+    icon: { glyph: "Target" },
+    title: capText(
+      `Goal (${statusWord}${tokens}): ${goal.objective}`,
+      GOAL_OBJECTIVE_MAX_CHARS,
+    ),
+  };
+}
+
+/** Compact token counts for a row title (`1234` → `1.2k`). */
+function formatGoalTokens(tokens: number): string {
+  return tokens >= 1000 ? `${(tokens / 1000).toFixed(1)}k tokens` : `${tokens} tokens`;
+}
+
+/**
+ * The settled-row pair one durable message renders as: an open and a close in
+ * one breath, under one key. Shared by the autonomous-status rows (live and
+ * replay) and a terminal goal state arriving with no open row.
+ */
+function settledRowDeltas(
+  key: DeltaItemKey,
+  item: DeltaItemShape,
+  presentation: DeltaPresentation,
+  resultText: string,
+): ThreadDelta[] {
+  return [
+    {
+      kind: "item.open",
+      key,
+      item,
+      attach: "currentOrLast",
+      presentation,
+    },
+    {
+      kind: "item.close",
+      key,
+      item,
+      presentation,
+      status: "completed",
+      resultText,
+    },
+  ];
+}
+
+/** bb's item-close vocabulary for a terminal goal status. */
+function closeStatusFor(status: PrimeGoalRowStatus): "completed" | "failed" | "interrupted" {
+  if (status === "complete") {
+    return "completed";
+  }
+  if (status === "error") {
+    return "failed";
+  }
+  return "interrupted";
+}
+
+/** The legible tail a closed goal row carries. */
+function goalResultText(goal: PrimeGoalItemPayload): string {
+  const tokens = goal.tokensUsed > 0 ? ` · ${formatGoalTokens(goal.tokensUsed)}` : "";
+  const seconds = goal.timeUsedSeconds > 0 ? ` · ${goal.timeUsedSeconds}s` : "";
+  return `goal ${goal.status}${tokens}${seconds}`;
 }
 
 function isErrorResult(result: AgentMessage): boolean {

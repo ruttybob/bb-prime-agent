@@ -7,7 +7,10 @@ import type {
 import type { DaemonCommandResult } from "./daemon/client.js";
 import type { DaemonConnectionEvent } from "./daemon/connection.js";
 import type { DaemonHello, DaemonPushMessage } from "./daemon/protocol.js";
-import { readCommandData } from "./daemon/answer.js";
+import {
+  isUnknownActiveSessionError,
+  readCommandData,
+} from "./daemon/answer.js";
 import {
   createPrimeDeltaTranslator,
   type PrimeDeltaTranslator,
@@ -41,6 +44,11 @@ import {
   type PrimeThinkingLevel,
 } from "./session-params.js";
 import { primePromptText } from "./skill-mentions.js";
+import {
+  goalStateHasContent,
+  parsePrimeGoalState,
+  type PrimeGoalState,
+} from "./goal-state.js";
 import { primeProviderThreadId } from "./vocabulary.js";
 import { forkCheckpointFor } from "./fork-points.js";
 import { asWireCommand } from "./daemon/transport.js";
@@ -214,6 +222,12 @@ export class PrimeSession {
   private clientsTimer: ReturnType<typeof setInterval> | undefined;
   private clientsReadAt = 0;
   /**
+   * The thread goal the last attach snapshot carried (bbpa-b1m.2), when it
+   * described a real goal. `undefined` for a fresh session, a cleared goal,
+   * or a prime too old to report the field. Consumed by `snapshotDeltas`.
+   */
+  private goalSeed: PrimeGoalState | undefined;
+  /**
    * Fork anchors for the prompt-carrying runs sent but not yet settled
    * (bbpa-ggf.7), FIFO in the order prime will run them (steering and
    * follow-up lanes are both FIFO). Each `agent_end` consumes the head and
@@ -226,10 +240,27 @@ export class PrimeSession {
   constructor(options: PrimeSessionOptions) {
     this.record = options.record;
     this.emit = options.emit;
-    this.request = options.request;
     this.ensureConnected = options.ensureConnected;
     this.onState = options.onState;
     this.translator = createPrimeDeltaTranslator();
+    // Every command this lane sends addresses its own session, so a refusal
+    // naming that id is the daemon saying the session is gone (eviction,
+    // prime-side close) even when the `session_closed` push was missed — the
+    // lane was not attached when it happened, say. Marking gone here keeps the
+    // bridge's recovery honest instead of letting the next prompt refuse.
+    this.request = async (command, args) => {
+      const answer = await options.request(command, args);
+      if (
+        !answer.success &&
+        this.record.activeSessionId !== undefined &&
+        answer.error !== undefined &&
+        answer.error.includes(this.record.activeSessionId) &&
+        isUnknownActiveSessionError(answer.error)
+      ) {
+        this.markSessionGone();
+      }
+      return answer;
+    };
     this.unsubscribe = options.subscribePush((message) => this.handlePush(message));
     this.unsubscribeConnection = options.subscribeConnection?.((event) =>
       this.handleConnectionEvent(event),
@@ -238,6 +269,23 @@ export class PrimeSession {
 
   get threadId(): string {
     return this.record.threadId;
+  }
+
+  /**
+   * The daemon no longer hosts this session: it said so itself, either by the
+   * `session_closed` push or by refusing a command with the session's own id.
+   * The transcript file survives on disk — this is the bridge's cue to reopen
+   * the thread from it instead of failing.
+   */
+  get sessionGone(): boolean {
+    return this.daemonClosed;
+  }
+
+  /** Same bookkeeping the `session_closed` push runs; idempotent. */
+  private markSessionGone(): void {
+    this.daemonClosed = true;
+    this.closed = true;
+    this.stopClientsPoll();
   }
 
   get hasOpenTurn(): boolean {
@@ -340,6 +388,12 @@ export class PrimeSession {
     // flags. Everything the model/compaction work reconciles against.
     if (answer.snapshot?.state !== undefined) {
       this.adoptState(answer.snapshot.state);
+      // The snapshot's `state.goal` is the thread goal as prime persisted it
+      // (bbpa-b1m.2): remembered here so an adopted thread's replay ends with
+      // the goal row already on its timeline.
+      const goal = parsePrimeGoalState(answer.snapshot.state.goal);
+      this.goalSeed =
+        goal !== undefined && goalStateHasContent(goal) ? goal : undefined;
     }
     // The snapshot's summary is a SessionSummary read, so the attached-client
     // count (story 21) rides the attach for free — the badge's first datum.
@@ -665,11 +719,10 @@ export class PrimeSession {
     }
     const closed = sessionClosedSchema.safeParse(message);
     if (closed.success && closed.data.activeSessionId === this.record.activeSessionId) {
-      // The daemon closed the session (prime quit it, update restart, …). The
-      // session file survives on disk; the lane stops streaming.
-      this.daemonClosed = true;
-      this.closed = true;
-      this.stopClientsPoll();
+      // The daemon closed the session (prime quit it, update restart, idle
+      // eviction, …). The session file survives on disk; the lane stops
+      // streaming and reports gone so the bridge can reopen the thread.
+      this.markSessionGone();
       return;
     }
     if (message.type === "session_resynced" || message.type === "session_replaced") {
@@ -1201,6 +1254,38 @@ export class PrimeSession {
         this.record.snapshotChildren ?? [],
         this.record.threadId,
       ),
+    );
+    if (this.goalSeed !== undefined) {
+      this.pushDeltas(
+        this.translator.goalDeltas(this.goalSeed, this.record.threadId),
+      );
+      this.goalSeed = undefined;
+    }
+  }
+
+  /**
+   * Clear the thread goal (bbpa-b1m.2): bb's goal-clear affordance rides the
+   * bridge's `thread/goal/clear` request, and prime's only way to clear a
+   * goal is its own `/goal clear` session command — there is no goal RPC
+   * (wire fact, probe 2026-09-06). So the request becomes that command as a
+   * control prompt: admitted like any prompt (a busy session takes it on the
+   * follow-up lane), producing the command rows and the `goal_update` that
+   * closes the timeline row. Deliberately no turn bookkeeping: bb called this
+   * as thread metadata, not as a user turn, and prime settles every admitted
+   * input with its own `agent_end` regardless.
+   */
+  async clearGoal(): Promise<void> {
+    if (this.record.activeSessionId === undefined) {
+      throw new Error("cannot clear the goal before the session is created");
+    }
+    await this.awaitLive();
+    await this.request(
+      asWireCommand({
+        type: "prompt",
+        activeSessionId: this.record.activeSessionId,
+        message: "/goal clear",
+        streamingBehavior: "followUp",
+      }),
     );
   }
 }

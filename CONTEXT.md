@@ -36,6 +36,20 @@ _Avoid_: exclusive attach, «аренда сессии»
 Заполнение ленты подключившегося клиента срезом снапшота сессии; события, пропущенные до подключения, не доигрываются.
 _Avoid_: catch-up, догоняющий стрим
 
+### Harness-поверхности (v2)
+
+**Thread goal**:
+Цель resident-сессии (`/goal …` в prime): objective, статус (active/paused/budget_limited/complete) и учёт токенов/времени. Bridge читает её из `state.goal` снапшота и live-событий `goal_update` (RPC на goal нет); в bb она видна рядом `prime-agent/goal`, очистка идёт командой `/goal clear` — отдельного RPC тоже нет.
+_Avoid_: «цель потока bb» (у bb своей цели нет)
+
+**Heartbeat**:
+Повторяющееся задание сессии в daemon'е (user-heartbeat сессии или agent-heartbeat субагента — `source` у job). Доставка при занятой сессии: `steer` или `follow_up`. Управляется Heartbeats-панелью поверх RPC `heartbeat_*`; изменения приходят глобальным push `heartbeats_changed` без id сессии.
+_Avoid_: «крон» (у расписок отдельный термин)
+
+**Schedule (prime-side)**:
+Расписка уровня daemon (`source: "cron"`, команды `cron_*`): промпт доставляется в resident-сессию по расписанию. От слова «расписка» в bb-automations отличается именно resident-доставкой (ADR-0004); живёт в той же Heartbeats-панели отдельной секцией.
+_Avoid_: automation (это про bb automations), крон-джоб без уточнения
+
 ### Субагенты
 
 **Subagent (RLM child)**:

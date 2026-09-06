@@ -10,10 +10,13 @@ import {
 } from "./session-commands.js";
 
 /**
- * The session-command catalog and its materialization (bbpa-b1m.1): the six
- * prime session commands the bb "/" menu offers (no `compact` — bb ships a
- * builtin), one `command-file` per command written into a host directory, and
- * the resolved roots answer pointing at those files.
+ * The session-command catalog and its materialization (bbpa-b1m.1, trimmed in
+ * bbpa-b1m.3): the three prime session commands the bb "/" menu offers —
+ * goal, refine, autonomous (no `compact`: bb ships a builtin; no
+ * `heartbeat`/`heartbeats`/`rlm-max-depth`: prime's TUI handles those
+ * client-side, they are not session commands, and their surface here is the
+ * Heartbeats panel instead) — one `command-file` per command written into a
+ * host directory, and the resolved roots answer pointing at those files.
  */
 
 let dir: string;
@@ -44,15 +47,28 @@ function frontmatter(path: string): Record<string, string> {
 }
 
 describe("the session-command catalog", () => {
-  it("lists exactly the six session commands, prime's names", () => {
+  it("lists exactly the three session commands, prime's names", () => {
     expect(PRIME_SESSION_COMMANDS.map((command) => command.name)).toEqual([
       "goal",
       "refine",
-      "heartbeat",
-      "heartbeats",
       "autonomous",
-      "rlm-max-depth",
     ]);
+  });
+
+  it("lists no TUI-only commands: they are not session commands", () => {
+    // prime parses only `execution: "session"` builtins as session commands
+    // (SESSION_SLASH_COMMAND_NAMES in its slash-commands.js): heartbeat,
+    // heartbeats and rlm-max-depth are prime-TUI client commands, and from bb
+    // their text would reach the model as a literal prompt.
+    expect(PRIME_SESSION_COMMANDS.map((command) => command.name)).not.toContain(
+      "heartbeat",
+    );
+    expect(PRIME_SESSION_COMMANDS.map((command) => command.name)).not.toContain(
+      "heartbeats",
+    );
+    expect(PRIME_SESSION_COMMANDS.map((command) => command.name)).not.toContain(
+      "rlm-max-depth",
+    );
   });
 
   it("leaves `compact` out: bb ships a builtin /compact already", () => {
@@ -76,14 +92,7 @@ describe("the session-command catalog", () => {
         description: "Refine continual harness prompt notes, skills, subagents, and memory",
         argumentHint: undefined,
       },
-      {
-        name: "heartbeat",
-        argumentHint:
-          "[status|pause|resume|stop|[every <duration>] [--steer|--follow-up] <instruction>]",
-      },
-      { name: "heartbeats", argumentHint: undefined },
       { name: "autonomous", argumentHint: "[status|on|off]" },
-      { name: "rlm-max-depth", argumentHint: "[<int> [--global]]" },
     ]);
   });
 });

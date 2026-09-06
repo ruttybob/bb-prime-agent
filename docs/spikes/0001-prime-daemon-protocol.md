@@ -145,6 +145,21 @@ refuses while the child is resident-and-running. Children appear in
   `--mode daemon` when absent, treats a `stale` daemon as replace-only-if-idle
   (`daemon-launch.js:70-281`) — the bridge must keep the "never touch a foreign busy
   daemon" rule and warn instead.
+- Heartbeats/goal (probed live 2026-09-06, bbpa-b1m.2/.3/.4): `heartbeats_list {activeSessionId}`
+  → `{heartbeats:[{job, sessionName?, firstMessage?}]}` (capability `heartbeat_catalog`);
+  `heartbeat_set/get/update` → `{heartbeat: job}`; `heartbeat_manage {jobId, action:
+  pause|resume|stop}` (capability `heartbeat_management`); `cron_list/add/cancel` —
+  prime-side schedules (`source:"cron"`), no capability gate. Every mutation pushes a
+  GLOBAL `heartbeats_changed` with no session id and no payload — refetch, not diff.
+  Goal state: NO goal RPC and no `SessionSummary` field; it rides the attach snapshot's
+  `state.goal` (`AgentConnectionState.goal`, full `GoalState`) and live `goal_update`
+  session events (on mutations and on accounting ticks while a goal turn runs). Clearing
+  is prime's own `/goal clear` session command — there is no out-of-band clear.
+  `/autonomous status` writes an `autonomous_status` custom message (details = the full
+  runtime state incl. budgets) — the only wire-visible autonomous surface.
+  TUI-only commands: `heartbeat`, `heartbeats`, `rlm-max-depth` are handled by
+  interactive-mode.js and have `execution != "session"` — a daemon session parses only
+  `compact/refine/goal/autonomous` as session commands.
 - Docs drift: `docs/daemon.md` says "protocol v4"; code and wire say **7**/rev 16.
   Idle eviction: `idleEvictionMinutes` default 90 is global-only — long bb threads keep
   activity via prompts or a registered heartbeat (`SessionSummary.hasActiveHeartbeat`).

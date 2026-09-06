@@ -375,6 +375,29 @@ export const daemonQueueResultSchema = z
 export type DaemonQueueResult = z.infer<typeof daemonQueueResultSchema>;
 
 /**
+ * One row of `list_saved_sessions`' answer — a session transcript on disk that
+ * no worker currently hosts (or a resident one, listed too). Only the fields
+ * the eviction recovery reads are named: `path` is what `create {sessionPath}`
+ * re-hosts, and `name` is how a bb thread finds its own transcript (the
+ * "[bb] " name embeds the thread id). Everything else rides `passthrough`.
+ */
+export const daemonSavedSessionSchema = z
+  .object({
+    path: z.string(),
+    name: z.string().optional(),
+  })
+  .passthrough();
+export type DaemonSavedSession = z.infer<typeof daemonSavedSessionSchema>;
+
+/** `list_saved_sessions`' answer. Refuses without a `cwd` to resolve (wire fact). */
+export const daemonSavedSessionsSchema = z
+  .object({
+    sessions: z.array(daemonSavedSessionSchema),
+  })
+  .passthrough();
+export type DaemonSavedSessions = z.infer<typeof daemonSavedSessionsSchema>;
+
+/**
  * `session_action_update` — prime's queue announcement (`bbpa-ggf.5`). The
  * previews are what prime's own TUI shows for the waiting steering and
  * follow-up lanes; read defensively (strings only) so a prime that reshapes
@@ -401,7 +424,8 @@ export const IGNORED_SESSION_EVENT_TYPES = new Set([
   "thinking_level_changed",
   "service_tier_changed",
   "recap_update",
-  "goal_update",
+  // `goal_update` is NOT ignored since bbpa-b1m.2: the goal state it carries
+  // renders as the thread's goal row (src/goal-state.ts).
   "connection_status",
   "heartbeats_changed",
   "ipython_sent_agent_message",

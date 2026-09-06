@@ -41,9 +41,13 @@ Package name `bb-plugin-prime-agent` → plugin id `prime-agent` → provider id
   stale-daemon no-takeover; conformance + recorded-replay test lanes and a
   live smoke check (`npm run smoke`).
 
-Deferred to v2 (bbpa-ydo): goal set/clear, heartbeats, schedules, `/refine`,
-autonomous launch, UI attach to resident sessions, full subagent transcript
-panel.
+The v2 harness surfaces (bbpa-b1m) landed: `/goal`, `/refine`, `/autonomous`
+in the "/" menu with their session-command rows; the thread goal row
+(set/clear via prime's own `/goal` command, fed by `goal_update` events); the
+Heartbeats panel — user/agent heartbeats with delivery badges and a create
+form over the daemon RPCs, plus prime-side schedules (ADR-0004); autonomous
+status rows with the budget counters. Still open in v2: UI attach to
+existing resident sessions (bbpa-b1m.7).
 
 ## Trust model
 

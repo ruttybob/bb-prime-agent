@@ -75,3 +75,11 @@ export const PRIME_NO_SANDBOX_NOTICE =
  * bundling the subagents contracts' zod trees.
  */
 export const SUBAGENTS_REALTIME_CHANNEL = "subagents";
+
+/**
+ * The realtime channel the plugin server republishes prime's global
+ * `heartbeats_changed` push on (bbpa-b1m.3). Plain data like its subagents
+ * sibling: `{at: number}` is the whole payload, and every open Heartbeats
+ * panel refetches its own session on it.
+ */
+export const HEARTBEATS_REALTIME_CHANNEL = "heartbeats";
