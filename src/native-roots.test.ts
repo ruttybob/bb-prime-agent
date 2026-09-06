@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   experimental_nativeRootsResolveOutputSchema,
 } from "@get-bb/plugin-sdk/host";
@@ -11,6 +11,10 @@ import {
   resolvePrimeNativeRoots,
 } from "./native-roots.js";
 import { primeAgentDir, primeProjectAgentDir } from "./session-params.js";
+import {
+  PRIME_SESSION_COMMANDS,
+  primeSessionCommandsDir,
+} from "./session-commands.js";
 
 /**
  * The native-roots surface (bbpa-ggf.8): the declaration names prime's fixed
@@ -77,12 +81,23 @@ function resolve(args?: { cwd?: string | null }): string[] {
     cwd: args?.cwd === undefined ? workspaceDir : args.cwd,
   });
   const parsed = experimental_nativeRootsResolveOutputSchema.parse(answer);
-  expect(parsed.commands).toEqual([]);
-  for (const root of parsed.skills) {
+  for (const root of [...parsed.skills, ...parsed.commands]) {
     expect(root.namePrefix).toBe("");
     expect(root.recursive).toBe(false);
     expect(root.ancestors).toBe(false);
   }
+  // The commands side always answers the session commands (bbpa-b1m.1),
+  // regardless of what prime config this fixture machine carries.
+  expect(parsed.commands).toEqual(
+    PRIME_SESSION_COMMANDS.map((command) => ({
+      path: join(primeSessionCommandsDir(), `${command.name}.md`),
+      origin: "user",
+      namePrefix: "",
+      recursive: false,
+      ancestors: false,
+      shape: "command-file",
+    })),
+  );
   return parsed.skills.map((root) => root.path);
 }
 
@@ -310,5 +325,23 @@ describe("resolvePrimeNativeRoots", () => {
     writeSettings(USER_SETTINGS(), { skills: [fixture("vanished")] });
     expect(resolve({ cwd: null })).toEqual([]);
     expect(existsSync(fixture("vanished"))).toBe(false);
+  });
+
+  it("answers the session commands as materialized command files (bbpa-b1m.1)", () => {
+    const answer = resolvePrimeNativeRoots({ homeDir, cwd: workspaceDir });
+    const commands = answer.commands ?? [];
+    expect(commands).toHaveLength(PRIME_SESSION_COMMANDS.length);
+    for (const root of commands) {
+      // The root names a file the resolver actually wrote: bb's "/" scan
+      // reads the frontmatter right off it.
+      expect(existsSync(root.path)).toBe(true);
+      const source = readFileSync(root.path, "utf-8");
+      expect(source).toMatch(/^---\ndescription: /u);
+    }
+    // The file's basename is the command name — that is where bb's entry
+    // gets its "/" name.
+    expect(
+      commands.map((root) => basename(root.path)),
+    ).toEqual(PRIME_SESSION_COMMANDS.map((command) => `${command.name}.md`));
   });
 });

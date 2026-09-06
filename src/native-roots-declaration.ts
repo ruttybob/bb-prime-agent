@@ -27,8 +27,11 @@ import type { PluginProviderDeclaration } from "@get-bb/plugin-sdk";
  * `.agents/skills` chain up to the repository root (`ancestors: true` —
  * prime's `collectAncestorAgentsSkillDirs`) at the project level.
  *
- * There are no command roots — prime's prompt templates
- * (`~/.prime/agent/prompts`) are a separate surface this ticket does not own.
+ * The command roots live in the resolved half: prime's session commands are
+ * materialized one `command-file` per command and answered by
+ * `resolvePrimeNativeRoots` (`src/session-commands.ts`, bbpa-b1m.1). Prime's
+ * prompt templates (`~/.prime/agent/prompts`) remain a separate surface this
+ * plugin does not own.
  */
 export const PRIME_NATIVE_ROOTS_DECLARATION: Pick<
   PluginProviderDeclaration,

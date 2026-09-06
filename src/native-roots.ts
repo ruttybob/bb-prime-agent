@@ -5,16 +5,24 @@ import {
   type ExperimentalNativeRootsResolveAnswer,
 } from "@get-bb/plugin-sdk/host";
 import { primeAgentDir, primeProjectAgentDir } from "./session-params.js";
+import {
+  materializePrimeSessionCommandFiles,
+  primeSessionCommandRoots,
+  primeSessionCommandsDir,
+  type PrimeSessionCommandRoot,
+} from "./session-commands.js";
 
 /**
- * The host-resolved half of prime-agent's native skill roots (bbpa-ggf.8):
+ * The host-resolved half of prime-agent's native roots (bbpa-ggf.8):
  * what only this host can name — the `skills` arrays of prime's user and
  * project `settings.json`, plus the loose top-level `*.md` skill files prime
- * discovers inside its two default skill directories. bb scans the answer
- * beside the declared roots (`./native-roots-declaration.ts` holds the fixed
- * directories) for the composer "/" menu; invoking an entry is the prompt
- * path (`src/skill-mentions.ts`) — prime expands `/skill:<name>` in the
- * session itself, so nothing here needs to reach the daemon's `create`.
+ * discovers inside its two default skill directories, and — since bbpa-b1m.1
+ * — prime's session slash commands, materialized one `command-file` per
+ * command by `./session-commands.ts`. bb scans the answer beside the declared
+ * roots (`./native-roots-declaration.ts` holds the fixed directories) for the
+ * composer "/" menu; invoking an entry is the prompt path
+ * (`src/skill-mentions.ts`) — prime expands `/skill:<name>` in the session
+ * itself, so nothing here needs to reach the daemon's `create`.
  *
  * This module value-imports `@get-bb/plugin-sdk/host` lawfully: it is
  * reachable only from the `bb.host` graph (`host.ts`), where the builder
@@ -98,10 +106,29 @@ export function resolvePrimeNativeRoots(
   }
   pushRoots(roots, seen, looseSkillFileRoots(join(agentDir, "skills"), "user"));
 
+  // The session commands (bbpa-b1m.1): materialized one `.md` per command
+  // into the shared per-uid temp dir and answered as `command-file` roots, so
+  // the "/" menu lists them beside the skills. A materialization failure (a
+  // read-only temp, say) must not cost the skills answer — the resolver
+  // contract charges a throw against the whole listing — so the commands
+  // side degrades to empty with a warning.
+  let commandRoots: PrimeSessionCommandRoot[] = [];
+  try {
+    const commandsDir = primeSessionCommandsDir();
+    materializePrimeSessionCommandFiles(commandsDir);
+    commandRoots = primeSessionCommandRoots(commandsDir);
+  } catch (error) {
+    console.warn(
+      `prime-agent: could not materialize session command files: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+
   // One root the contract refuses must not cost the user the others: each is
   // judged on its own, and the refused ones are dropped with a warning.
   return experimental_filterResolvedNativeRoots(
-    { skills: roots },
+    { skills: roots, commands: commandRoots },
     { warn: console.warn },
   ).answer;
 }

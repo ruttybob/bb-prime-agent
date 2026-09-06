@@ -7,6 +7,7 @@ import {
   extractResultText,
   type DeltaItemKey,
   type DeltaItemShape,
+  type DeltaPresentation,
   type ThreadDelta,
   type ThreadEventTokenUsageBreakdown,
   type JsonValue,
@@ -21,6 +22,7 @@ import {
   compactionEndEventSchema,
   compactionStartEventSchema,
   IGNORED_SESSION_EVENT_TYPES,
+  messageStartEventSchema,
   messageUpdateEventSchema,
   rlmChildUpdateEventSchema,
   sessionActionUpdateEventSchema,
@@ -31,6 +33,7 @@ import {
   type AgentMessage,
 } from "./daemon/wire.js";
 import { PRIME_QUEUE_EXTENSION_KIND, queueStatePayload } from "./queue-state.js";
+import { PRIME_PLUGIN_ID } from "./vocabulary.js";
 import {
   childActivityLabel,
   childDelegationShape,
@@ -60,15 +63,41 @@ import {
  * - prime's queue announcement (`session_action_update`) becomes the thread's
  *   queue state under the `prime-agent/queue` extension kind, so waiting
  *   steering and follow-up messages are visible while they queue (bbpa-ggf.5).
+ * - prime's session slash commands render as `extension` items under the
+ *   `prime-agent/session-command` kind (bbpa-b1m.1): the durable command
+ *   message prime writes when a `/goal …`-style prompt runs opens the row,
+ *   its result message closes it, and the same rendering rebuilds from an
+ *   attach snapshot. Custom messages of every other kind — heartbeat prompts,
+ *   ipython state, compaction outcomes — render nothing, as before.
  *
- * The translator is stateless per thread apart from four bookkeeping maps
- * (streamed-tool shapes, still-open text streams, still-open delegation items,
- * cumulative usage), which `resetThread` clears at every provider id-space
+ * The translator is stateless per thread apart from its bookkeeping —
+ * streamed-tool shapes, still-open text streams, still-open delegation items,
+ * still-open session commands, cumulative usage, and the compaction/queue
+ * dedup flags — which `resetThread` clears at every provider id-space
  * boundary.
  */
 
 const ASSISTANT_STREAM_KEY = "assistant";
 const MAX_STATE_ENTRIES = 1024;
+
+/**
+ * prime's durable session-command messages (bbpa-b1m.1): when a prompt parses
+ * as a session slash command, prime appends a `session_slash_command` custom
+ * message and — when the command has run — a `session_slash_command_result`,
+ * each announced by a `message_start`/`message_end` pair. `details.command`
+ * (`{name, args, text}`) is shared by both; the result adds `success`,
+ * `severity`, and `error`.
+ */
+const SESSION_COMMAND_CUSTOM_TYPE = "session_slash_command";
+const SESSION_COMMAND_RESULT_CUSTOM_TYPE = "session_slash_command_result";
+
+/** The timeline extension kind one session-command invocation renders under. */
+const PRIME_SESSION_COMMAND_EXTENSION_KIND = `${PRIME_PLUGIN_ID}/session-command`;
+
+/** Row-header titles cap here; argument hints can run long (`/heartbeat …`). */
+const SESSION_COMMAND_TITLE_MAX_CHARS = 120;
+/** A result's legible tail caps here; command output can run much longer. */
+const SESSION_COMMAND_RESULT_MAX_CHARS = 2000;
 
 function thinkingStreamKey(contentIndex: number): string {
   return `thinking-${contentIndex}`;
@@ -204,6 +233,208 @@ function stopReasonToStatus(
   return "completed";
 }
 
+/* --------------------- session slash commands (bbpa-b1m.1) --------------------- */
+
+/** prime's `details.command` (`{name, args, text}`), read defensively. */
+interface SessionCommandRef {
+  name: string;
+  args: string;
+  text: string;
+}
+
+/** The payload one session-command item carries through open and close. */
+type SessionCommandPayload = {
+  command: string;
+  args: string;
+  text: string;
+  phase: "requested" | "succeeded" | "failed" | "interrupted";
+  error?: string;
+};
+
+/** A session-command item this bridge opened and a result has not closed yet. */
+interface OpenSessionCommand {
+  key: DeltaItemKey;
+  ref: SessionCommandRef;
+}
+
+function capText(text: string, maxChars: number): string {
+  return text.length > maxChars ? text.slice(0, maxChars) : text;
+}
+
+/**
+ * The command a custom session-command message refers to, or `undefined` when
+ * anything is malformed — a prime that reshapes `details` must cost a row,
+ * never a translator throw.
+ */
+function sessionCommandRef(message: AgentMessage): SessionCommandRef | undefined {
+  const details = (message as Record<string, unknown>).details;
+  const command =
+    typeof details === "object" && details !== null
+      ? (details as Record<string, unknown>).command
+      : undefined;
+  if (typeof command !== "object" || command === null) {
+    return undefined;
+  }
+  const name = (command as Record<string, unknown>).name;
+  if (typeof name !== "string" || name.trim() === "") {
+    return undefined;
+  }
+  const args = (command as Record<string, unknown>).args;
+  const text = (command as Record<string, unknown>).text;
+  return {
+    name,
+    args: typeof args === "string" ? args : "",
+    text: typeof text === "string" ? text : "",
+  };
+}
+
+/** Whether prime marked the command's result failed. */
+function sessionCommandFailed(message: AgentMessage): boolean {
+  const details = (message as Record<string, unknown>).details;
+  if (typeof details !== "object" || details === null) {
+    return false;
+  }
+  const record = details as Record<string, unknown>;
+  return record.success === false || record.severity === "error";
+}
+
+/**
+ * A failed result's error message, or `undefined` when prime shipped none —
+ * the failure itself is already carried by the status and the payload phase.
+ */
+function sessionCommandError(message: AgentMessage): string | undefined {
+  if (!sessionCommandFailed(message)) {
+    return undefined;
+  }
+  const details = (message as Record<string, unknown>).details;
+  const error =
+    typeof details === "object" && details !== null
+      ? (details as Record<string, unknown>).error
+      : undefined;
+  return typeof error === "string" && error.trim() !== "" ? error : undefined;
+}
+
+function sessionCommandItem(payload: SessionCommandPayload): DeltaItemShape {
+  return {
+    type: "extension",
+    kind: PRIME_SESSION_COMMAND_EXTENSION_KIND,
+    payload,
+  };
+}
+
+function sessionCommandPresentation(ref: SessionCommandRef): DeltaPresentation {
+  return {
+    label: { pending: `/${ref.name}`, completed: `/${ref.name}` },
+    icon: { glyph: "terminal" },
+    title: capText(
+      `/${ref.name}${ref.args === "" ? "" : ` ${ref.args}`}`.trim(),
+      SESSION_COMMAND_TITLE_MAX_CHARS,
+    ),
+  };
+}
+
+function sessionCommandOpenDelta(
+  key: DeltaItemKey,
+  payload: SessionCommandPayload,
+): ThreadDelta {
+  return {
+    kind: "item.open",
+    key,
+    item: sessionCommandItem(payload),
+    attach: "currentOrLast",
+    presentation: sessionCommandPresentation({
+      name: payload.command,
+      args: payload.args,
+      text: payload.text,
+    }),
+  };
+}
+
+/**
+ * The deltas a result message produces, closing `open` in place: the most
+ * recent entry with the result's command name — nested invocations of one
+ * command settle inside-out. A result with no open row (prime answered
+ * before this bridge attached, or the open was dropped as malformed) becomes
+ * an open+close settled pair, so the result still shows.
+ */
+function sessionCommandResultDeltas(
+  message: AgentMessage,
+  open: OpenSessionCommand[],
+  nextKey: () => DeltaItemKey,
+): ThreadDelta[] {
+  const ref = sessionCommandRef(message);
+  if (ref === undefined) {
+    return [];
+  }
+  const failed = sessionCommandFailed(message);
+  const error = sessionCommandError(message);
+  const payload: SessionCommandPayload = {
+    command: ref.name,
+    args: ref.args,
+    text: ref.text,
+    phase: failed ? "failed" : "succeeded",
+    ...(error === undefined ? {} : { error }),
+  };
+  const content = messageText(message);
+  const resultText =
+    content === undefined
+      ? undefined
+      : capText(content, SESSION_COMMAND_RESULT_MAX_CHARS);
+  let index = -1;
+  for (let cursor = open.length - 1; cursor >= 0; cursor -= 1) {
+    if (open[cursor]?.ref.name === ref.name) {
+      index = cursor;
+      break;
+    }
+  }
+  if (index === -1) {
+    return sessionCommandSettledPair(nextKey(), payload, {
+      status: failed ? "failed" : "completed",
+      resultText,
+    });
+  }
+  const entry = open[index] as OpenSessionCommand;
+  open.splice(index, 1);
+  return [
+    {
+      kind: "item.close",
+      key: entry.key,
+      item: sessionCommandItem(payload),
+      status: failed ? "failed" : "completed",
+      ...(resultText === undefined ? {} : { resultText }),
+    },
+  ];
+}
+
+/**
+ * An open+close pair for a result that arrived with no open row (prime
+ * answered before this bridge attached, or the open was dropped as
+ * malformed): the outcome is known, but bb has no row for it yet, so both
+ * halves land in one breath.
+ */
+function sessionCommandSettledPair(
+  key: DeltaItemKey,
+  payload: SessionCommandPayload,
+  result: {
+    status: "completed" | "failed" | "interrupted";
+    resultText: string | undefined;
+  },
+): ThreadDelta[] {
+  const item = sessionCommandItem(payload);
+  return [
+    sessionCommandOpenDelta(key, payload),
+    {
+      kind: "item.close",
+      key,
+      item,
+      status: result.status,
+      ...(result.resultText === undefined
+        ? {}
+        : { resultText: result.resultText }),
+    },
+  ];
+}
+
 /** Where a streamed turn sits, so an abort can settle it exactly once. */
 export interface TurnObservation {
   /** `agent_end` arrived: the boundary status prime reported. */
@@ -235,6 +466,13 @@ interface ThreadState {
   openTextStreams: Set<string>;
   /** Child ids whose delegation item is open on the timeline. */
   openDelegations: Set<string>;
+  /**
+   * Session-command bookkeeping (bbpa-b1m.1): the monotonic source of item
+   * keys, and the items a result has not closed yet — oldest first, since a
+   * result closes the most recent entry with its command's name.
+   */
+  sessionCommandOrdinal: number;
+  openSessionCommands: OpenSessionCommand[];
   usage: ThreadEventTokenUsageBreakdown;
   /** Set between `compaction_start` and `compaction_end`; prime's reason decides the settlement. */
   compaction: { manual: boolean } | undefined;
@@ -294,6 +532,8 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
       toolCalls: new Map(),
       openTextStreams: new Set(),
       openDelegations: new Set(),
+      sessionCommandOrdinal: 0,
+      openSessionCommands: [],
       usage: ZERO_TOKEN_USAGE,
       compaction: undefined,
       queuePayload: undefined,
@@ -469,6 +709,67 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
     return deltas;
   }
 
+  /**
+   * The timeline deltas one durable custom message produces (bbpa-b1m.1): a
+   * session-command message opens its row, a result closes the most recent open
+   * row for that command. Every other custom type — heartbeat prompts, ipython
+   * state, compaction outcomes — and every non-custom message these pushes
+   * bracket render nothing, exactly as the ignore set did before this surface
+   * existed. Malformed session-command details are dropped silently: a prime
+   * that reshapes them may cost a row, never a translator throw.
+   */
+  function sessionCommandDeltas(
+    message: AgentMessage | undefined,
+    context: TranslationContext,
+  ): ThreadDelta[] {
+    if (message === undefined || message.role !== "custom") {
+      return [];
+    }
+    const customType = (message as Record<string, unknown>).customType;
+    if (customType === SESSION_COMMAND_CUSTOM_TYPE) {
+      return openSessionCommand(message, context);
+    }
+    if (customType === SESSION_COMMAND_RESULT_CUSTOM_TYPE) {
+      return closeSessionCommand(message, context);
+    }
+    return [];
+  }
+
+  function openSessionCommand(
+    message: AgentMessage,
+    context: TranslationContext,
+  ): ThreadDelta[] {
+    const ref = sessionCommandRef(message);
+    if (ref === undefined) {
+      return [];
+    }
+    const state = stateFor(context.threadId);
+    state.sessionCommandOrdinal += 1;
+    const key: DeltaItemKey = {
+      channel: `session-command-${state.sessionCommandOrdinal}`,
+    };
+    state.openSessionCommands.push({ key, ref });
+    return [
+      sessionCommandOpenDelta(key, {
+        command: ref.name,
+        args: ref.args,
+        text: ref.text,
+        phase: "requested",
+      }),
+    ];
+  }
+
+  function closeSessionCommand(
+    message: AgentMessage,
+    context: TranslationContext,
+  ): ThreadDelta[] {
+    const state = stateFor(context.threadId);
+    return sessionCommandResultDeltas(message, state.openSessionCommands, () => {
+      state.sessionCommandOrdinal += 1;
+      return { channel: `session-command-${state.sessionCommandOrdinal}` };
+    });
+  }
+
   function translate(
     event: unknown,
     context: TranslationContext,
@@ -524,6 +825,28 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
             context,
           );
         }
+        return [];
+      }
+
+      case "message_start": {
+        // Durable custom messages (bbpa-b1m.1): a session slash command and,
+        // later, its result each arrive here, so this is the one event a row
+        // renders on. Non-command messages — every user/assistant/toolResult
+        // turn, prime's other custom types — render nothing, exactly as the
+        // ignore set did before this case existed; the parse-fail branch
+        // stays silent for the same reason (a prime that reshapes these
+        // events must not turn every message into an unhandled row).
+        const parsed = messageStartEventSchema.safeParse(event);
+        if (!parsed.success) {
+          return [];
+        }
+        return sessionCommandDeltas(parsed.data.message, context);
+      }
+
+      case "message_end": {
+        // prime announces every durable message as a start/end pair carrying
+        // the same message; whatever the start rendered (or deliberately did
+        // not), the end never adds a row of its own.
         return [];
       }
 
@@ -839,11 +1162,50 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
       }
     }
     const deltas: ThreadDelta[] = [];
+    // Session-command items (bbpa-b1m.1) render with the same shapes as the
+    // live path, but keys and the open stack are local to this pass: it runs
+    // once per attach against a message list the live stream never replays,
+    // and repeating `session-command-N` channels across passes is the
+    // grammar's normal key reuse (the compaction channel has always worked
+    // that way).
+    const openCommands: OpenSessionCommand[] = [];
+    let commandOrdinal = 0;
+    const nextCommandKey = (): DeltaItemKey => {
+      commandOrdinal += 1;
+      return { channel: `session-command-${commandOrdinal}` };
+    };
     for (const message of parsed) {
       if (message.role === "user") {
         const text = messageText(message);
         if (text !== undefined) {
           deltas.push({ kind: "input.provider", text });
+        }
+        continue;
+      }
+      if (message.role === "custom") {
+        // Custom messages were skipped outright before bbpa-b1m.1; the two
+        // session-command types now render in message order — command opens
+        // pending, its result closes. Every other custom type keeps today's
+        // behavior: skipped.
+        const customType = (message as Record<string, unknown>).customType;
+        const ref = sessionCommandRef(message);
+        if (customType === SESSION_COMMAND_CUSTOM_TYPE && ref !== undefined) {
+          const key = nextCommandKey();
+          openCommands.push({ key, ref });
+          deltas.push(
+            sessionCommandOpenDelta(key, {
+              command: ref.name,
+              args: ref.args,
+              text: ref.text,
+              phase: "requested",
+            }),
+          );
+          continue;
+        }
+        if (customType === SESSION_COMMAND_RESULT_CUSTOM_TYPE) {
+          deltas.push(
+            ...sessionCommandResultDeltas(message, openCommands, nextCommandKey),
+          );
         }
         continue;
       }
@@ -923,6 +1285,24 @@ export function createPrimeDeltaTranslator(): PrimeDeltaTranslator {
           }
         }
       }
+    }
+    // A command still open when the transcript ends — prime writes its result
+    // immediately after the command, so a missing result means a truncated
+    // session — must not survive replay as a pending row: close it
+    // interrupted, outcome unknown. The close lands beside the open this pass
+    // already emitted, so no second open is minted here.
+    for (const open of openCommands) {
+      deltas.push({
+        kind: "item.close",
+        key: open.key,
+        item: sessionCommandItem({
+          command: open.ref.name,
+          args: open.ref.args,
+          text: open.ref.text,
+          phase: "interrupted",
+        }),
+        status: "interrupted",
+      });
     }
     return deltas;
   }

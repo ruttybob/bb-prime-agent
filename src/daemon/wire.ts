@@ -237,6 +237,31 @@ export const messageUpdateEventSchema = z
   .passthrough();
 export type MessageUpdateEvent = z.infer<typeof messageUpdateEventSchema>;
 
+/**
+ * `message_start`/`message_end` bracket every durable message prime appends
+ * to a session — user, assistant, toolResult, and (the ones this bridge
+ * renders, bbpa-b1m.1) the custom messages a session slash command writes
+ * (`_appendDurableSessionCommandMessage`: the command, then its result). The
+ * translator reads only the session-command custom messages; every other
+ * arrival keeps the render-nothing behavior the ignore set gave these event
+ * types.
+ */
+export const messageStartEventSchema = z
+  .object({
+    type: z.literal("message_start"),
+    message: agentMessageSchema.optional(),
+  })
+  .passthrough();
+export type MessageStartEvent = z.infer<typeof messageStartEventSchema>;
+
+export const messageEndEventSchema = z
+  .object({
+    type: z.literal("message_end"),
+    message: agentMessageSchema.optional(),
+  })
+  .passthrough();
+export type MessageEndEvent = z.infer<typeof messageEndEventSchema>;
+
 export const toolExecutionStartEventSchema = z
   .object({
     type: z.literal("tool_execution_start"),
@@ -382,8 +407,9 @@ export const IGNORED_SESSION_EVENT_TYPES = new Set([
   "ipython_sent_agent_message",
   "turn_start",
   "turn_end",
-  "message_start",
-  "message_end",
   // pi streams text through message_update; the boundary is agent_end's job.
-  // Model-round boundaries would fabricate extra turns.
+  // Model-round boundaries would fabricate extra turns. `message_start` and
+  // `message_end` are deliberately absent from this set: they carry prime's
+  // durable session-command custom messages (bbpa-b1m.1), and the translator
+  // renders nothing for every other message they bracket.
 ]);
