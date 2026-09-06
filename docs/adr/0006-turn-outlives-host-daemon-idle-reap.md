@@ -7,7 +7,7 @@ status: accepted
 Билет bbpa-1pr исходил из наблюдения «host plugin worker became idle»: host-daemon
 останавливает воркер плагина после ~5 минут того, что считает простоем, и длинный
 turn (8–15 минут на медленной модели) будто бы рискует потерять доставку конца
-turn'а — push-поток умирает вместе с воркером, daemon доигрывает прогон «в пустоту»,
+turn'а — push-поток умирает вместе с воркером, prime-daemon доигрывает прогон «в пустоту»,
 а свежий воркер доигрывает только snapshot replay. Разбор механизма на bb 0.42.1
 показал: у воркера, владеющего turn'ом, idle-таймера нет вовсе, и плагину нечего
 «держать живым».
@@ -16,23 +16,27 @@ turn'а — push-поток умирает вместе с воркером, dae
 
 У host-daemon'а два вида воркеров плагина, и idle-таймер есть только у одного:
 
-- **Host worker** (`bb-plugin-host-worker.mjs`, IPC-ребёнок daemon'а) исполняет host
+- **Host worker** (`bb-plugin-host-worker.mjs`, IPC-ребёнок host-daemon'а) исполняет host
   RPC entry плагина — у нас это default export `host.ts` (ростер субагентов,
   heartbeats, native roots). Его и останавливает таймер «became idle»:
   `scheduleWorkerIdle` c `DEFAULT_WORKER_IDLE_TIMEOUT_MS = 5*60_000` (опция
   `workerIdleTimeoutMs`). Таймер снимают только: входящий RPC-вызов (busy-state
   `activeCallCount > 0`), lease `experimental_retainWorker()` из контекста живого
-  вызова (сообщение `lease-acquire` воркер→daemon) и `watch-start`. Push
-  воркер→daemon (`signal`) таймер НЕ сбрасывает — push-only активность простоем
+  вызова (сообщение `lease-acquire` воркер→host-daemon) и `watch-start`. Push
+  воркер→host-daemon (`signal`) таймер НЕ сбрасывает — push-only активность простоем
   не считается.
-- **Bridge worker** (`bb-provider-bridge-worker.mjs`, stdio-ребёнок daemon'а)
+- **Bridge worker** (`bb-provider-bridge-worker.mjs`, stdio-ребёнок host-daemon'а)
   исполняет `experimental_providerBridge` (`src/provider-bridge.ts`) — именно он
-  владеет открытыми bb-turn'ами и push-потоком дельт. Idle-таймера у этого процесса
+  владеет открытыми turn'ами и push-потоком дельт. Idle-таймера у этого процесса
   нет, и каждый путь его остановки учитывает хостируемые bb-треды:
   `releaseIdleProviderProcess` выходит, пока `identity.threadIds.size > 0`;
   retirement устаревших процессов требует нуля хостируемых тредов; рекомендованный
-  restart переносится, пока по тредам идёт turn. Посреди turn'а воркер всегда
-  хостирует минимум один тред — остановить его нечем.
+  restart переносится, пока по тредам идёт turn. Есть и сессионный 30-минутный
+  idle-reap (`reapIdleProviderSessions`, `IDLE_PROVIDER_SESSION_REAP_AFTER_MS`):
+  он пер-тредовый, mid-turn не трогает, но со временем опустошает `threadIds`
+  по завершённым тредам — и тогда bridge worker останавливается уже обычным
+  путём. Посреди turn'а воркер всегда хостирует минимум один тред — остановить
+  его нечем.
 
 E2E (билет bbpa-1pr, throwaway-воркспейс): prime-agent turn с foreground `sleep 420`
 работал 7m13s — дольше idle-окна; bridge worker, родившийся на старте turn'а,
@@ -45,7 +49,7 @@ E2E (билет bbpa-1pr, throwaway-воркспейс): prime-agent turn с for
 
 Bridge не держит себя живым специально: ни lease-болтовни, ни самовызовов, ни
 таймеров против host-daemon'а. Idle-reap host worker'а остаётся как есть —
-панельные RPC переподключаются к daemon'у с нуля, а открытые панели и так считают
+панельные RPC переподключаются к prime-daemon'у с нуля, а открытые панели и так считают
 пропущенные signal-push'и признанной дырой и догоняют перечитыванием
 (`use-heartbeats`).
 
@@ -54,17 +58,17 @@ push сквозь окно простоя (подписка, живущая бе
 `experimental_retainWorker()` из контекста живого вызова: держать lease, пока
 подписка открыта, отпустить при закрытии. Сегодня такой поверхности нет.
 
-## Consequences
+## Последствия
 
 - Плагин не добавляет служебного трафика ради борьбы с reap'ом; гигиена простоя
   host-daemon'а работает без исключений (нет keep-alive регрессии).
 - Длинные turn'ы безопасны конструктивно на проверенной версии bb (0.42.1).
 - Открытая панель может увидеть устаревшие данные, пока host worker среплен;
   это документированное поведение панелей, а не дефект доставки turn'ов.
-- Если будущая версия bb заведёт idle-таймер и для bridge worker'ов, turn'ы снова
-  сломаются; при апгрейде переконтролировать `scheduleWorkerIdle` и пути остановки
-  bridge-процессов в бандле host-daemon'а (`releaseIdleProviderProcess`,
-  `retireStaleBridgeProcesses`).
+- Idle-механика host-daemon'а может поменяться (таймеры, пороги, пути остановки)
+  — при апгрейде bb перепроверить `scheduleWorkerIdle`, сессионный
+  `reapIdleProviderSessions` и пути остановки bridge-процессов
+  (`releaseIdleProviderProcess`, `retireStaleBridgeProcesses`).
 
 ## Considered Options
 
