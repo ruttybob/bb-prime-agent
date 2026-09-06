@@ -123,6 +123,41 @@ describe("the prime subagents host entry", () => {
     await harness.experimental_dispose();
   });
 
+  it("watches a session without a panel and keeps the pushes flowing", async () => {
+    // The child-threads service (bbpa-b1m.11) watches through this proc so a
+    // spawn surfaces as a bb thread even when no Subagents panel is open.
+    const scripted = scriptedConnection({ children: [child()] });
+    const harness = createHostEntryHarness(
+      createPrimeSubagentsHostEntry({ createConnection: () => scripted.connection }),
+    );
+
+    const answer = await harness.experimental_call("subagents.watch", {
+      activeSessionId: "sess_parent",
+    });
+    expect(answer.children.map((entry) => entry.id)).toEqual(["child_1"]);
+
+    // The watch lends the worker retention exactly like a panel question:
+    // pushes keep flowing with no window open.
+    scripted.push({
+      type: "session_event",
+      activeSessionId: "sess_parent",
+      event: { type: "rlm_child_update", child: child({ id: "child_2", label: "new" }) },
+      meta: { sequence: 1, cursor: { generation: "gen-0", sequence: 1 } },
+    } as unknown as DaemonPushMessage);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    const pushed = harness
+      .experimental_getSignals()
+      .filter((signal) => signal.signal === "subagents.changed");
+    expect(
+      pushed.some((signal) =>
+        (signal.payload.children as Array<{ id: string }>).some(
+          (entry) => entry.id === "child_2",
+        ),
+      ),
+    ).toBe(true);
+    await harness.experimental_dispose();
+  });
+
   it("pushes a validated signal when a watched roster changes", async () => {
     const scripted = scriptedConnection({ children: [] });
     const harness = createHostEntryHarness(
@@ -464,6 +499,7 @@ describe("the control surface's limits", () => {
       "subagents.steer",
       "subagents.stop",
       "subagents.transcript",
+      "subagents.watch",
     ]);
   });
 });

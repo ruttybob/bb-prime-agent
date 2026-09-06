@@ -88,6 +88,20 @@ export const primeSubagentsHostContract = defineRpcContract({
       children: z.array(primeChildSchema),
     }),
   },
+  /**
+   * Watch without a panel (bbpa-b1m.11): the child-threads service asks the
+   * host to keep a session's roster live so spawns surface as bb threads
+   * even when no Subagents panel is open. Same answer shape as a roster
+   * read — the current children ride along, free.
+   */
+  "subagents.watch": {
+    input: z.object({
+      activeSessionId: z.string().min(1),
+    }),
+    output: z.object({
+      children: z.array(primeChildSchema),
+    }),
+  },
   "subagents.steer": {
     input: z.object({
       activeSessionId: z.string().min(1),

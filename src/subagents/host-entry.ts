@@ -159,14 +159,24 @@ export function createPrimeSubagentsHostEntry(
     return child;
   }
 
+  /** The one body both a roster question and a panel-less watch share. */
+  const readRoster = async (
+    input: { activeSessionId: string },
+    context: ExperimentalHostRpcContext<typeof primeSubagentsHostSignals>,
+  ): Promise<{ children: ReturnType<SubagentsRoster["childrenOf"]> }> => {
+    const { children } = await watched(input.activeSessionId, context);
+    return { children };
+  };
+
   return experimental_defineHostEntry({
     contract: primeSubagentsHostContract,
     experimental_signals: primeSubagentsHostSignals,
     handlers: {
-      "subagents.roster": async (input, context) => {
-        const { children } = await watched(input.activeSessionId, context);
-        return { children };
-      },
+      "subagents.roster": readRoster,
+      // Watch without a panel (bbpa-b1m.11): identical to a roster read —
+      // `watched` retains the worker for as long as anything is watched, so
+      // the spawn signals keep flowing with no window open.
+      "subagents.watch": readRoster,
       "subagents.steer": async (input, context) => {
         const { backend, children } = await watched(input.activeSessionId, context);
         const child = childOrThrow(children, input);

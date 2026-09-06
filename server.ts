@@ -18,9 +18,16 @@ import {
   userExtensionSettingsDescriptors,
 } from "./src/user-extensions.js";
 import {
+  childThreadMarkerInput,
+  createChildThreadService,
+} from "./src/child-threads.js";
+import { errorMessage } from "./src/error-message.js";
+import {
   HEARTBEATS_REALTIME_CHANNEL,
+  PRIME_PROVIDER_ID,
   PRIME_PROVIDER_THREAD_PREFIX,
   SUBAGENTS_REALTIME_CHANNEL,
+  primeProviderThreadId,
 } from "./src/vocabulary.js";
 
 /**
@@ -49,10 +56,12 @@ export default function plugin(bb: BbPluginApi): void {
   );
   const stopSubagents = registerSubagents(bb);
   const stopHeartbeats = registerHeartbeats(bb);
+  const stopChildThreads = registerChildThreads(bb);
   bb.onDispose(() => {
     registered.dispose();
     stopSubagents();
     stopHeartbeats();
+    stopChildThreads();
   });
 }
 
@@ -64,14 +73,11 @@ export default function plugin(bb: BbPluginApi): void {
  */
 function createSessionResolver(bb: BbPluginApi) {
   const sessionByThread = new Map<string, string>();
+  /** The reverse edge (prime session -> bb thread), for the child threads. */
+  const threadBySession = new Map<string, string>();
 
-  async function resolveActiveSessionId(
-    threadId: string,
-  ): Promise<string | undefined> {
-    const cached = sessionByThread.get(threadId);
-    if (cached !== undefined) {
-      return cached;
-    }
+  /** The providerThreadId a thread's latest thread/identity event names. */
+  async function latestIdentity(threadId: string): Promise<string | undefined> {
     const rows = await bb.sdk.threads.events.list({
       threadId,
       types: ["thread/identity"],
@@ -81,8 +87,19 @@ function createSessionResolver(bb: BbPluginApi) {
     const providerThreadId = (
       rows[0]?.data as { providerThreadId?: unknown } | undefined
     )?.providerThreadId;
+    return typeof providerThreadId === "string" ? providerThreadId : undefined;
+  }
+
+  async function resolveActiveSessionId(
+    threadId: string,
+  ): Promise<string | undefined> {
+    const cached = sessionByThread.get(threadId);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const providerThreadId = await latestIdentity(threadId);
     if (
-      typeof providerThreadId !== "string" ||
+      providerThreadId === undefined ||
       !providerThreadId.startsWith(PRIME_PROVIDER_THREAD_PREFIX)
     ) {
       return undefined;
@@ -94,10 +111,38 @@ function createSessionResolver(bb: BbPluginApi) {
       return undefined;
     }
     sessionByThread.set(threadId, activeSessionId);
+    threadBySession.set(activeSessionId, threadId);
     return activeSessionId;
   }
 
-  return { resolveActiveSessionId };
+  /**
+   * The bb thread a prime session backs, resolved on demand: recent
+   * prime-agent threads are scanned for the identity that named the session,
+   * then cached. Only the child-threads service needs this direction, and a
+   * spawn is a rare event, so the per-thread identity lookup is fine.
+   */
+  async function resolveThreadBySession(
+    sessionId: string,
+  ): Promise<string | undefined> {
+    const cached = threadBySession.get(sessionId);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const threads = await bb.sdk.threads.list({ limit: 100 });
+    for (const thread of threads) {
+      if (thread.providerId !== PRIME_PROVIDER_ID) {
+        continue;
+      }
+      const providerThreadId = await latestIdentity(thread.id);
+      if (providerThreadId === primeProviderThreadId(sessionId)) {
+        threadBySession.set(sessionId, thread.id);
+        return thread.id;
+      }
+    }
+    return undefined;
+  }
+
+  return { resolveActiveSessionId, resolveThreadBySession };
 }
 
 /**
@@ -460,6 +505,101 @@ function registerHeartbeats(bb: BbPluginApi): () => void {
   });
 }
 
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+
+/**
+ * Child subagent sessions as bb threads (bbpa-b1m.11, ADR-0005): the
+ * `subagents.changed` signal names a parent session and its live children;
+ * each child with its own daemon session gets one bb thread, spawned into
+ * the parent's project and environment with the parent thread as its parent.
+ * The spawn's marker input is consumed by the bridge (see
+ * `startChildThread`), which binds the thread to the child's session.
+ */
+function registerChildThreads(bb: BbPluginApi): () => void {
+  const { resolveActiveSessionId, resolveThreadBySession } =
+    createSessionResolver(bb);
+  const { firstHostAnswer } = createHostFanOut(bb, "Child threads");
+  const hostClient = bb.hosts.experimental_client({
+    contract: primeSubagentsHostContract,
+    experimental_signals: primeSubagentsHostSignals,
+  });
+
+  const service = createChildThreadService({
+    log: {
+      info: (message) => bb.log.info(message),
+      warn: (message) => bb.log.warn(message),
+    },
+    resolveParentThreadId: resolveThreadBySession,
+    resolveThreadSession: resolveActiveSessionId,
+    getParentThread: async (threadId) => {
+      const thread = await bb.sdk.threads.get({ threadId });
+      return thread === null
+        ? undefined
+        : { projectId: thread.projectId, environmentId: thread.environmentId };
+    },
+    findExistingChildThread: async (parentThreadId, title) => {
+      // Bound the scan: a parent with more live children than this is
+      // beyond any real grilling fleet, and the dedupe is a restart-only
+      // safety net (the in-process claim covers the steady state).
+      const children = await bb.sdk.threads.list({
+        parentThreadId,
+        limit: 100,
+      });
+      return children.some((thread) => thread.title === title);
+    },
+    spawnChildThread: async (args) => {
+      await bb.sdk.threads.spawn({
+        projectId: args.projectId,
+        providerId: PRIME_PROVIDER_ID,
+        title: args.title,
+        parentThreadId: args.parentThreadId,
+        environment:
+          args.environmentId === null
+            ? { type: "project-default" }
+            : { type: "reuse", environmentId: args.environmentId },
+        input: [childThreadMarkerInput(args.childSessionId)],
+      });
+    },
+    watchSession: async (sessionId) => {
+      // Ask every connected host; the one holding the session keeps its
+      // roster live. A host without the session refuses — skipped, not fatal.
+      await firstHostAnswer(sessionId, "watch", (hostId) =>
+        hostClient.call(
+          "subagents.watch",
+          { activeSessionId: sessionId },
+          { hostId },
+        ),
+      );
+    },
+    listRecentPrimeThreadIds: async () => {
+      const threads = await bb.sdk.threads.list({ limit: 25, archived: false });
+      return threads
+        .filter((thread) => thread.providerId === PRIME_PROVIDER_ID)
+        .map((thread) => thread.id);
+    },
+  });
+
+  const unsubscribe = hostClient.experimental_onSignal(
+    "subagents.changed",
+    (event) => {
+      // Fire and forget: a spawn failure is logged inside the service; the
+      // signal stream must never see a slow consumer.
+      void service
+        .onChildren(event.payload.activeSessionId, event.payload.children)
+        .catch(() => {});
+    },
+  );
+
+  // Spawns are only seen for watched sessions; a slow sweep keeps the
+  // parents of recent threads watched so a child surfaces with no panel
+  // open. The first sweep runs immediately — registration happens before
+  // the server listens, and the sdk is already bound.
+  const sweep = setInterval(() => {
+    void service.watchRecentThreads().catch(() => {});
+  }, 60_000);
+  void service.watchRecentThreads().catch(() => {});
+
+  return () => {
+    clearInterval(sweep);
+    unsubscribe();
+  };
 }

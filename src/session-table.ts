@@ -34,6 +34,13 @@ export interface SessionRecord {
   snapshotMessages?: readonly unknown[];
   /** Children from the latest attach snapshot (the Subagents roster's seed). */
   snapshotChildren?: readonly unknown[];
+  /**
+   * The record binds a session bb did not mint (the child-thread marker
+   * path, bbpa-b1m.11): a thread discard downgrades to release, because the
+   * child's session and transcript belong to prime's subagent, not to this
+   * thread.
+   */
+  childThread?: boolean;
 }
 
 /** Skill roots handed over by `skills/configure`, kept for session creation. */

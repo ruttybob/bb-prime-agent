@@ -62,6 +62,10 @@ import {
   primeProviderThreadId,
   provisionalPrimeProviderThreadId,
 } from "./vocabulary.js";
+import {
+  childThreadMarkerFromInput,
+  type ChildThreadStartParams,
+} from "./child-threads.js";
 import { PrimeSession } from "./prime-session.js";
 import { forkPrimeSession } from "./fork-session.js";
 import { enabledExtensionsFromProviderOptions } from "./user-extensions.js";
@@ -495,6 +499,72 @@ async function startSession(args: {
   }
 }
 
+/**
+ * The child-thread marker start (bbpa-b1m.11, ADR-0005): bind the thread to
+ * the named child session instead of creating one. The marker was already
+ * consumed by the caller's parse — nothing here sends anything to prime
+ * except the attach. The adopted-session replay fills the fresh timeline with
+ * the child's transcript; the marker turn settles with a note row so the
+ * spawn dispatch completes.
+ */
+async function startChildThread(
+  id: JsonRpcId,
+  data: ChildThreadStartParams,
+  childSessionId: string,
+): Promise<void> {
+  const record = registerSession({
+    threadId: data.threadId,
+    providerThreadId: primeProviderThreadId(childSessionId),
+    cwd: data.cwd,
+    dynamicTools: data.dynamicTools ?? [],
+  });
+  record.activeSessionId = childSessionId;
+  record.childThread = true;
+  try {
+    const session = laneFor(record);
+    try {
+      await session.attach();
+    } catch (error) {
+      if (!isUnknownActiveSessionError(error)) {
+        throw error;
+      }
+      // The child finished and the daemon unloaded it before the spawn
+      // dispatch landed: reopen from its transcript — the thread still gets
+      // the full history, and the note below says the child is done.
+      await reopenEvictedSession(record, "resume");
+    }
+    announceSession(record);
+    sessionFor(record).snapshotDeltas();
+  } catch (error) {
+    sessions.drop(record.threadId);
+    throw error;
+  }
+  await ensureDynamicToolsChannel(record);
+  await publishDynamicTools(record);
+  const note =
+    `Attached to prime-agent subagent session ${childSessionId}. Its transcript` +
+    " is below; messages you send here reach that session.";
+  emitDeltas(record.threadId, [
+    { kind: "turn.open" },
+    {
+      kind: "item.textDelta",
+      key: { channel: "child-thread-note" },
+      channel: "agentMessage",
+      text: note,
+    },
+    {
+      kind: "item.textClose",
+      key: { channel: "child-thread-note" },
+      channel: "agentMessage",
+    },
+    { kind: "turn.boundary", status: "completed" },
+  ]);
+  io.sendResult(id, {
+    providerThreadId: record.providerThreadId,
+    sessionRestorable: true,
+  });
+}
+
 async function runTurn(args: {
   record: SessionRecord;
   input: readonly PromptInput[];
@@ -722,6 +792,37 @@ const handlers: Record<string, RequestHandler> = {
     BRIDGE_REQUEST_METHODS.threadStart,
     threadStartParamsSchema,
     (id, data) => {
+      // A child-thread spawn (bbpa-b1m.11, ADR-0005) arrives as a start whose
+      // only input is the marker naming the child's daemon session. The
+      // marker is consumed here — it never reaches prime or a model — and the
+      // thread binds to the child session instead of creating one: the
+      // adopted-session replay fills the timeline with the child's
+      // transcript, and later prompts ride the ordinary turn path.
+      const marker = childThreadMarkerFromInput(data.input);
+      if (marker !== undefined) {
+        const bound = sessions.byThread(data.threadId);
+        if (bound === undefined) {
+          return startChildThread(id, data, marker.childSessionId);
+        }
+        if (bound.providerThreadId === primeProviderThreadId(marker.childSessionId)) {
+          // A redo of an already-bound start answers with the same binding
+          // and nothing else — no re-attach, no second marker turn.
+          io.sendResult(id, {
+            providerThreadId: bound.providerThreadId,
+            sessionRestorable: true,
+          });
+          return;
+        }
+        // Bound elsewhere: falling through would send the marker to prime as
+        // a user prompt. The marker is machine-to-machine; a mismatch is a
+        // caller bug, refused rather than leaked.
+        io.sendError(
+          id,
+          BRIDGE_JSON_RPC_ERRORS.INVALID_PARAMS,
+          `thread ${data.threadId} is already bound to ${bound.providerThreadId}; refusing a child-thread marker for ${marker.childSessionId}`,
+        );
+        return;
+      }
       const record = registerSession({
         threadId: data.threadId,
         cwd: data.cwd,
@@ -983,11 +1084,16 @@ const handlers: Record<string, RequestHandler> = {
         // The bb tools channel never outlives a discard attempt: bb is tearing
         // the thread down, and a resume re-arms the channel if the discard fails.
         await stopDynamicTools(record);
-        if (record?.session !== undefined) {
+        if (record?.session !== undefined && !record.childThread) {
           // Stop + cleanup: soft-stop the open turn, then `kill` +
           // `delete_saved_session` for exactly the session id and file this
           // thread's record names — never a session this bridge did not mint.
           await record.session.destroy();
+        } else if (record?.session !== undefined) {
+          // A child thread binds a session prime's rlm() minted (bbpa-b1m.11,
+          // ADR-0005): bb does not destroy work it did not start, so discard
+          // only releases the attach — the child and its transcript survive.
+          await record.session.release();
         }
         // A record without a session has no daemon identity to clean up (its
         // `create` never answered), so there is nothing to address.
