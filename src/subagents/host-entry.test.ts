@@ -37,6 +37,8 @@ function scriptedConnection(
     children?: unknown[];
     /** Answers beyond the attach snapshot, by command type. */
     answers?: Record<string, DaemonCommandResult>;
+    /** Attach answers by the session they name (a child's transcript seed). */
+    attachAnswers?: Record<string, DaemonCommandResult>;
   } = {},
 ): ScriptedConnectionHandle {
   const commands: Array<Record<string, unknown>> = [];
@@ -46,11 +48,17 @@ function scriptedConnection(
     async request(command) {
       commands.push(command);
       if (command.type === "attach") {
-        return {
-          command: "attach",
-          success: true,
-          data: { snapshot: { children: args.children ?? [] } },
-        } satisfies DaemonCommandResult;
+        const targeted = args.attachAnswers?.[String(command.activeSessionId)];
+        if (targeted !== undefined) {
+          return targeted;
+        }
+        return (
+          args.answers?.attach ?? {
+            command: "attach",
+            success: true,
+            data: { snapshot: { children: args.children ?? [] } },
+          } satisfies DaemonCommandResult
+        );
       }
       return (
         args.answers?.[String(command.type)] ?? {
@@ -455,6 +463,7 @@ describe("the control surface's limits", () => {
       "subagents.roster",
       "subagents.steer",
       "subagents.stop",
+      "subagents.transcript",
     ]);
   });
 });
@@ -473,3 +482,83 @@ async function vi_waitFor(predicate: () => void): Promise<void> {
     }
   }
 }
+
+describe("reading a child's transcript from the panel", () => {
+  it("attaches to the child's own session and answers its bounded transcript", async () => {
+    const scripted = scriptedConnection({
+      children: [child({ activeSessionId: "sess_child_1" })],
+      attachAnswers: {
+        sess_child_1: {
+          command: "attach",
+          success: true,
+          data: {
+            snapshot: {
+              messages: [
+                { role: "user", content: "scout" },
+                { role: "assistant", content: [{ type: "text", text: "all clear" }] },
+              ],
+            },
+          },
+        },
+      },
+    });
+    // The parent attach seeds the roster; the child's attach (keyed by the
+    // child's own session) carries the transcript — mirroring how the daemon
+    // splits resident rosters from a subagent snapshot's messages.
+    const harness = createHostEntryHarness(
+      createPrimeSubagentsHostEntry({ createConnection: () => scripted.connection }),
+    );
+    await expect(
+      harness.experimental_call("subagents.transcript", {
+        activeSessionId: "sess_parent",
+        childId: "child_1",
+      }),
+    ).resolves.toEqual({
+      state: "ready",
+      entries: [
+        { kind: "user", text: "scout" },
+        { kind: "assistant", text: "all clear" },
+      ],
+      truncated: false,
+    });
+    // The second command on the wire is the child attach — the parent attach
+    // only seeded the roster, the transcript attach names the child's session.
+    expect(scripted.commands[1]).toMatchObject({
+      type: "attach",
+      activeSessionId: "sess_child_1",
+    });
+    await harness.experimental_dispose();
+  });
+
+  it("answers no_session for a child that has not booted, without attaching", async () => {
+    const scripted = scriptedConnection({
+      children: [child({ id: "child_1", status: "queued" })],
+    });
+    const harness = createHostEntryHarness(
+      createPrimeSubagentsHostEntry({ createConnection: () => scripted.connection }),
+    );
+    await expect(
+      harness.experimental_call("subagents.transcript", {
+        activeSessionId: "sess_parent",
+        childId: "child_1",
+      }),
+    ).resolves.toEqual({ state: "no_session", entries: [], truncated: false });
+    const attaches = scripted.commands.filter((command) => command.type === "attach");
+    expect(attaches).toHaveLength(1); // the roster's parent attach only
+    await harness.experimental_dispose();
+  });
+
+  it("refuses a child this session does not have", async () => {
+    const scripted = scriptedConnection({ children: [child()] });
+    const harness = createHostEntryHarness(
+      createPrimeSubagentsHostEntry({ createConnection: () => scripted.connection }),
+    );
+    await expect(
+      harness.experimental_call("subagents.transcript", {
+        activeSessionId: "sess_parent",
+        childId: "child_other",
+      }),
+    ).rejects.toThrow(/no subagent "child_other"/);
+    await harness.experimental_dispose();
+  });
+});

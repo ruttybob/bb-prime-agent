@@ -1,11 +1,13 @@
 import { useState } from "react";
 import type { PrimeChild } from "../subagents/children.js";
 import { MAX_STEER_MESSAGE_CHARS } from "../subagents/control.js";
+import type { TranscriptEntry } from "../subagents/transcript.js";
 import {
   useSubagentsRoster,
   type RosterStatus,
   type SubagentsPanel,
 } from "./use-subagents-roster.js";
+import { useChildTranscript } from "./use-child-transcript.js";
 
 /**
  * The Subagents panel (bbpa-ggf.9): the prime subagents of this thread, with
@@ -23,17 +25,38 @@ import {
 
 export function SubagentsPanel({ threadId }: { threadId: string }) {
   const panel = useSubagentsRoster(threadId);
+  /** The one child whose transcript is open, or none. */
+  const [openTranscriptId, setOpenTranscriptId] = useState<string | null>(null);
   return (
     <div
       className="flex min-w-0 flex-col gap-3 text-sm"
       data-testid="subagents-panel"
     >
-      <PanelBody panel={panel} />
+      <PanelBody
+        panel={panel}
+        threadId={threadId}
+        openTranscriptId={openTranscriptId}
+        onToggleTranscript={(childId) =>
+          setOpenTranscriptId((current) =>
+            current === childId ? null : childId,
+          )
+        }
+      />
     </div>
   );
 }
 
-function PanelBody({ panel }: { panel: SubagentsPanel }) {
+function PanelBody({
+  panel,
+  threadId,
+  openTranscriptId,
+  onToggleTranscript,
+}: {
+  panel: SubagentsPanel;
+  threadId: string;
+  openTranscriptId: string | null;
+  onToggleTranscript: (childId: string) => void;
+}) {
   const { status } = panel;
   if (status.kind === "loading") {
     return (
@@ -61,15 +84,29 @@ function PanelBody({ panel }: { panel: SubagentsPanel }) {
       </p>
     );
   }
-  return <RosterList roster={status.children} panel={panel} />;
+  return (
+    <RosterList
+      roster={status.children}
+      panel={panel}
+      threadId={threadId}
+      openTranscriptId={openTranscriptId}
+      onToggleTranscript={onToggleTranscript}
+    />
+  );
 }
 
 function RosterList({
   roster,
   panel,
+  threadId,
+  openTranscriptId,
+  onToggleTranscript,
 }: {
   roster: readonly PrimeChild[];
   panel: SubagentsPanel;
+  threadId: string;
+  openTranscriptId: string | null;
+  onToggleTranscript: (childId: string) => void;
 }) {
   const ordered = [...roster].sort(
     (left, right) => Number(isLive(right)) - Number(isLive(left)),
@@ -86,7 +123,14 @@ function RosterList({
       </div>
       <ul className="flex min-w-0 flex-col gap-2">
         {ordered.map((child) => (
-          <ChildRow key={child.id} child={child} panel={panel} />
+          <ChildRow
+            key={child.id}
+            child={child}
+            panel={panel}
+            threadId={threadId}
+            transcriptOpen={openTranscriptId === child.id}
+            onToggleTranscript={() => onToggleTranscript(child.id)}
+          />
         ))}
       </ul>
     </div>
@@ -96,9 +140,15 @@ function RosterList({
 function ChildRow({
   child,
   panel,
+  threadId,
+  transcriptOpen,
+  onToggleTranscript,
 }: {
   child: PrimeChild;
   panel: SubagentsPanel;
+  threadId: string;
+  transcriptOpen: boolean;
+  onToggleTranscript: () => void;
 }) {
   const detail = childDetail(child);
   const live = isLive(child);
@@ -186,7 +236,143 @@ function ChildRow({
           {failure.message}
         </p>
       ) : null}
+      <div className="mt-1 flex items-center justify-end">
+        <button
+          type="button"
+          onClick={onToggleTranscript}
+          aria-expanded={transcriptOpen}
+          aria-label={`Transcript: ${child.label}`}
+          className="shrink-0 rounded border border-zinc-500/40 px-2 py-1 text-[11px] text-zinc-600 hover:bg-zinc-500/10 dark:text-zinc-300"
+        >
+          Transcript
+        </button>
+      </div>
+      {transcriptOpen ? (
+        <ChildTranscriptSection
+          threadId={threadId}
+          childId={child.id}
+          activeSessionId={panel.activeSessionId ?? undefined}
+        />
+      ) : null}
     </li>
+  );
+}
+
+/**
+ * One child's transcript (bbpa-b1m.8): read-only, bounded history, kept
+ * current by the hook's poll. The rows are prime's own roles — what the child
+ * was asked, what it thought and answered, what it ran and what came back.
+ */
+function ChildTranscriptSection({
+  threadId,
+  childId,
+  activeSessionId,
+}: {
+  threadId: string;
+  childId: string;
+  activeSessionId: string | undefined;
+}) {
+  const { status } = useChildTranscript(threadId, childId, activeSessionId);
+  if (status.kind === "loading") {
+    return (
+      <p
+        className="mt-2 rounded-md bg-zinc-500/5 px-3 py-2 text-[12px] text-zinc-500"
+        role="status"
+      >
+        Reading the transcript…
+      </p>
+    );
+  }
+  if (status.kind === "unavailable") {
+    return (
+      <p
+        className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[12px] text-amber-600 dark:text-amber-400"
+        role="alert"
+      >
+        {status.message}
+      </p>
+    );
+  }
+  if (status.kind === "no_session") {
+    return (
+      <p className="mt-2 rounded-md bg-zinc-500/5 px-3 py-2 text-[12px] text-zinc-500">
+        This subagent has not started yet — it has no session to read.
+      </p>
+    );
+  }
+  if (status.entries.length === 0) {
+    return (
+      <p className="mt-2 rounded-md bg-zinc-500/5 px-3 py-2 text-[12px] text-zinc-500">
+        The transcript is empty.
+      </p>
+    );
+  }
+  return (
+    <div
+      className="mt-2 flex min-w-0 flex-col gap-1.5 rounded-md bg-zinc-500/5 px-3 py-2"
+      aria-label="Subagent transcript"
+    >
+      {status.entries.map((entry, index) => (
+        <TranscriptRow key={index} entry={entry} />
+      ))}
+      {status.truncated ? (
+        <p className="mt-1 text-[11px] italic text-zinc-500">
+          Older entries were dropped — the transcript keeps the most recent
+          history only.
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function TranscriptRow({ entry }: { entry: TranscriptEntry }) {
+  if (entry.kind === "user") {
+    return (
+      <p className="whitespace-pre-wrap break-words text-[12px] text-zinc-700 dark:text-zinc-300">
+        <span aria-hidden className="mr-1 text-zinc-500">
+          ›
+        </span>
+        {entry.text}
+      </p>
+    );
+  }
+  if (entry.kind === "thinking") {
+    return (
+      <p className="whitespace-pre-wrap break-words text-[12px] italic text-zinc-500 dark:text-zinc-500">
+        <span aria-hidden className="mr-1 not-italic">
+          …
+        </span>
+        {entry.text}
+      </p>
+    );
+  }
+  if (entry.kind === "assistant") {
+    return (
+      <p className="whitespace-pre-wrap break-words text-[12px] text-zinc-800 dark:text-zinc-200">
+        {entry.text}
+      </p>
+    );
+  }
+  return (
+    <div className="min-w-0 break-words text-[12px]">
+      <span className="font-medium text-sky-700 dark:text-sky-400">
+        {entry.toolName}
+      </span>
+      {entry.argsPreview !== undefined ? (
+        <span className="ml-1 break-all text-zinc-500">{entry.argsPreview}</span>
+      ) : null}
+      {entry.resultText !== undefined ? (
+        <p
+          className={`whitespace-pre-wrap break-words ${
+            entry.isError === true
+              ? "text-rose-600 dark:text-rose-400"
+              : "text-zinc-600 dark:text-zinc-400"
+          }`}
+        >
+          {entry.resultText}
+        </p>
+      ) : null}
+    </div>
   );
 }
 

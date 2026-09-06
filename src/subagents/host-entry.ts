@@ -12,6 +12,8 @@ import {
   type SubagentsBackendConnection,
 } from "./backend-connection.js";
 import { isChildLive } from "./children.js";
+import type { SubagentsTranscriptHostResult } from "./contract.js";
+import { ChildTranscripts } from "./transcripts.js";
 import {
   steerCommand,
   steerDelivery,
@@ -49,8 +51,12 @@ export interface PrimeSubagentsHostEntryArgs {
 export function createPrimeSubagentsHostEntry(
   args: PrimeSubagentsHostEntryArgs = {},
 ) {
-  let connection: SubagentsBackendConnection | undefined;
-  let roster: SubagentsRoster | undefined;
+  /**
+   * The one backend (roster + transcript tracker + their shared daemon
+   * connection), built lazily on the first question. One slot, so the pieces
+   * can never fall out of step.
+   */
+  let built: SubagentsBackend | undefined;
   /** The worker-retention lease, held while any session is watched. */
   let lease: ExperimentalHostWorkerLease | undefined;
   /** The first handler call lends the entry its retention ability. */
@@ -67,6 +73,7 @@ export function createPrimeSubagentsHostEntry(
     | undefined;
 
   function syncLease(): void {
+    const roster = built?.roster;
     if (roster === undefined) {
       return;
     }
@@ -78,23 +85,32 @@ export function createPrimeSubagentsHostEntry(
     }
   }
 
-  /** The roster and the daemon wire it reads (and the control actions use). */
+  /** The roster, the transcript tracker, and the daemon wire they share. */
   interface SubagentsBackend {
     roster: SubagentsRoster;
+    transcripts: ChildTranscripts;
     connection: SubagentsBackendConnection;
   }
 
   function backend(): SubagentsBackend {
-    if (roster !== undefined && connection !== undefined) {
-      return { roster, connection };
+    if (built !== undefined) {
+      return built;
     }
-    const built = args.createConnection?.() ?? createSubagentsBackendConnection();
-    const created = new SubagentsRoster({
-      request: (command, requestArgs) => built.request(command, requestArgs),
-      subscribePush: (listener) => built.subscribePush(listener),
-      onReconnect: (listener) => built.onReconnect(listener),
+    const connection = args.createConnection?.() ?? createSubagentsBackendConnection();
+    const roster = new SubagentsRoster({
+      request: (command, requestArgs) => connection.request(command, requestArgs),
+      subscribePush: (listener) => connection.subscribePush(listener),
+      onReconnect: (listener) => connection.onReconnect(listener),
     });
-    created.onChange((change) => {
+    // The transcript tracker shares the roster's connection and push stream:
+    // one per-machine daemon client carries both (and the bridge's lane is a
+    // separate client entirely).
+    const transcripts = new ChildTranscripts({
+      request: (command, requestArgs) => connection.request(command, requestArgs),
+      subscribePush: (listener) => connection.subscribePush(listener),
+      onReconnect: (listener) => connection.onReconnect(listener),
+    });
+    roster.onChange((change) => {
       syncLease();
       if (emit === undefined) {
         return;
@@ -106,9 +122,8 @@ export function createPrimeSubagentsHostEntry(
         children: [...change.children],
       }).catch(() => {});
     });
-    roster = created;
-    connection = built;
-    return { roster: created, connection: built };
+    built = { roster, transcripts, connection };
+    return built;
   }
 
   /**
@@ -194,15 +209,31 @@ export function createPrimeSubagentsHostEntry(
         }
         return { cancelled: stopCancelled(answer.data) };
       },
+      /**
+       * The transcript read (bbpa-b1m.8): the roster names the child (and
+       * vouches that this machine's daemon has it), the child's own session id
+       * is the attach target. Read-only — an unbooted child has no session to
+       * read, which is a state, not a failure.
+       */
+      "subagents.transcript": async (input, context) => {
+        const { backend, children } = await watched(input.activeSessionId, context);
+        const child = childOrThrow(children, input);
+        const answer: SubagentsTranscriptHostResult =
+          child.activeSessionId === undefined || child.activeSessionId.length === 0
+            ? { state: "no_session", entries: [], truncated: false }
+            : { state: "ready", ...(await backend.transcripts.read(child.activeSessionId)) };
+        return answer;
+      },
     },
     async dispose() {
       lease?.dispose();
       lease = undefined;
       retain = undefined;
-      await roster?.dispose();
-      roster = undefined;
-      connection?.dispose();
-      connection = undefined;
+      const backend = built;
+      built = undefined;
+      await backend?.transcripts.dispose();
+      await backend?.roster.dispose();
+      backend?.connection.dispose();
     },
   });
 }

@@ -347,3 +347,131 @@ describe("the Subagents panel's controls", () => {
     slot.lifecycle.unmount();
   });
 });
+
+/**
+ * The transcript (bbpa-b1m.8): a child row opens its bounded transcript —
+ * read-only, polled while open, and honest about a child that has not booted.
+ */
+describe("the Subagents panel's child transcript", () => {
+  function renderRosterWithTranscript(options: {
+    transcript?: (input: unknown) => Promise<unknown>;
+  } = {}) {
+    return renderPanel({
+      rpc: {
+        roster: vi.fn().mockResolvedValue({
+          state: "ready",
+          activeSessionId: "sess_panel",
+          children: [scoutChild()],
+        }),
+        ...(options.transcript === undefined ? {} : { transcript: options.transcript }),
+      },
+    });
+  }
+
+  const readyTranscript = {
+    state: "ready",
+    activeSessionId: "sess_panel",
+    truncated: false,
+    entries: [
+      { kind: "user", text: "scout the repo" },
+      { kind: "thinking", text: "start at the manifest" },
+      { kind: "assistant", text: "found the parser" },
+      {
+        kind: "tool",
+        toolName: "bash",
+        argsPreview: '{"command":"ls"}',
+        resultText: "README",
+      },
+    ],
+  };
+
+  it("opens a child's transcript, renders its roles, and closes it", async () => {
+    const transcript = vi.fn().mockResolvedValue(readyTranscript);
+    const slot = renderRosterWithTranscript({ transcript });
+    await slot.findByText("scout");
+
+    // Closed until asked; opening asks exactly once, carrying the session.
+    expect(transcript).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Transcript: scout" }));
+    await slot.findByText("scout the repo");
+    await waitFor(() =>
+      expect(transcript).toHaveBeenCalledWith({
+        threadId: "thr_panel",
+        childId: "child_1",
+        activeSessionId: "sess_panel",
+      }),
+    );
+    expect(screen.getByText("found the parser")).toBeDefined();
+    expect(screen.getByText(/bash/)).toBeDefined();
+    expect(screen.getByText("README")).toBeDefined();
+
+    // Closing unmounts the transcript view.
+    fireEvent.click(screen.getByRole("button", { name: "Transcript: scout" }));
+    await waitFor(() => expect(screen.queryByText("scout the repo")).toBeNull());
+    slot.lifecycle.unmount();
+  });
+
+  it("says a child without a session has no transcript yet", async () => {
+    const slot = renderRosterWithTranscript({
+      transcript: vi.fn().mockResolvedValue({
+        state: "no_session",
+        activeSessionId: "sess_panel",
+        entries: [],
+        truncated: false,
+      }),
+    });
+    await slot.findByText("scout");
+    fireEvent.click(screen.getByRole("button", { name: "Transcript: scout" }));
+    await slot.findByText(/has not started yet/);
+    slot.lifecycle.unmount();
+  });
+
+  it("says when older entries were dropped by the history bounds", async () => {
+    const slot = renderRosterWithTranscript({
+      transcript: vi.fn().mockResolvedValue({
+        ...readyTranscript,
+        truncated: true,
+      }),
+    });
+    await slot.findByText("scout");
+    fireEvent.click(screen.getByRole("button", { name: "Transcript: scout" }));
+    await slot.findByText(/older entries/i);
+    slot.lifecycle.unmount();
+  });
+
+  it("keeps a transcript open current: refetch on roster signals and on the clock", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const transcript = vi.fn().mockResolvedValue(readyTranscript);
+      const slot = renderRosterWithTranscript({ transcript });
+      await slot.findByText("scout");
+      fireEvent.click(screen.getByRole("button", { name: "Transcript: scout" }));
+      await slot.findByText("scout the repo");
+      const asksAfterOpen = transcript.mock.calls.length;
+
+      // A roster signal for this thread's session is worth asking again.
+      await slot.behavior.emitRealtime("subagents", { activeSessionId: "sess_panel" });
+      await waitFor(() => expect(transcript.mock.calls.length).toBeGreaterThan(asksAfterOpen));
+
+      // And so is the passage of time while the transcript stays open.
+      const asksBeforeTick = transcript.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5_500);
+      });
+      await waitFor(() => expect(transcript.mock.calls.length).toBeGreaterThan(asksBeforeTick));
+      slot.lifecycle.unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("surfaces a transcript read failure as an alert", async () => {
+    const slot = renderRosterWithTranscript({
+      transcript: vi.fn().mockRejectedValue(new Error("the host went away")),
+    });
+    await slot.findByText("scout");
+    fireEvent.click(screen.getByRole("button", { name: "Transcript: scout" }));
+    await slot.findByText(/the host went away/);
+    slot.lifecycle.unmount();
+  });
+});

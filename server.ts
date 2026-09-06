@@ -5,6 +5,7 @@ import {
   primeSubagentsHostSignals,
   primeSubagentsRpcContract,
   type SubagentsRosterResult,
+  type SubagentsTranscriptHostResult,
 } from "./src/subagents/contract.js";
 import {
   discoverUserPrimeExtensions,
@@ -219,6 +220,42 @@ function registerSubagents(bb: BbPluginApi): () => void {
         throw noHostHolds(activeSessionId);
       }
       return { activeSessionId, cancelled: answer.cancelled };
+    },
+
+    /**
+     * The transcript read (bbpa-b1m.8) is a question, not an action: an
+     * unreachable daemon answers `unavailable` (the panel shows it), and a
+     * host whose daemon lost the session answers the same way a session that
+     * never existed would — the panel cannot tell the difference and does not
+     * need to. `no_session` passes straight through: the child has not booted.
+     */
+    async transcript(
+      input,
+    ): Promise<{
+      state: "ready" | "unknown_thread" | "unavailable" | "no_session";
+      activeSessionId: string | null;
+      entries: SubagentsTranscriptHostResult["entries"];
+      truncated: boolean;
+    }> {
+      const activeSessionId =
+        input.activeSessionId ?? (await resolveActiveSessionId(input.threadId));
+      if (activeSessionId === undefined) {
+        return { state: "unknown_thread", activeSessionId: null, entries: [], truncated: false };
+      }
+      const answer = await firstHostAnswer<SubagentsTranscriptHostResult>(
+        activeSessionId,
+        "read a transcript in",
+        (hostId) =>
+          hostClient.call(
+            "subagents.transcript",
+            { activeSessionId, childId: input.childId },
+            { hostId },
+          ),
+      );
+      if (answer === undefined) {
+        return { state: "unavailable", activeSessionId, entries: [], truncated: false };
+      }
+      return { ...answer, activeSessionId };
     },
   });
 

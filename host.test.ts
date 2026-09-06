@@ -25,6 +25,7 @@ describe("the host artifact", () => {
       "subagents.roster",
       "subagents.steer",
       "subagents.stop",
+      "subagents.transcript",
     ]);
     expect(hostEntry.experimental_signals).toBeDefined();
   });

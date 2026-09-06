@@ -2,6 +2,7 @@ import { z } from "zod";
 import { defineRpcContract } from "@get-bb/plugin-sdk";
 import { primeChildSchema } from "./children.js";
 import { MAX_STEER_MESSAGE_CHARS } from "./control.js";
+import { boundedTranscriptSchema } from "./transcript.js";
 
 /**
  * The Subagents panel's two contracts (bbpa-ggf.9, control added in .10).
@@ -59,6 +60,17 @@ export const subagentsStopResultSchema = z.object({
 export type SubagentsStopResult = z.infer<typeof subagentsStopResultSchema>;
 
 /**
+ * A transcript read's answer, shared by the host contract and its handler:
+ * the bounded transcript plus the one state word the host adds.
+ */
+export const subagentsTranscriptHostResultSchema = boundedTranscriptSchema.extend({
+  state: z.enum(["ready", "no_session"]),
+});
+export type SubagentsTranscriptHostResult = z.infer<
+  typeof subagentsTranscriptHostResultSchema
+>;
+
+/**
  * Host contract: the read-only roster question, and the two control actions
  * (bbpa-ggf.10) that map to prime's `send_message` and `cancel_rlm_child`.
  * Both control actions name the child inside the session the panel is already
@@ -90,6 +102,19 @@ export const primeSubagentsHostContract = defineRpcContract({
       childId: z.string().min(1),
     }),
     output: subagentsStopResultSchema,
+  },
+  /**
+   * The child transcript read (bbpa-b1m.8): a read-only attach to the child's
+   * own daemon session, answered with a bounded history. `no_session` is the
+   * honest answer for a child prime has not booted yet — not an error, and not
+   * an empty transcript.
+   */
+  "subagents.transcript": {
+    input: z.object({
+      activeSessionId: z.string().min(1),
+      childId: z.string().min(1),
+    }),
+    output: subagentsTranscriptHostResultSchema,
   },
 });
 
@@ -148,5 +173,21 @@ export const primeSubagentsRpcContract = defineRpcContract({
       activeSessionId: z.string().min(1).optional(),
     }),
     output: subagentsControlOutput.extend(subagentsStopResultSchema.shape),
+  },
+  /**
+   * The transcript question (bbpa-b1m.8) rides the roster's road: thread id in,
+   * the resolved prime session out, and the read-only states the panel renders
+   * as-is (`unknown_thread`, `unavailable`) alongside the host's `no_session`.
+   */
+  transcript: {
+    input: z.object({
+      threadId: z.string().min(1),
+      childId: z.string().min(1),
+      activeSessionId: z.string().min(1).optional(),
+    }),
+    output: boundedTranscriptSchema.extend({
+      state: z.enum(["ready", "unknown_thread", "unavailable", "no_session"]),
+      activeSessionId: z.string().nullable(),
+    }),
   },
 });

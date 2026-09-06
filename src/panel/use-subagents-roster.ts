@@ -41,6 +41,12 @@ export interface SubagentActionFailure {
 
 export interface SubagentsPanel {
   status: RosterStatus;
+  /**
+   * The prime session the last answer named, or `null` before the first one.
+   * Follow-up questions (a child's transcript) ride it instead of re-resolving
+   * the thread on the server.
+   */
+  activeSessionId: string | null;
   /** Child id → the action in flight for it (cleared when the call settles). */
   pending: ReadonlyMap<string, SubagentAction>;
   /** The last refusal, per the row that raised it; cleared by the next try. */
@@ -217,7 +223,15 @@ export function useSubagentsRoster(threadId: string): SubagentsPanel {
     [control, rpc, threadId],
   );
 
-  return { status, pending, failure, delivery, steer, stop };
+  return {
+    status,
+    activeSessionId: activeSessionIdRef.current,
+    pending,
+    failure,
+    delivery,
+    steer,
+    stop,
+  };
 }
 
 function toStatus(answer: SubagentsRosterResult): RosterStatus {
