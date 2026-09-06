@@ -733,6 +733,25 @@ export interface PrimeDeltaTranslator {
     threadId: string,
     args: { message: string; detail?: string },
   ): ThreadDelta[];
+  /**
+   * Deltas that settle a stuck open turn by reconciliation (bbpa-uld): the
+   * turn-end signal was lost while the daemon session reads verifiably idle —
+   * open streams closed, one feed row explaining the reconciliation, the
+   * boundary `interrupted` (the run's real outcome is unknown, never success).
+   * The live lane settles with this: it *knows* the turn was open.
+   */
+  reconciliationDeltas(
+    threadId: string,
+    args: { idleSeconds: number },
+  ): ThreadDelta[];
+  /**
+   * The attach-time check's quiet form: the same interrupted boundary, no
+   * feed row. A fresh worker cannot know whether a bb turn was actually open
+   * (the knowledge died with the reaped process), so it must not fabricate
+   * the explanation — `claimIfIdle` does the talking, and is a no-op when
+   * there is nothing to claim.
+   */
+  quietReconciliationDeltas(threadId: string): ThreadDelta[];
   resetThread(threadId: string): void;
 }
 
@@ -1881,10 +1900,37 @@ function closeGoalRow(
       });
       return deltas;
     },
+    reconciliationDeltas(threadId, args) {
+      const deltas = closeOpenStreams({ threadId, cwd: undefined });
+      deltas.push({
+        kind: "provider.warning",
+        category: "general",
+        summary:
+          "the turn's end event was lost; the bridge closed the turn by reconciliation",
+        details: `prime-agent's session read idle for ${args.idleSeconds}s — no streaming, running tools, bash, RLM children, or compaction — while the turn was still open; the run's real outcome is unknown`,
+      });
+      deltas.push(reconciledTurnBoundary());
+      return deltas;
+    },
+    quietReconciliationDeltas(threadId) {
+      const deltas = closeOpenStreams({ threadId, cwd: undefined });
+      deltas.push(reconciledTurnBoundary());
+      return deltas;
+    },
     resetThread(threadId) {
       states.delete(threadId);
     },
   };
+}
+
+/**
+ * The boundary every reconciliation settles with: `interrupted` — the run's
+ * real outcome is unknown — and `claimIfIdle`, so a boundary whose bb turn
+ * already went away (a racing `agent_end`, a plain thread reopen) is a no-op
+ * on the assembler side rather than a fabricated turn.
+ */
+function reconciledTurnBoundary(): ThreadDelta {
+  return { kind: "turn.boundary", status: "interrupted", claimIfIdle: true };
 }
 
 /** The payload one goal row carries: the state prime reported, respelled. */
