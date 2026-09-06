@@ -37,10 +37,10 @@ export interface ChildThreadStartParams {
 
 /**
  * The marker's text form. Deliberately exact and single-line: the bridge
- * accepts only this shape, so ordinary (or adversarial) user text can never
- * masquerade as a marker — a marker is something only this plugin's spawn
- * writes, and `visibility: "agent-only"` keeps it out of the timeline even
- * before the bridge consumes it.
+ * accepts only this shape. We write it `visibility: "agent-only"` so it
+ * stays out of the timeline, though bb strips that field on provider
+ * delivery — the parse therefore rests on the exact text shape, which
+ * ordinary prompts and multi-line text never satisfy.
  */
 const MARKER_PREFIX = "@prime-child:";
 
@@ -59,7 +59,8 @@ export function childThreadMarkerInput(childSessionId: string): PromptInput {
 /**
  * The child session id a start request's input carries, or `undefined` when
  * the input is not exactly one marker part (ordinary prompts, extra parts,
- * multi-line smuggling).
+ * multi-line smuggling). The part's `visibility` is deliberately not
+ * consulted: bb strips it on provider delivery, so it proves nothing.
  */
 export function childThreadMarkerFromInput(
   input: readonly PromptInput[] | undefined,
@@ -68,9 +69,16 @@ export function childThreadMarkerFromInput(
     return undefined;
   }
   const part = input[0];
-  if (part.type !== "text" || part.visibility !== "agent-only") {
+  if (part.type !== "text") {
     return undefined;
   }
+  // bb 0.42.1 strips `visibility` when it delivers a spawn prompt to the
+  // provider — the minted marker arrives as a bare text part, so visibility
+  // cannot carry the authentication. Accepting the bare part is still safe:
+  // a marker can only be a thread's first input via this plugin's spawn or a
+  // person deliberately typing it, and both mean "attach this thread to the
+  // named session". Ordinary prompts, extra parts, and multi-line smuggling
+  // still fail the exact-shape check below.
   const match = MARKER_PATTERN.exec(part.text);
   if (match === null) {
     return undefined;

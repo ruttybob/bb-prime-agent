@@ -19,6 +19,17 @@ describe("child thread marker", () => {
     expect(parsed).toEqual({ childSessionId: "6f39f76c3892" });
   });
 
+  it("still binds when bb strips visibility on provider delivery (0.42.1 wire fact)", () => {
+    // Observed live: a minted thread's marker reached the bridge as a bare
+    // text part — no `visibility` — and the strict check silently rejected
+    // every real mint, so child threads never attached to their sessions.
+    // The cast is the point: bb's delivery drops `mentions` too, and the
+    // parse must survive exactly that bare shape.
+    const delivered = [{ type: "text", text: "@prime-child:9e901348a3d1" }];
+    const parsed = childThreadMarkerFromInput(delivered as PromptInput[]);
+    expect(parsed).toEqual({ childSessionId: "9e901348a3d1" });
+  });
+
   it("is invisible to the timeline parser: agent-only text yields no visible parts", () => {
     // The marker rides bb's dispatch as the thread's first message; it must
     // never render as user text. bb skips `visibility: "agent-only"` parts
