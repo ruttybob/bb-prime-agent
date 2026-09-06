@@ -50,6 +50,11 @@ import {
   type PrimeGoalState,
 } from "./goal-state.js";
 import { primeProviderThreadId } from "./vocabulary.js";
+import {
+  reconcileTimingFromEnv,
+  sessionSummaryIsIdle,
+  type ReconcileClock,
+} from "./turn-reconciliation.js";
 import { forkCheckpointFor } from "./fork-points.js";
 import { asWireCommand } from "./daemon/transport.js";
 import type { SessionRecord } from "./session-table.js";
@@ -222,6 +227,20 @@ export class PrimeSession {
   private clientsTimer: ReturnType<typeof setInterval> | undefined;
   private clientsReadAt = 0;
   /**
+   * The turn-reconciliation clock (bbpa-uld): the poll timer that reads
+   * `get_state` while a turn is open, the moment the session first read
+   * verifiably idle in the current window, the one attach-time check a fresh
+   * worker schedules, and how many turns settled since that attach (any
+   * settled turn proves the lane is live — the check stands down).
+   */
+  private reconcile: ReconcileClock = {
+    pollTimer: undefined,
+    attachTimer: undefined,
+    attachConfirmTimer: undefined,
+    idleSince: undefined,
+    settledSinceAttach: 0,
+  };
+  /**
    * The thread goal the last attach snapshot carried (bbpa-b1m.2), when it
    * described a real goal. `undefined` for a fresh session, a cleared goal,
    * or a prime too old to report the field. Consumed by `snapshotDeltas`.
@@ -286,6 +305,7 @@ export class PrimeSession {
     this.daemonClosed = true;
     this.closed = true;
     this.stopClientsPoll();
+    this.stopReconcileTimers();
   }
 
   get hasOpenTurn(): boolean {
@@ -563,6 +583,245 @@ export class PrimeSession {
     if (this.clientsTimer !== undefined) {
       clearInterval(this.clientsTimer);
       this.clientsTimer = undefined;
+    }
+  }
+
+  /* --------------------- turn reconciliation (bbpa-uld) --------------------- */
+
+  /**
+   * Arm the periodic reconcile poll for a turn about to stream. A turn whose
+   * `agent_end` is lost — the wire event never comes, the worker that would
+   * have heard it is reaped — would otherwise hold the bb turn open forever:
+   * bb retired its own provider-turn watchdog (wire fact), so the bridge is
+   * the thing that must notice.
+   */
+  private armReconcilePoll(): void {
+    if (this.reconcile.pollTimer !== undefined || this.closed) {
+      return;
+    }
+    this.scheduleReconcileTick(reconcileTimingFromEnv().pollMs);
+  }
+
+  private scheduleReconcileTick(delayMs: number): void {
+    if (this.reconcile.pollTimer !== undefined || this.closed) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.reconcile.pollTimer = undefined;
+      void this.reconcileTick();
+    }, delayMs);
+    // Never a reason for the bridge process to stay alive on its own.
+    timer.unref?.();
+    this.reconcile.pollTimer = timer;
+  }
+
+  private stopReconcileTimers(): void {
+    if (this.reconcile.pollTimer !== undefined) {
+      clearTimeout(this.reconcile.pollTimer);
+      this.reconcile.pollTimer = undefined;
+    }
+    if (this.reconcile.attachTimer !== undefined) {
+      clearTimeout(this.reconcile.attachTimer);
+      this.reconcile.attachTimer = undefined;
+    }
+    if (this.reconcile.attachConfirmTimer !== undefined) {
+      clearTimeout(this.reconcile.attachConfirmTimer);
+      this.reconcile.attachConfirmTimer = undefined;
+    }
+    this.reconcile.idleSince = undefined;
+  }
+
+  /**
+   * `true`/`false` — the session's verifiably-idle verdict; `undefined` — the
+   * daemon would not say (refusal, drop, unparsable answer): not evidence,
+   * the idle window restarts rather than settling on doubt.
+   */
+  private async readIdleVerdict(): Promise<boolean | undefined> {
+    if (this.record.activeSessionId === undefined) {
+      return undefined;
+    }
+    try {
+      const state = await this.request(
+        asWireCommand({
+          type: "get_state",
+          activeSessionId: this.record.activeSessionId,
+        }),
+      );
+      if (!state.success) {
+        return undefined;
+      }
+      return sessionSummaryIsIdle(state.data);
+    } catch {
+      // The badge poll's discipline applies here too: a read that cannot
+      // happen is not a reason to settle a turn, and not a crash either.
+      return undefined;
+    }
+  }
+
+  /** One poll step: read the session, hold or fill the idle window, settle. */
+  private async reconcileTick(): Promise<void> {
+    const timing = reconcileTimingFromEnv();
+    if (this.closed || this.daemonClosed) {
+      return;
+    }
+    if (!this.hasOpenTurn) {
+      // Settled by its own agent_end, an interrupt, or a failure path since
+      // the last tick: the reconcile has nothing to own any more.
+      this.stopReconcileTimers();
+      return;
+    }
+    if (!this.attached || this.wireDown) {
+      // The bbpa-ggf.11 recovery owns a turn that died with the socket; wait
+      // for the lane to be live again before reading anything.
+      this.scheduleReconcileTick(timing.pollMs);
+      return;
+    }
+    const idle = await this.readIdleVerdict();
+    if (!this.hasOpenTurn) {
+      this.stopReconcileTimers();
+      return;
+    }
+    if (idle === true) {
+      this.reconcile.idleSince ??= Date.now();
+    } else {
+      // Busy (work appeared — steers, heartbeats, another client) or unreadable:
+      // either way the window restarts from the next idle read.
+      this.reconcile.idleSince = undefined;
+    }
+    if (
+      this.reconcile.idleSince !== undefined &&
+      Date.now() - this.reconcile.idleSince >= timing.graceMs
+    ) {
+      // Straight before the settle, ask once more: the window's oldest read
+      // is already grace old, so only a fresh idle verdict may close the turn.
+      const confirmed = await this.readIdleVerdict();
+      if (confirmed === true) {
+        if (this.hasOpenTurn) {
+          this.settleReconciledTurn();
+        }
+        return;
+      }
+      if (confirmed === false) {
+        this.reconcile.idleSince = undefined;
+      }
+    }
+    this.scheduleReconcileTick(timing.pollMs);
+  }
+
+  /** Close the stuck turn: interrupted, with the feed note (the lane knows). */
+  private settleReconciledTurn(): void {
+    if (this.openTurn === undefined || this.openTurn.settledLocally) {
+      return;
+    }
+    // The window's start is the honest "how long has the session read idle"
+    // figure for the note — read it before the clock is torn down.
+    const idleSeconds = Math.max(
+      1,
+      Math.round((Date.now() - (this.reconcile.idleSince ?? Date.now())) / 1000),
+    );
+    this.openTurn = { ...this.openTurn, settledLocally: true };
+    this.stopReconcileTimers();
+    this.pushDeltas(
+      this.translator.reconciliationDeltas(this.record.threadId, {
+        idleSeconds,
+      }),
+    );
+  }
+
+  /**
+   * The attach-time reconcile (bbpa-uld): a fresh bridge process adopting an
+   * already-running session (bb re-bind after a worker reap) runs this once,
+   * shortly after the attach. An already-stuck thread — bb's turn open since
+   * before this process existed, the daemon session long settled — closes on
+   * this first reconciliation: one idle read, then the confirming read after
+   * the same grace window the live poll uses (the spec's "verifiably not
+   * working for a grace period" does not shrink for being young). While the
+   * lane is not ready to ask — wire down, reconnecting, daemon mumbling — the
+   * first read reschedules instead of giving up: healing late beats never.
+   * The check stays quiet about anything it cannot know: no `provider.warning`
+   * note (whether a bb turn was actually open is bb's knowledge), and the
+   * `claimIfIdle` boundary is a no-op when there is none.
+   */
+  scheduleStuckTurnCheck(): void {
+    this.scheduleAttachStep(reconcileTimingFromEnv().attachCheckDelayMs, "read");
+  }
+
+  private scheduleAttachStep(
+    delayMs: number,
+    step: "read" | "confirm",
+  ): void {
+    if (this.closed) {
+      return;
+    }
+    const field =
+      step === "read" ? "attachTimer" : "attachConfirmTimer";
+    if (this.reconcile[field] !== undefined) {
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.reconcile[field] = undefined;
+      void (step === "read"
+        ? this.attachTimeFirstRead()
+        : this.attachTimeConfirm());
+    }, delayMs);
+    timer.unref?.();
+    this.reconcile[field] = timer;
+  }
+
+  /**
+   * The facts that mean the lane is demonstrably live — a turn of its own
+   * open, or one already settled since the attach: the ordinary paths own the
+   * timeline, and the attach-time check stands down for good.
+   */
+  private attachTimeStandDown(): boolean {
+    return this.hasOpenTurn || this.reconcile.settledSinceAttach > 0;
+  }
+
+  private async attachTimeFirstRead(): Promise<void> {
+    const timing = reconcileTimingFromEnv();
+    if (this.closed || this.daemonClosed || this.attachTimeStandDown()) {
+      return;
+    }
+    if (!this.attached || this.wireDown) {
+      this.scheduleAttachStep(timing.pollMs, "read");
+      return;
+    }
+    const idle = await this.readIdleVerdict();
+    if (this.closed || this.attachTimeStandDown()) {
+      return;
+    }
+    if (idle === undefined) {
+      // Not evidence either way: ask again on the poll cadence.
+      this.scheduleAttachStep(timing.pollMs, "read");
+      return;
+    }
+    if (idle !== true) {
+      // Busy: a live run is going, and its own agent_end — claimIfIdle, like
+      // every boundary this lane translates — closes a bb turn if one is open.
+      return;
+    }
+    // Hold the idle evidence through the grace window, then confirm.
+    this.scheduleAttachStep(timing.graceMs, "confirm");
+  }
+
+  private async attachTimeConfirm(): Promise<void> {
+    const timing = reconcileTimingFromEnv();
+    if (this.closed || this.daemonClosed || this.attachTimeStandDown()) {
+      return;
+    }
+    if (!this.attached || this.wireDown) {
+      this.scheduleAttachStep(timing.pollMs, "confirm");
+      return;
+    }
+    const idle = await this.readIdleVerdict();
+    if (this.closed || this.attachTimeStandDown()) {
+      return;
+    }
+    // One idle window already held; only a fresh idle verdict settles.
+    if (idle === true) {
+      this.pushDeltas(
+        this.translator.quietReconciliationDeltas(this.record.threadId),
+      );
     }
   }
 
@@ -914,7 +1173,8 @@ export class PrimeSession {
     }
   }
 
-  private deliver(push: SessionEventEnvelope): void {    this.trackSessionFacts(push.event);
+  private deliver(push: SessionEventEnvelope): void {
+    this.trackSessionFacts(push.event);
     const sequence = push.meta?.sequence;
     if (typeof sequence === "number" && this.lastSequence >= 0 && sequence <= this.lastSequence) {
       return;
@@ -947,6 +1207,10 @@ export class PrimeSession {
         if (this.openTurn !== undefined) {
           this.openTurn.settledLocally = true;
         }
+        // The turn prime settled is one this lane no longer reconciles (and
+        // one that proves the lane is live, for the attach-time check).
+        this.reconcile.settledSinceAttach += 1;
+        this.stopReconcileTimers();
         // A settled turn is a natural moment to re-read the attached-client
         // count (story 21) — windowed, so a thread turning steadily costs no
         // extra commands beyond the slow poll.
@@ -1030,6 +1294,7 @@ export class PrimeSession {
       clientRequestId: args.clientRequestId,
       settledLocally: false,
     };
+    this.armReconcilePoll();
     // The anchor is queued with the send: prime settles every admitted input
     // with an agent_end, which consumes it. If the prompt is refused, the
     // anchor is taken back so the FIFO stays aligned with prime's runs.
@@ -1060,6 +1325,11 @@ export class PrimeSession {
       }
     } catch (error) {
       this.pendingCheckpoints.pop();
+      // Nothing was admitted, so no turn is open: the bookkeeping goes with
+      // it, and the reconcile poll has nothing to watch (a stuck-open
+      // openTurn here would read as a turn to reconcile — it never was one).
+      this.openTurn = undefined;
+      this.stopReconcileTimers();
       throw error;
     }
   }
@@ -1084,6 +1354,7 @@ export class PrimeSession {
     await this.awaitLive();
     const midTurn = this.hasOpenTurn;
     this.openTurn = { settledLocally: false };
+    this.armReconcilePoll();
     this.queueCheckpoint(primePromptText(args.input));
     try {
       await readCommandData(
@@ -1109,6 +1380,13 @@ export class PrimeSession {
       );
     } catch (error) {
       this.pendingCheckpoints.pop();
+      if (!midTurn) {
+        // The fresh run a resumeIfIdle steer would have started was never
+        // admitted: no turn is open (a genuinely mid-turn steer's earlier
+        // run still owns the timeline, and its agent_end settles it).
+        this.openTurn = undefined;
+        this.stopReconcileTimers();
+      }
       throw error;
     }
   }
@@ -1176,6 +1454,7 @@ export class PrimeSession {
   async release(args: { interrupt?: boolean } = {}): Promise<void> {
     this.settleConnectionGap("unavailable");
     this.stopClientsPoll();
+    this.stopReconcileTimers();
     if (args.interrupt !== false) {
       await this.interrupt();
     }

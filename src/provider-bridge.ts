@@ -810,6 +810,11 @@ const handlers: Record<string, RequestHandler> = {
             // that history the bridge ever sees.
             if (adopted) {
               live.snapshotDeltas();
+              // The fresh worker's first reconciliation (bbpa-uld): a thread
+              // re-bound after a provider-worker reap may carry a bb turn the
+              // old process lost — one check against the daemon's live state
+              // closes it if the session has verifiably settled meanwhile.
+              live.scheduleStuckTurnCheck();
             }
           } else {
             const session = sessionFor(record);
